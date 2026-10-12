@@ -1508,6 +1508,71 @@ fn preparing_a_form_adds_renames_and_deletes_fields() {
     assert_eq!(names(&s), ["Text1", "Check Box1", "email"]);
 }
 
+/// One 612×300 page with one line of `text` in the standard font `base`, which has no /Widths
+/// (what many PDF generators write for the standard 14 fonts).
+fn standard_font_line(base: &str, size: u32, text: &str) -> Vec<u8> {
+    let body = format!("BT /F1 {size} Tf 1 0 0 1 36 150 Tm ({text}) Tj ET");
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 300] >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+        format!("<< /Type /Font /Subtype /Type1 /BaseFont /{base} /Encoding /WinAnsiEncoding >>"),
+        format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+/// Put a redaction mark over `needle` where page 1 shows it, as Find text and redact does.
+fn mark_shown_text(s: &mut Session, id: DocId, needle: &str) {
+    let doc = s.get(id).unwrap();
+    let mut r = pdfcraft_render::PageRenderer::new(doc.bytes.clone(), pdfcraft_render::RenderConfig::default());
+    let text = r.render(RenderRequestFor::text(0)).text.expect("the page has text");
+    let range = text.find(needle).pop().expect("the page shows the text");
+    let info = &doc.info.pages[0];
+    let quads = text.line_rects(range).into_iter().map(|v| pdfcraft_annot::rect_quad(info.view_rect_to_user(v).map(f64::from))).collect();
+    let shape = Shape::Redact { quads, overlay: String::new(), look: Default::default() };
+    let mark =
+        Edit::AddAnnotation(NewAnnotation { page: 0, style: Style::default_for(&shape), shape, contents: String::new(), author: "Ada".into() });
+    s.apply(id, mark).unwrap();
+}
+
+/// Redaction approximates the advances of a standard font that has no /Widths, so along a long
+/// line its idea of where the glyphs are drifts from where the page shows them. A mark placed over
+/// the number at the end of the line then lies over glyphs redaction puts elsewhere: it used to
+/// report success and leave the number in the file. The renderer is asked now, and the edit is
+/// refused.
+#[test]
+fn redaction_is_refused_when_the_page_still_shows_text_under_a_mark() {
+    let line = "Patient name and date of birth as recorded on admission by the nursing staff: Margaret Hollingsworth, PIN 4417";
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let id = s.open("bold.pdf", None, Arc::new(standard_font_line("Helvetica-Bold", 9, line)), None).unwrap();
+    mark_shown_text(&mut s, id, "4417");
+    let refused = s.apply(id, Edit::ApplyRedactions { pages: None });
+    assert!(matches!(refused, Err(EditError::Redact(pdfcraft_redact::RedactError::Residue(n))) if n > 0), "{refused:?}");
+    // Nothing was changed: the mark is still pending and the page still shows the line.
+    assert_eq!(s.get(id).unwrap().redaction_marks(), 1);
+    assert!(page_texts(&s, id)[0].ends_with("PIN 4417"));
+
+    // Courier's advances are exact: the same mark is applied and the number is gone.
+    let id = s.open("mono.pdf", None, Arc::new(standard_font_line("Courier", 6, line)), None).unwrap();
+    mark_shown_text(&mut s, id, "4417");
+    s.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+    let shown = page_texts(&s, id).swap_remove(0);
+    assert!(shown.ends_with("PIN") && !shown.contains("4417"), "{shown}");
+}
+
 #[test]
 fn redaction_marks_apply_for_good_and_undo() {
     let (mut s, id) = session_with(2);

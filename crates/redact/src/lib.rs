@@ -293,6 +293,8 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     by_page.dedup();
     report.pages = by_page.len();
     let mut doomed_fields: Vec<String> = Vec::new();
+    // The original image and form XObjects the rewrite drops or replaces, on any page.
+    let mut doomed_xobjects: Vec<ObjRef> = Vec::new();
     let widget_owner: Vec<(ObjRef, String)> =
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
 
@@ -315,6 +317,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         if out.vertical {
             return Err(RedactError::VerticalText(pi + 1));
         }
+        doomed_xobjects.extend_from_slice(&out.doomed);
         let mut new_list = list.clone();
         let mut changed = false;
         for (i, new) in out.streams.into_iter().enumerate() {
@@ -464,6 +467,10 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             pdfcraft_edit::stamp(doc, pi, "Redaction", content)?;
         }
     }
+
+    // A removed image or form must not stay reachable through another resource dictionary (an
+    // inherited or shared /Resources): a full save keeps whatever is still referenced.
+    interp::unlink_doomed(doc, &doomed_xobjects)?;
 
     // 5. Verify: nothing readable may remain under a region.
     let mut residue = 0;

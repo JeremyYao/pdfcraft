@@ -13,6 +13,11 @@ pub(crate) fn fixture(n: usize) -> Vec<u8> {
         let body = format!("BT /F1 24 Tf 20 150 Td (Page {}) Tj ET", i + 1);
         objs.push(format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()).into_bytes());
     }
+    assemble(&objs)
+}
+
+/// A document from `objs`, numbered from 1, object 1 being the catalog.
+fn assemble(objs: &[Vec<u8>]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objs.iter().enumerate() {
@@ -2858,6 +2863,61 @@ fn actions_run_their_steps_on_files() {
     assert_eq!(d.info.title.as_deref(), Some("Q3"));
     assert!(page_texts(&s2, id)[0].contains("DRAFT"));
     assert!(actions::run_on(&custom, "bad.pdf", Arc::new(b"nope".to_vec()), |_, _| {}).is_err());
+}
+
+/// A refused confidentiality step (Sanitize, Remove hidden information) must fail the file,
+/// not be logged while the unsanitized file is written and reported done. Only a step with
+/// genuinely nothing to do is a skip.
+#[test]
+fn actions_fail_the_file_when_a_sanitizing_step_is_refused() {
+    let built = actions::builtin();
+    let sanitize = built.iter().find(|a| a.name == "Sanitize Documents").unwrap();
+    let prepare = built.iter().find(|a| a.name == "Prepare for Distribution").unwrap();
+    let run = |action: &actions::Action, bytes: Arc<Vec<u8>>| actions::run_on(action, "in.pdf", bytes, |_, _| {});
+    // The file must fail, never be produced with the refusal only in its log.
+    let refused = |action: &actions::Action, bytes: Arc<Vec<u8>>| match run(action, bytes) {
+        Ok(r) => panic!("{} produced the file as done, log {:?}", action.name, r.log),
+        Err(e) => e,
+    };
+
+    // A signature field with any value makes the file signed: a full rewrite is refused.
+    let page = b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> /Annots [6 0 R] >>".to_vec();
+    let body = "BT /F1 24 Tf 20 150 Td (Page 1) Tj ET";
+    let signed = Arc::new(assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        page,
+        format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()).into_bytes(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig1) /Rect [0 0 0 0] /P 4 0 R /V << /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached >> >>".to_vec(),
+    ]));
+    let err = refused(sanitize, signed.clone());
+    assert!(err.starts_with("Sanitize document:") && err.contains("signed"), "{err}");
+    let err = refused(prepare, signed);
+    assert!(err.starts_with("Remove hidden information:") && err.contains("signed"), "{err}");
+
+    // Permissions that forbid changes refuse it too.
+    let err = refused(sanitize, protected("", "owner", 0b0100));
+    assert!(err.contains("security settings"), "{err}");
+
+    // So does a page whose content can't be read (its /Contents is a number) when there is
+    // hidden text to remove (page 1's is invisible, rendering mode 3).
+    let hidden = "BT /F1 24 Tf 3 Tr 20 150 Td (Hidden) Tj ET";
+    let unreadable = Arc::new(assemble(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 /MediaBox [0 0 200 300] >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources << /Font << /F1 3 0 R >> >> >>".to_vec(),
+        format!("<< /Length {} >>\nstream\n{hidden}\nendstream", hidden.len()).into_bytes(),
+        b"<< /Type /Page /Parent 2 0 R /Contents 42 >>".to_vec(),
+    ]));
+    let err = refused(sanitize, unreadable);
+    assert!(err.contains("can't be read"), "{err}");
+
+    // Controls: a plain file is sanitized, and a step with nothing to do is a skip, not a failure.
+    assert_eq!(run(sanitize, Arc::new(fixture(1))).unwrap().log, ["Sanitize document"]);
+    let r = run(prepare, Arc::new(fixture(1))).unwrap();
+    assert_eq!(r.log, ["Remove hidden information: nothing to do", "Flatten comments", "Flatten form fields"]);
 }
 
 #[test]

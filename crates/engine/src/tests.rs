@@ -2674,6 +2674,43 @@ fn recognize_text_makes_a_scanned_page_searchable() {
     assert!(again[0].skipped.is_some());
 }
 
+/// A recognition result is bound to the document state it was captured from. If the document is
+/// edited after Recognize text starts but before its result is applied (the GUI runs it on a
+/// worker thread), applying the stale result would stamp the pre-edit words back onto the page as
+/// an invisible, selectable layer -- defeating a redaction applied in that window. The apply step
+/// now refuses a result whose captured generation no longer matches the document. No OCR models
+/// are needed: the worker's word list is supplied directly, as in the audit harness.
+#[test]
+fn ocr_result_is_refused_when_the_document_changed_after_capture() {
+    let mut s = Session::new().with_clock(|| 1_700_000_000);
+    let text = s.create_from_text("t", "Card 4111 1111 1111 1111").unwrap();
+    let id0 = s.open("text.pdf", None, text, None).unwrap();
+    let png = export::Exporter::new(s.get(id0).unwrap()).png(0, 150.0).unwrap();
+    let scan = s.create_from_images(&[("scan.png".into(), png)]).unwrap();
+    let id = s.open("scan.pdf", None, scan, None).unwrap();
+    assert_eq!(page_texts(&s, id), [""], "the scan is a picture, with no text");
+
+    // Capture a job, as the GUI does before starting the background worker.
+    let job = s.ocr_job(id, &[], ocr::OcrSettings::default()).expect("a job");
+    let captured = job.generation;
+    let found = vec![ocr::OcrPage {
+        page: 0,
+        words: vec![ocr::PlacedWord { text: "4111 1111 1111 1111".into(), origin: [40.0, 40.0], across: [120.0, 0.0], up: [0.0, 12.0] }],
+        already_on_page: 0,
+        skipped: None,
+    }];
+
+    // The document is edited while recognition "runs", bumping its edit generation.
+    s.apply(id, rect_comment(0, [10.0, 10.0, 50.0, 50.0])).unwrap();
+    let stale = s.apply_ocr(id, &found, captured);
+    assert!(stale.is_err(), "a result captured before the edit must be refused");
+    assert_eq!(page_texts(&s, id), [""], "no OCR text was stamped onto the page");
+
+    // Captured against the current state, the same result applies.
+    let now = s.get(id).unwrap().edit_generation();
+    assert_eq!(s.apply_ocr(id, &found, now).unwrap(), 1, "a fresh result still applies");
+}
+
 /// #1028: a page with its own text and a picture of text. By default it is skipped, as before;
 /// with `skip_text_pages: false` the picture is read and the page's own text is not added again.
 #[test]

@@ -228,6 +228,86 @@ fn unapplied_redact_mark_is_found() {
     assert!(findings[0].covered_text.contains("DO NOT SHARE"));
 }
 
+/// One page of `TEXT` with one annotation (object 6, `annot` is the rest of its dictionary) whose
+/// appearance streams are objects 7, 8, ... (`streams`: each the rest of the stream dictionary
+/// and the data).
+fn annotated(annot: &str, streams: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.add("<< /Type /Catalog /Pages 2 0 R >>");
+    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>");
+    b.add_stream(TEXT);
+    b.add(FONT);
+    b.add(&format!("<< /Type /Annot {annot} >>"));
+    for (extra, data) in streams {
+        b.add_stream_with(data, extra);
+    }
+    b.build()
+}
+
+const TEXT: &[u8] = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n";
+const AP_FORM: &str = "/Type /XObject /Subtype /Form /BBox [0 0 220 32]";
+const AP_FILL: &[u8] = b"0 g\n0 0 220 32 re f\n";
+
+#[test]
+fn annotation_appearance_over_text_is_found() {
+    // A black rectangle drawn as a shape or highlight annotation covers the text exactly like
+    // one in the page content: the viewer paints its appearance stream over the page.
+    for subtype in ["Square", "Highlight"] {
+        let annot = format!("/Subtype /{subtype} /Rect [100 688 320 720] /C [0 0 0] /IC [0 0 0] /F 4 /AP << /N 7 0 R >>");
+        let findings = audit_redactions(&open(annotated(&annot, &[(AP_FORM, AP_FILL)]))).expect("audit must run");
+        assert_eq!(findings.len(), 1, "{subtype}: {findings:?}");
+        assert_eq!(findings[0].kind, FindingKind::CoveredText);
+        assert_eq!(findings[0].rect, [100.0, 688.0, 320.0, 720.0]);
+        assert_eq!(findings[0].covered_text, "SECRET DATA 123");
+    }
+}
+
+#[test]
+fn annotation_appearance_is_placed_by_rect_bbox_and_matrix() {
+    // ISO 32000-2 §12.5.5: the form's /BBox goes through /Matrix, and the box that comes out is
+    // scaled and moved onto /Rect. Here a 100-unit square scaled by 2 lands on the 220 × 32 rect.
+    let annot = "/Subtype /Square /Rect [100 688 320 720] /F 4 /AP << /N 7 0 R >>";
+    let form = "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [2 0 0 2 50 50]";
+    let findings = audit_redactions(&open(annotated(annot, &[(form, b"0 g\n0 0 100 100 re f\n")]))).expect("audit must run");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].rect, [100.0, 688.0, 320.0, 720.0]);
+    // The same square painted in the lower-left quarter of the form hides only the left half of
+    // the line's x range and the bottom half of its height: under half the height, no cover.
+    let findings = audit_redactions(&open(annotated(annot, &[(form, b"0 g\n0 0 50 50 re f\n")]))).expect("audit must run");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn hidden_or_noview_annotation_appearance_is_not_a_cover() {
+    // Flags Hidden (2) and NoView (32): the viewer does not paint it, so the text shows.
+    for flags in [2, 32, 34] {
+        let annot = format!("/Subtype /Square /Rect [100 688 320 720] /F {flags} /AP << /N 7 0 R >>");
+        let findings = audit_redactions(&open(annotated(&annot, &[(AP_FORM, AP_FILL)]))).expect("audit must run");
+        assert!(findings.is_empty(), "/F {flags}: {findings:?}");
+    }
+}
+
+#[test]
+fn annotation_appearance_state_selects_the_stream() {
+    // /N holds one stream per appearance state; /AS names the one shown.
+    let streams: &[(&str, &[u8])] = &[(AP_FORM, AP_FILL), (AP_FORM, b"")];
+    let on = "/Subtype /Square /Rect [100 688 320 720] /F 4 /AS /On /AP << /N << /On 7 0 R /Off 8 0 R >> >>";
+    let findings = audit_redactions(&open(annotated(on, streams))).expect("audit must run");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let off = "/Subtype /Square /Rect [100 688 320 720] /F 4 /AS /Off /AP << /N << /On 7 0 R /Off 8 0 R >> >>";
+    let findings = audit_redactions(&open(annotated(off, streams))).expect("audit must run");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn undecodable_annotation_appearance_fails_the_audit() {
+    let annot = "/Subtype /Square /Rect [100 688 320 720] /F 4 /AP << /N 7 0 R >>";
+    let form = "/Type /XObject /Subtype /Form /BBox [0 0 220 32] /Filter /FlateDecode";
+    let err = audit_redactions(&open(annotated(annot, &[(form, b"this is not deflated data")]))).expect_err("audit must fail closed");
+    assert!(err.to_string().contains("decoded"), "unexpected error: {err}");
+}
+
 #[test]
 fn background_before_text_is_not_flagged() {
     // An opaque dark rectangle painted *before* the text is a background, not a cover.

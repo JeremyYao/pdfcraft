@@ -5,8 +5,10 @@
 //! whose four corners form an axis-aligned rectangle in user space is the same shape and counts
 //! too (#1510). Graphics state tracked here is deliberately small: the CTM stack (`q`/`Q`/`cm`),
 //! the non-stroking color (`g`/`rg`/`k`) and the non-stroking alpha from ExtGState (`gs` reading
-//! `/ca`). Form XObjects are followed read-only with a depth cap. Anything fancier (other filled paths, shadings, patterns) is
-//! out of scope and documented as such.
+//! `/ca`). Form XObjects are followed read-only with a depth cap, and so are the normal
+//! appearance streams of the page's visible annotations, placed by `/Rect`, `/BBox` and
+//! `/Matrix` and painted after the page content. Anything fancier (other filled paths, shadings,
+//! patterns) is out of scope and documented as such.
 //!
 //! Paint order: a page's content streams are one stream in pieces (ISO 32000-2 §7.8.2), so they
 //! are parsed joined and walked once with a single graphics state — state set in an earlier
@@ -35,7 +37,9 @@ pub struct FilledRect {
     /// The fill color as sRGB-ish `[r, g, b]` (CMYK is converted approximately).
     pub rgb: [f64; 3],
     /// Paint position: `(content-stream index, operator index in the joined stream)`.
-    /// Rectangles inside a form XObject carry the `Do` operator's position.
+    /// Rectangles inside a form XObject carry the `Do` operator's position; those painted by
+    /// an annotation's appearance carry `(usize::MAX, annotation index)`, after every page
+    /// operator.
     pub pos: (usize, usize),
 }
 
@@ -254,29 +258,108 @@ impl<'a> Walker<'a> {
         let Some(entry) = xobjects.get(name) else { return Ok(()) };
         let resolved = self.doc.resolve(entry);
         let Object::Stream(stream) = &*resolved else { return Ok(()) };
-        let dict = &stream.dict;
-        if dict.name(b"Subtype") != Some(b"Form") {
+        if stream.dict.name(b"Subtype") != Some(b"Form") {
             return Ok(());
         }
-        let matrix = dict
-            .get(b"Matrix")
-            .map(|o| self.doc.resolve(o))
-            .and_then(|o| o.as_array().map(|a| a.to_vec()))
-            .and_then(|a| {
-                let v: Vec<f64> = a.iter().filter_map(|o| self.doc.resolve(o).as_f64()).collect();
-                (v.len() == 6 && v.iter().all(|x| x.is_finite())).then(|| Matrix([v[0], v[1], v[2], v[3], v[4], v[5]]))
-            })
-            .unwrap_or(Matrix::IDENTITY);
+        self.walk_form(stream, gs, depth, pos)
+    }
+
+    /// Walk a form stream's content with `gs` as the state outside it: its `/Matrix` maps form
+    /// space into that state's user space (ISO 32000-2 §8.10.1). `depth` is the nesting of the
+    /// form being entered; every rectangle found is stamped with `pos`.
+    fn walk_form(&mut self, stream: &pdfcraft_cos::Stream, gs: &Gs, depth: usize, pos: (usize, usize)) -> Result<(), AuditError> {
+        let dict = &stream.dict;
+        let matrix = numbers::<6>(self.doc, dict.get(b"Matrix")).map_or(Matrix::IDENTITY, Matrix);
         let sub_resources = dict.get(b"Resources").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default();
         // A form stream that cannot be decoded fails the audit: it might hide a cover.
         let data = stream.decoded_strict()?;
         let ops = parse(&data).ops;
-        // The XObject matrix maps form space into the user space active at `Do`.
         let mut sub_gs = gs.clone();
         sub_gs.ctm = matrix.then(&gs.ctm);
         let mut sub_stack = Vec::new();
         self.walk_ops(&ops, &mut sub_gs, &mut sub_stack, &sub_resources, depth + 1, Some(pos))
     }
+
+    /// Walk the normal appearance a viewer paints for the `k`-th annotation of the page, placed
+    /// by its `/Rect`, `/BBox` and `/Matrix` (ISO 32000-2 §12.5.5): the form's bounding box goes
+    /// through its matrix, and the box that comes out is scaled and moved onto `/Rect`. The
+    /// appearance is painted after all page content and is clipped to its box, so every
+    /// rectangle it paints is cut to `/Rect` and stamped with a position past every page
+    /// operator. Annotations a viewer does not paint (Hidden or NoView flags, popups, or no
+    /// appearance to show) contribute nothing; an appearance that cannot be decoded fails the
+    /// audit like page content does.
+    fn walk_annotation(&mut self, annot: &Dict, k: usize) -> Result<(), AuditError> {
+        const HIDDEN: i64 = 2;
+        const NO_VIEW: i64 = 32;
+        let flags = annot.get(b"F").map(|o| self.doc.resolve(o)).and_then(|o| o.as_int()).unwrap_or(0);
+        if flags & (HIDDEN | NO_VIEW) != 0 || annot.name(b"Subtype") == Some(b"Popup") {
+            return Ok(());
+        }
+        let Some(r) = numbers::<4>(self.doc, annot.get(b"Rect")) else { return Ok(()) };
+        let rect = [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])];
+        let Some(stream) = self.normal_appearance(annot) else { return Ok(()) };
+        let Object::Stream(stream) = &*stream else { return Ok(()) };
+        let matrix = numbers::<6>(self.doc, stream.dict.get(b"Matrix")).map_or(Matrix::IDENTITY, Matrix);
+        // Algorithm 8.1: `/BBox` through `/Matrix`, then the matrix `a` that maps that box onto
+        // `/Rect`. A box with no extent in a direction is not scaled in it. Without a `/BBox`
+        // the form has no box to map: its content is taken as drawn in page space.
+        let a = match numbers::<4>(self.doc, stream.dict.get(b"BBox")) {
+            Some(bbox) => {
+                let b = matrix.bbox([bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3])]);
+                let scale = |from: f64, to: f64| if from > 0.0 && from.is_finite() { to / from } else { 1.0 };
+                let (sx, sy) = (scale(b[2] - b[0], rect[2] - rect[0]), scale(b[3] - b[1], rect[3] - rect[1]));
+                Matrix([sx, 0.0, 0.0, sy, rect[0] - b[0] * sx, rect[1] - b[1] * sy])
+            }
+            None => Matrix::IDENTITY,
+        };
+        let gs = Gs { ctm: a, ..Gs::default() };
+        let from = self.out.len();
+        self.walk_form(stream, &gs, 0, annotation_pos(k))?;
+        // The appearance shows only inside its box, which `a` maps onto `/Rect`. (`from` is
+        // never past the end: the walk only appends.)
+        let painted = self.out.split_off(from.min(self.out.len()));
+        self.out.extend(painted.into_iter().filter_map(|mut f| {
+            let r = f.rect;
+            f.rect = [r[0].max(rect[0]), r[1].max(rect[1]), r[2].min(rect[2]), r[3].min(rect[3])];
+            (f.rect[2] > f.rect[0] && f.rect[3] > f.rect[1]).then_some(f)
+        }));
+        Ok(())
+    }
+
+    /// The normal appearance stream a viewer shows for `annot`: `/AP /N`, either a stream or a
+    /// dictionary of states from which `/AS` (or the only state) picks one. `None` when there is
+    /// nothing a viewer would paint.
+    fn normal_appearance(&self, annot: &Dict) -> Option<std::sync::Arc<Object>> {
+        let ap = annot.get(b"AP").map(|o| self.doc.resolve(o))?;
+        let n = ap.as_dict()?.get(b"N").map(|o| self.doc.resolve(o))?;
+        match &*n {
+            Object::Stream(_) => Some(n),
+            Object::Dict(states) => {
+                let state = match annot.name(b"AS") {
+                    Some(name) => states.get(name)?,
+                    None if states.len() == 1 => states.iter().next().map(|(_, o)| o)?,
+                    None => return None,
+                };
+                let resolved = self.doc.resolve(state);
+                matches!(&*resolved, Object::Stream(_)).then_some(resolved)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Paint position of the `k`-th annotation's appearance: after every page operator (no content
+/// stream has index `usize::MAX`).
+fn annotation_pos(k: usize) -> (usize, usize) {
+    (usize::MAX, k)
+}
+
+/// `N` finite numbers from an array object (`/Rect`, `/BBox`, `/Matrix`), or `None`.
+fn numbers<const N: usize>(doc: &Document, o: Option<&Object>) -> Option<[f64; N]> {
+    let resolved = doc.resolve(o?);
+    let v: Vec<f64> = resolved.as_array()?.iter().filter_map(|o| doc.resolve(o).as_f64()).collect();
+    let a = <[f64; N]>::try_from(v).ok()?;
+    a.iter().all(|x| x.is_finite()).then_some(a)
 }
 
 /// The `x y` operands of `m`/`l`, mapped to user space.
@@ -298,11 +381,13 @@ fn ext_alpha(doc: &Document, resources: &Dict, name: &[u8]) -> f64 {
     alpha.filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 1.0)).unwrap_or(1.0)
 }
 
-/// Every opaque filled rectangle drawn by a page's content (and its form XObjects), with paint
-/// positions. A page's content streams are walked once, joined, with one graphics state, so
-/// state set in an earlier stream is still in force in the later ones. Any content stream that
-/// cannot be decoded is an audit failure, never an empty result.
-pub fn filled_rects(doc: &Document, page: &Dict) -> Result<Vec<FilledRect>, AuditError> {
+/// Every opaque filled rectangle drawn by a page's content (and its form XObjects), then by the
+/// normal appearances of its annotations `annots` (in that order, with `/Redact` marks left
+/// out: they are reported as unapplied marks), with paint positions. A page's content streams
+/// are walked once, joined, with one graphics state, so state set in an earlier stream is still
+/// in force in the later ones. Any content or appearance stream that cannot be decoded is an
+/// audit failure, never an empty result.
+pub fn filled_rects(doc: &Document, page: &Dict, annots: &[Dict]) -> Result<Vec<FilledRect>, AuditError> {
     let resources = page.get(b"Resources").map(|o| doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default();
     let contents: Vec<Object> = match page.get(b"Contents") {
         None => Vec::new(),
@@ -323,5 +408,10 @@ pub fn filled_rects(doc: &Document, page: &Dict) -> Result<Vec<FilledRect>, Audi
     let mut gs = Gs::default();
     let mut stack = Vec::new();
     w.walk_ops(&parsed.ops, &mut gs, &mut stack, &resources, 0, None)?;
+    for (k, annot) in annots.iter().enumerate() {
+        if annot.name(b"Subtype") != Some(b"Redact") {
+            w.walk_annotation(annot, k)?;
+        }
+    }
     Ok(w.out)
 }

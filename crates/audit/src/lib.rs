@@ -12,12 +12,19 @@
 //! strikethrough or a table rule does not. A finding reports the whole text of every line the
 //! cover touches, not only the hidden glyphs.
 //!
+//! Covers are collected from the page content, the form XObjects it draws, and the normal
+//! appearance stream of every annotation a viewer paints (not Hidden or NoView, not a popup),
+//! placed by its `/Rect`, `/BBox` and `/Matrix` and painted after the page content: a box
+//! drawn over text with a shape or highlight tool is audited like one in the content.
+//!
 //! Detection limits (documented, not hidden): only `re` rectangles closed by a fill operator
 //! are considered — arbitrary filled paths, shadings and patterns are not; a rectangle drawn
 //! with a translucent ExtGState (`/ca < 1`) is not flagged; annotation rectangles are compared
 //! in unrotated user space, so pages with `/Rotate` may misalign; covers inside form XObjects
-//! are found, but only text drawn directly in the page content is checked under them, so text
-//! inside a form XObject is not audited.
+//! and annotation appearances are found, but only text drawn directly in the page content is
+//! checked under them, so text inside a form XObject or an appearance is not audited; an
+//! annotation whose `/AP /N` holds several states and no `/AS` has no appearance to show and
+//! contributes nothing.
 //!
 //! The audit fails closed: any content that cannot be read (an undecodable content stream,
 //! malformed annotations, form XObjects nested deeper than 32 or in a cycle) is an error, never
@@ -93,8 +100,10 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
     let mut out = Vec::new();
     for (n, page) in pdfcraft_model::pages(doc).iter().enumerate() {
         let lines = pdfcraft_edit::text_lines(doc, n).map_err(|e| AuditError::Text(n, e.to_string()))?;
-        // 1. Opaque filled rectangles over extractable text.
-        for r in cover::filled_rects(doc, &page.dict)? {
+        let annotations = annotations(doc, &page.dict)?;
+        // 1. Opaque filled rectangles over extractable text, in the page content and in the
+        //    appearances of its annotations.
+        for r in cover::filled_rects(doc, &page.dict, &annotations)? {
             let mut covered = String::new();
             for line in &lines {
                 if is_cover(&r, line) {
@@ -109,7 +118,7 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
             }
         }
         // 2. Redact annotations that were never applied.
-        for annot in annots(doc, &page.dict)? {
+        for annot in redact_marks(doc, &annotations) {
             let mut covered = String::new();
             for line in &lines {
                 if covers(&annot, &line.rect) {
@@ -167,22 +176,28 @@ fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-/// Rectangles of `/Redact` annotations on a page (unrotated user space). A missing `/Annots`
-/// means no marks; a malformed one fails the audit rather than silently passing.
-fn annots(doc: &Document, page: &Dict) -> Result<Vec<[f64; 4]>, AuditError> {
+/// The annotation dictionaries of a page, in `/Annots` order. A missing `/Annots` means no
+/// annotations; a malformed one fails the audit rather than silently passing.
+fn annotations(doc: &Document, page: &Dict) -> Result<Vec<Dict>, AuditError> {
     let Some(a) = page.get(b"Annots") else { return Ok(Vec::new()) };
     let resolved = doc.resolve(a);
     let items: Vec<pdfcraft_cos::Object> = match &*resolved {
         pdfcraft_cos::Object::Array(items) => items.clone(),
-        // A missing /Annots means no marks; a malformed one fails the audit.
         _ => return Err(AuditError::BadAnnots),
     };
+    Ok(items
+        .iter()
+        .filter_map(|a| match &*doc.resolve(a) {
+            pdfcraft_cos::Object::Dict(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Rectangles of the `/Redact` annotations among `annotations` (unrotated user space).
+fn redact_marks(doc: &Document, annotations: &[Dict]) -> Vec<[f64; 4]> {
     let mut out = Vec::new();
-    for a in &items {
-        let dict = match &*doc.resolve(a) {
-            pdfcraft_cos::Object::Dict(d) => d.clone(),
-            _ => continue,
-        };
+    for dict in annotations {
         if dict.name(b"Subtype") != Some(b"Redact") {
             continue;
         }
@@ -194,5 +209,5 @@ fn annots(doc: &Document, page: &Dict) -> Result<Vec<[f64; 4]>, AuditError> {
             out.push([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]);
         }
     }
-    Ok(out)
+    out
 }

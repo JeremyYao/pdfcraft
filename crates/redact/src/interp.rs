@@ -247,7 +247,12 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
 /// image shown on another page, or again outside a mark). A dictionary that loses an entry is
 /// replaced by a private copy on its node, so a dictionary object shared with other nodes is
 /// left as it is for them. Fails closed when a page's use of a name cannot be told.
-pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef]) -> Result<(), RedactError> {
+///
+/// `copies` are the rewritten form copies. One made for a form without /Resources of its own
+/// was given its caller's dictionary, which names the original form (the one the copy replaces)
+/// and whatever else the caller dropped: those entries go from the copy too, unless the copy's
+/// own content still draws the name.
+pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], copies: &[ObjRef]) -> Result<(), RedactError> {
     if doomed.is_empty() {
         return Ok(());
     }
@@ -313,6 +318,36 @@ pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef]) -> Result<(),
             let mut res = res;
             res.set(b"XObject".to_vec(), Object::Dict(xo));
             doc.update_dict(node, |d| d.set(b"Resources".to_vec(), Object::Dict(res)))?;
+        }
+    }
+    for copy in copies {
+        let obj = doc.get(*copy);
+        let Object::Stream(s) = &*obj else { continue };
+        let Some(res) = s.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()) else { continue };
+        let mut xo = res_dict(doc, &res, b"XObject");
+        let names: Vec<Vec<u8>> = xo.iter().filter(|(_, v)| v.as_ref().is_some_and(|r| doomed.contains(&r))).map(|(n, _)| n.to_vec()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        // A copy whose content cannot be read may still draw the name: fail closed.
+        let content = s.decoded().map_err(|_| RedactError::Residue(1))?;
+        let mut pruned = false;
+        for n in names {
+            match content_draws(doc, std::slice::from_ref(&content), &xo, &n, 0, &mut HashSet::new()) {
+                Some(true) => {}
+                Some(false) => {
+                    xo.remove(&n);
+                    pruned = true;
+                }
+                None => return Err(RedactError::Residue(1)),
+            }
+        }
+        if pruned {
+            let mut res = res;
+            res.set(b"XObject".to_vec(), Object::Dict(xo));
+            let mut dict = s.dict.clone();
+            dict.set(b"Resources".to_vec(), Object::Dict(res));
+            doc.set(*copy, Object::Stream(Stream { dict, raw: s.raw.clone() }));
         }
     }
     Ok(())

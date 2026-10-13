@@ -940,3 +940,29 @@ fn redacting_every_inheriting_page_retires_the_parent_resources() {
         assert_eq!(under(&mut saved, page, &[[0.0, 190.0, 300.0, 220.0]]), 0);
     }
 }
+
+/// A form without /Resources draws through its caller's. Its rewritten copy was given the
+/// caller's dictionary, which still named the original form (and whatever else the page dropped):
+/// the original, with the text under the mark, stayed reachable from the copy and survived a
+/// full-rewrite save.
+#[test]
+fn the_original_of_a_bare_form_does_not_survive_through_its_copys_resources() {
+    let mut doc = one_page(
+        b"/FmBare Do",
+        "/XObject << /FmBare 7 0 R /Im1 8 0 R >>",
+        vec![
+            stream(
+                "/Type /XObject /Subtype /Form /BBox [0 0 300 300]",
+                b"q 50 0 0 50 20 230 cm /Im1 Do Q BT /F1 12 Tf 20 250 Td (REDFORMSECRETTEXT) Tj ET",
+            ),
+            stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"REDIMGONECOVERED"),
+        ],
+    );
+    mark(&mut doc, 0, &[[0.0, 200.0, 300.0, 300.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert!(r.images_removed == 1 && r.forms_rewritten == 1, "{r:?}");
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(!has(b"REDFORMSECRETTEXT"), "the form's text under the mark survived the save");
+    assert!(!has(b"REDIMGONECOVERED"), "the image the form drew survived the save");
+}

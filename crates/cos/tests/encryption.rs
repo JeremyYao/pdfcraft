@@ -279,3 +279,24 @@ fn signature_contents_stay_unencrypted() {
         assert_eq!(string(2, b"Contents"), b"Private note", "{alg:?}");
     }
 }
+
+/// A stray token in the encryption dictionary: this parser skips it, the renderer's stops at it
+/// and draws the undecrypted bytes, so signing or redacting the decrypted page would act on
+/// content the user never saw. Such a file is refused rather than read two ways.
+#[test]
+fn an_encryption_dictionary_with_skipped_tokens_is_refused() {
+    for alg in ALL {
+        let bytes = protect(alg, "", "owner", -1);
+        assert!(Document::open(Arc::new(bytes.clone())).is_ok(), "{alg:?}: the sound file opens");
+        // `/Filter /Standard` becomes `/Filter/Standard]`: the same bytes long, the entry
+        // intact, and one stray token between entries.
+        let at = bytes.windows(17).position(|w| w == b"/Filter /Standard").unwrap();
+        let mut damaged = bytes;
+        damaged[at..at + 17].copy_from_slice(b"/Filter/Standard]");
+        match Document::open(Arc::new(damaged)) {
+            Err(CosError::Security(why)) => assert!(why.contains("damaged"), "{alg:?}: {why}"),
+            Err(e) => panic!("{alg:?}: refused for another reason: {e}"),
+            Ok(_) => panic!("{alg:?}: opened a file whose encryption dictionary had to be repaired"),
+        }
+    }
+}

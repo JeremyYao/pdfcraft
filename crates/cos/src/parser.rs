@@ -28,11 +28,14 @@ fn is_regular(b: u8) -> bool {
 pub struct Lexer<'a> {
     pub data: &'a [u8],
     pub pos: usize,
+    /// How many tokens were skipped as garbage between dictionary entries (damaged files).
+    /// Another parser may stop at such a token, or read the dictionary differently.
+    pub skipped: u32,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos: pos.min(data.len()) }
+        Self { data, pos: pos.min(data.len()), skipped: 0 }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -286,6 +289,7 @@ impl<'a> Lexer<'a> {
                     if self.pos == before {
                         self.pos += 1;
                     }
+                    self.skipped = self.skipped.saturating_add(1);
                 }
             }
         }
@@ -359,7 +363,7 @@ fn hexval(b: u8) -> Option<u8> {
 /// Parse an indirect object at `offset`: `N G obj <object> [stream…endstream] endobj`.
 /// `resolve_length` resolves an indirect `/Length`. Returns the object and its (num, gen).
 pub fn parse_indirect(data: &[u8], offset: usize, resolve_length: &dyn Fn(ObjRef) -> Option<i64>) -> Result<(ObjRef, Object), CosError> {
-    parse_indirect_in(data, None, offset, resolve_length)
+    parse_indirect_in(data, None, offset, resolve_length).map(|(id, obj, _)| (id, obj))
 }
 
 /// [`parse_indirect`] for a document's own bytes: stream data points into `data` instead of
@@ -369,7 +373,17 @@ pub(crate) fn parse_indirect_shared(
     offset: usize,
     resolve_length: &dyn Fn(ObjRef) -> Option<i64>,
 ) -> Result<(ObjRef, Object), CosError> {
-    parse_indirect_in(data, Some(data), offset, resolve_length)
+    parse_indirect_in(data, Some(data), offset, resolve_length).map(|(id, obj, _)| (id, obj))
+}
+
+/// [`parse_indirect`], also telling whether a dictionary in the object was read leniently
+/// (tokens skipped as garbage): another parser may then read the object differently.
+pub(crate) fn parse_indirect_checked(
+    data: &[u8],
+    offset: usize,
+    resolve_length: &dyn Fn(ObjRef) -> Option<i64>,
+) -> Result<(ObjRef, Object, bool), CosError> {
+    parse_indirect_in(data, None, offset, resolve_length).map(|(id, obj, skipped)| (id, obj, skipped > 0))
 }
 
 fn parse_indirect_in(
@@ -377,7 +391,7 @@ fn parse_indirect_in(
     shared: Option<&Arc<Vec<u8>>>,
     offset: usize,
     resolve_length: &dyn Fn(ObjRef) -> Option<i64>,
-) -> Result<(ObjRef, Object), CosError> {
+) -> Result<(ObjRef, Object, u32), CosError> {
     let mut lx = Lexer::new(data, offset);
     lx.skip_ws();
     let num_tok = lx.token();
@@ -394,9 +408,10 @@ fn parse_indirect_in(
     let obj = match lx.object() {
         Ok(o) => o,
         // "N G obj endobj" (empty) is treated as null.
-        Err(_) if lx.eat_keyword(b"endobj") => return Ok((id, Object::Null)),
+        Err(_) if lx.eat_keyword(b"endobj") => return Ok((id, Object::Null, lx.skipped)),
         Err(e) => return Err(e),
     };
+    let skipped = lx.skipped;
     lx.skip_ws();
     if let Object::Dict(dict) = &obj
         && lx.eat_keyword(b"stream")
@@ -437,9 +452,9 @@ fn parse_indirect_in(
         .ok_or_else(|| CosError::Syntax { offset: start, detail: "stream data past the end of the file".into() })?;
         let mut dict = dict.clone();
         dict.set(b"Length".to_vec(), Object::Int(raw.len() as i64));
-        return Ok((id, Object::Stream(Stream { dict, raw })));
+        return Ok((id, Object::Stream(Stream { dict, raw }), skipped));
     }
-    Ok((id, obj))
+    Ok((id, obj, skipped))
 }
 
 /// Offset where stream data ends (before the EOL preceding "endstream").

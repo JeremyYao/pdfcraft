@@ -5,12 +5,12 @@
 //! Edits never touch the original bytes; the writer appends them (incremental save) or rewrites
 //! the file (full save).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::CosError;
 use crate::object::{Dict, ObjRef, Object};
-use crate::parser::{Lexer, is_whitespace, parse_indirect, parse_indirect_shared};
+use crate::parser::{Lexer, is_whitespace, parse_indirect_checked, parse_indirect_shared};
 
 thread_local! {
     /// The objects being loaded on this thread, innermost last (see `Document::try_get`).
@@ -107,6 +107,9 @@ pub struct Document {
     revisions: Arc<Vec<Revision>>,
     /// See [`Self::xref_oddities`].
     xref_oddities: Arc<Vec<(u64, u32)>>,
+    /// The trailer dictionary was read leniently (tokens skipped as garbage): another reader
+    /// may read what it names, an /Encrypt dictionary above all, differently.
+    trailer_lenient: bool,
     repair_log: Arc<Vec<String>>,
     cache: Arc<Mutex<HashMap<u32, Arc<Object>>>>,
     objstms: Arc<Mutex<HashMap<u32, Arc<ObjStm>>>>,
@@ -222,6 +225,7 @@ impl Document {
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             xref_oddities: Arc::default(),
+            trailer_lenient: false,
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
             objstms: Arc::default(),
@@ -286,6 +290,7 @@ impl Document {
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             xref_oddities: Arc::default(),
+            trailer_lenient: false,
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
             objstms: Arc::default(),
@@ -308,9 +313,10 @@ impl Document {
         let parsed = doc.read_xref_chain(&mut log);
         let mut authenticated = false;
         let ok = match parsed {
-            Ok((entries, trailer, revisions, oddities)) => {
+            Ok((entries, trailer, revisions, oddities, lenient)) => {
                 doc.entries = Arc::new(entries);
                 doc.trailer = trailer;
+                doc.trailer_lenient = lenient;
                 doc.revisions = Arc::new(revisions);
                 doc.xref_oddities = Arc::new(oddities);
                 // Authenticate before checking the catalog: it may sit in an encrypted object
@@ -361,6 +367,20 @@ impl Document {
             self.trailer.remove(b"Encrypt");
             return Ok(());
         };
+        // The renderer reads this dictionary with a parser of its own. Where this parser had to
+        // skip tokens, or had to search for the object because its entry misses it, that parser
+        // may read another dictionary or none: the page would then show undecrypted bytes while
+        // signing and redaction work on the decrypted ones. Refuse rather than read a security
+        // dictionary two ways.
+        let lenient = match enc {
+            Object::Ref(r) => self.read_leniently(r.num),
+            _ => self.trailer_lenient,
+        };
+        if lenient {
+            return Err(CosError::Security(
+                "the encryption dictionary is damaged (tokens had to be skipped, or its cross-reference entry misses it); refusing to read a file another reader cannot decrypt".into(),
+            ));
+        }
         let params = crate::security::encrypt_dict(self, &dict);
         let id0 = self.first_id();
         let handler = pdfcraft_crypt::SecurityHandler::open(params, &id0, password).map_err(|e| match e {
@@ -629,6 +649,38 @@ impl Document {
                 self.objstm(*stream).is_ok_and(|stm| usize::try_from(*index).ok().and_then(|i| stm.index.get(i)).is_some_and(|(n, _)| *n == num))
             }
         }
+    }
+
+    /// Whether object `num` can only be read leniently from the file: its entry misses it (so
+    /// the reader searches), it sits in an object stream, or a dictionary in it was parsed with
+    /// tokens skipped. Another reader may then read something else, or nothing, for the number.
+    fn read_leniently(&self, num: u32) -> bool {
+        let Some(XrefEntry::InFile { offset, .. }) = self.entries.get(&num) else { return true };
+        let at = |off: usize| match parse_indirect_checked(&self.data, off, &|_| None) {
+            Ok((id, _, lenient)) if id.num == num => Some(lenient),
+            _ => None,
+        };
+        let Ok(off) = usize::try_from(*offset) else { return true };
+        at(off).or_else(|| (self.header_offset != 0).then(|| at(off.saturating_add(self.header_offset))).flatten()).unwrap_or(true)
+    }
+
+    /// Object numbers whose `N G obj` header is in the bytes from `from` on, at a line start
+    /// (as a reader that rebuilds its cross-reference by scanning the file finds it), while the
+    /// entry this reader holds for the number does not place it at that header. Such a reader
+    /// reads that body for the number; this one reads another, or none. A writer lists every
+    /// object it appends, so after a signed revision such a header is never part of a
+    /// permitted change. Headers inside stream data count too: a scanning reader takes them.
+    pub fn objects_unlisted_from(&self, from: usize) -> Vec<u32> {
+        let mut out = BTreeSet::new();
+        scan_headers(&self.data, from, |at, num, _| {
+            let here = |off: u64| {
+                usize::try_from(off).is_ok_and(|off| off == at || (self.header_offset != 0 && off.saturating_add(self.header_offset) == at))
+            };
+            if !matches!(self.entries.get(&num), Some(XrefEntry::InFile { offset, .. }) if here(*offset)) {
+                out.insert(num);
+            }
+        });
+        out.into_iter().collect()
     }
 
     /// Object `num` has an unsaved edit.
@@ -995,7 +1047,7 @@ impl Document {
     }
 
     #[allow(clippy::type_complexity)]
-    fn read_xref_chain(&self, log: &mut Vec<String>) -> Result<(BTreeMap<u32, XrefEntry>, Dict, Vec<Revision>, Vec<(u64, u32)>), CosError> {
+    fn read_xref_chain(&self, log: &mut Vec<String>) -> Result<(BTreeMap<u32, XrefEntry>, Dict, Vec<Revision>, Vec<(u64, u32)>, bool), CosError> {
         let data = &self.data;
         let tail_start = data.len().saturating_sub(4096);
         let sx = rfind(data, b"startxref", tail_start).ok_or(CosError::Syntax { offset: data.len(), detail: "no startxref".into() })?;
@@ -1006,6 +1058,7 @@ impl Document {
         };
         let mut entries = BTreeMap::new();
         let mut trailer: Option<Dict> = None;
+        let mut trailer_lenient = false;
         let mut revisions = Vec::new();
         let mut oddities = Vec::new();
         // What each hybrid section's cross-reference stream reaches through its own /Prev where
@@ -1022,7 +1075,7 @@ impl Document {
             let mut sect = BTreeMap::new();
             // Object numbers whose entry in this section was set aside ([`Self::xref_oddities`]).
             let mut odd = Vec::new();
-            let (sect_trailer, is_stream) = match self.read_section(off as usize, &mut sect, &mut odd) {
+            let (sect_trailer, is_stream, lenient) = match self.read_section(off as usize, &mut sect, &mut odd) {
                 Ok(v) => v,
                 Err(e) if self.header_offset > 0 => {
                     log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
@@ -1044,7 +1097,7 @@ impl Document {
             if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
                 let mut stm = BTreeMap::new();
                 match self.read_section(x as usize, &mut stm, &mut odd) {
-                    Ok((stm_dict, _)) => {
+                    Ok((stm_dict, _, _)) => {
                         for (num, e) in stm {
                             match sect.get(&num) {
                                 None | Some(XrefEntry::Free { .. }) => {
@@ -1079,6 +1132,7 @@ impl Document {
             next = sect_trailer.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
             if trailer.is_none() {
                 trailer = Some(sect_trailer);
+                trailer_lenient = lenient;
             }
         }
         for (off, reached) in hybrid_prev {
@@ -1089,7 +1143,7 @@ impl Document {
         for k in [&b"Prev"[..], b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"] {
             trailer.remove(k);
         }
-        Ok((entries, trailer, revisions, oddities))
+        Ok((entries, trailer, revisions, oddities, trailer_lenient))
     }
 
     /// The entries the cross-reference stream of a hybrid file reaches through its own /Prev
@@ -1105,7 +1159,7 @@ impl Document {
                 break;
             }
             let (mut sect, mut odd) = (BTreeMap::new(), Vec::new());
-            let Ok((dict, _)) = self.read_section(off as usize, &mut sect, &mut odd) else { break };
+            let Ok((dict, _, _)) = self.read_section(off as usize, &mut sect, &mut odd) else { break };
             for (num, e) in sect {
                 out.entry(num).or_insert(e);
             }
@@ -1117,7 +1171,7 @@ impl Document {
     /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
     /// collects the object numbers whose entry here is set aside or read differently by another
     /// reader ([`Self::xref_oddities`]).
-    fn read_section(&self, off: usize, entries: &mut BTreeMap<u32, XrefEntry>, odd: &mut Vec<u32>) -> Result<(Dict, bool), CosError> {
+    fn read_section(&self, off: usize, entries: &mut BTreeMap<u32, XrefEntry>, odd: &mut Vec<u32>) -> Result<(Dict, bool, bool), CosError> {
         let data = &self.data;
         let mut lx = Lexer::new(data, off);
         if lx.eat_keyword(b"xref") {
@@ -1126,7 +1180,7 @@ impl Document {
                 if lx.eat_keyword(b"trailer") {
                     let t = lx.object()?;
                     let d = t.as_dict().cloned().ok_or(CosError::Syntax { offset: lx.pos, detail: "trailer is not a dictionary".into() })?;
-                    return Ok((d, false));
+                    return Ok((d, false, lx.skipped > 0));
                 }
                 let (Ok(Object::Int(start)), Ok(Object::Int(count))) = (lx.object(), lx.object()) else {
                     return Err(CosError::Syntax { offset: lx.pos, detail: "bad xref subsection header".into() });
@@ -1180,7 +1234,7 @@ impl Document {
             }
         }
         // Cross-reference stream.
-        let (_, obj) = parse_indirect(data, off, &|_| None)?;
+        let (_, obj, lenient) = parse_indirect_checked(data, off, &|_| None)?;
         let Object::Stream(s) = obj else { return Err(CosError::Syntax { offset: off, detail: "expected xref table or stream".into() }) };
         if s.dict.name(b"Type") != Some(b"XRef") {
             return Err(CosError::Syntax { offset: off, detail: "stream at startxref is not /Type /XRef".into() });
@@ -1256,36 +1310,18 @@ impl Document {
                 }
             }
         }
-        Ok((s.dict.clone(), true))
+        Ok((s.dict.clone(), true, lenient))
     }
 
     /// Rebuild the cross-reference index by scanning for `N G obj` headers (§7.5.4 recovery).
     fn reconstruct(&mut self, log: &mut Vec<String>) -> Result<(), CosError> {
         let data = self.data.clone();
         let mut entries: BTreeMap<u32, XrefEntry> = BTreeMap::new();
-        let mut i = 0;
         let mut objstms = Vec::new();
-        while i < data.len() {
-            // Object headers start at a line start (or after whitespace).
-            let at_start = i == 0 || is_whitespace(data[i - 1]) || data[i - 1] == b'>';
-            if at_start && data[i].is_ascii_digit() {
-                let mut lx = Lexer::new(&data, i);
-                let n = lx.token();
-                lx.skip_ws();
-                let g = lx.token();
-                if !n.is_empty() && !g.is_empty() && n.iter().all(u8::is_ascii_digit) && g.iter().all(u8::is_ascii_digit) && lx.eat_keyword(b"obj") {
-                    let num = std::str::from_utf8(n).ok().and_then(|s| s.parse::<u32>().ok());
-                    let generation = std::str::from_utf8(g).ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-                    if let Some(num) = num {
-                        entries.insert(num, XrefEntry::InFile { offset: i as u64, generation });
-                        objstms.push(num);
-                    }
-                    i = lx.pos;
-                    continue;
-                }
-            }
-            i += 1;
-        }
+        scan_headers(&data, 0, |at, num, generation| {
+            entries.insert(num, XrefEntry::InFile { offset: at as u64, generation });
+            objstms.push(num);
+        });
         if entries.is_empty() {
             return Err(CosError::Syntax { offset: 0, detail: "no objects found".into() });
         }
@@ -1314,11 +1350,12 @@ impl Document {
             if let Ok(Object::Dict(d)) = lx.object()
                 && d.reference(b"Root").is_some_and(|r| matches!(self.try_get(r.num).as_deref(), Ok(Object::Dict(_))))
             {
-                trailer = Some(d);
+                trailer = Some((d, lx.skipped > 0));
             }
         }
+        self.trailer_lenient = trailer.as_ref().is_some_and(|(_, lenient)| *lenient);
         let trailer = match trailer {
-            Some(t) => t,
+            Some((t, _)) => t,
             None => {
                 let catalog = self
                     .entries
@@ -1383,6 +1420,32 @@ const MAX_XREF_OBJECTS: usize = 8_388_607;
 /// How many entries one section can add to [`Document::xref_oddities`]: one is enough to tell
 /// that the section is read differently elsewhere, and a section can declare millions.
 const ODDITIES_PER_SECTION: usize = 1024;
+
+/// Every `N G obj` header in `data` from `from` on, as a reader that rebuilds a cross-reference
+/// by scanning the file finds them: at a line start (or after whitespace or `>`). `f` gets each
+/// header's offset, object number and generation, in file order.
+fn scan_headers(data: &[u8], from: usize, mut f: impl FnMut(usize, u32, u16)) {
+    let mut i = from.min(data.len());
+    while i < data.len() {
+        let at_start = i == 0 || is_whitespace(data[i - 1]) || data[i - 1] == b'>';
+        if at_start && data[i].is_ascii_digit() {
+            let mut lx = Lexer::new(data, i);
+            let n = lx.token();
+            lx.skip_ws();
+            let g = lx.token();
+            if !n.is_empty() && !g.is_empty() && n.iter().all(u8::is_ascii_digit) && g.iter().all(u8::is_ascii_digit) && lx.eat_keyword(b"obj") {
+                let num = std::str::from_utf8(n).ok().and_then(|s| s.parse::<u32>().ok());
+                let generation = std::str::from_utf8(g).ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                if let Some(num) = num {
+                    f(i, num, generation);
+                }
+                i = lx.pos;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
 
 /// Record `num` among a section's oddities, up to [`ODDITIES_PER_SECTION`].
 fn note(odd: &mut Vec<u32>, num: u32) {

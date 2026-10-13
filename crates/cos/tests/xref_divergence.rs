@@ -109,3 +109,26 @@ fn a_hybrid_streams_own_prev_chain_is_recorded_where_it_disagrees() {
     let doc = Document::open(Arc::new(bytes)).unwrap();
     assert!(doc.xref_oddities().is_empty(), "{:?}", doc.xref_oddities());
 }
+
+/// An object body that no cross-reference entry locates: a reader that rebuilds its table by
+/// scanning the file takes it for the number, this reader does not.
+#[test]
+fn object_bodies_no_entry_locates_are_listed() {
+    let (base, prev, _, _) = base();
+    let doc = Document::open(Arc::new(base.clone())).unwrap();
+    assert!(doc.objects_unlisted_from(0).is_empty());
+    // A second body for object 3 after the file, listed by nothing.
+    let mut bytes = base;
+    let body = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n(other)\nendobj\n");
+    let doc = Document::open(Arc::new(bytes.clone())).unwrap();
+    assert_eq!(doc.objects_unlisted_from(body), [3]);
+    assert!(doc.objects_unlisted_from(bytes.len()).is_empty());
+    // The same body listed by an appended section: located, so not unlisted.
+    let section = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n3 1\n{body:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /Prev {prev} >>\nstartxref\n{section}\n%%EOF\n").as_bytes(),
+    );
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    assert!(doc.objects_unlisted_from(body).is_empty(), "{:?}", doc.objects_unlisted_from(body));
+}

@@ -37,8 +37,14 @@ A verification pass re-reads each redacted page and fails the operation if any g
 image is still under an area. Content that can't be decoded makes the operation fail rather than
 leave it unredacted.
 
-Structure cleanup resolves named MCIDs and indirect content references. Form content
-references are updated to the cleaned copy; unchanged sibling descriptions remain.
+Text that stands for removed glyphs goes with them: the property list of every marked-content
+sequence (`BDC`) around a removed or cut item loses its `/ActualText`, `/Alt` and `/E` (an inline
+list is edited; a named list is replaced by a cleaned copy, inline or under a fresh `/Properties`
+name when it holds references, and the shared original is dropped once no surviving `BDC` names
+it). Structure cleanup resolves named MCIDs and indirect content references; the element owning
+changed marked content and every element above it lose `/ActualText`, `/Alt`, `/E` and `/T`, and
+unchanged siblings keep theirs. Form content references are updated to the cleaned copy. Not
+covered: a property list held only by a `/Resources` another, unredacted page still inherits.
 
 A redacted page that inherits `/Resources` from the page tree gets them pinned (by reference;
 a direct inherited dictionary is made one shared object first) before it is rewritten. The parent's
@@ -70,5 +76,4 @@ Security numbers and dates for Search & Redact.
 `CodeSet::from_id("foia")?.overlay(&["(b)(6)"])` gives the overlay text for the picked codes.
 Custom code sets aren't supported yet.
 
-Not yet: pattern locales, struct-tree/alt-text cleanup, metadata and hidden-information
-sanitising (M8.4), re-encoding of DCT images (they are removed instead).
+Not yet: pattern locales, re-encoding of DCT images (they are removed instead).

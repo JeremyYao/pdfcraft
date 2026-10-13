@@ -498,22 +498,36 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
         if changed || !out.xobjects.is_empty() || !out.replaced.is_empty() {
             let mut res = resources.clone();
+            let page_content: Vec<Vec<u8>> = new_list
+                .iter()
+                .map(|o| match &*doc.resolve(o) {
+                    Object::Stream(s) => s.decoded().unwrap_or_default(),
+                    _ => Vec::new(),
+                })
+                .collect();
             if !out.xobjects.is_empty() || !out.replaced.is_empty() {
                 let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
                 // A full save keeps whatever is still referenced: unlink the originals this page no
                 // longer draws so the removed image or form bytes cannot survive in the saved file.
-                let page_content: Vec<Vec<u8>> = new_list
-                    .iter()
-                    .map(|o| match &*doc.resolve(o) {
-                        Object::Stream(s) => s.decoded().unwrap_or_default(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
                 interp::prune(&mut xo, &out.replaced, &page_content);
                 for (n, r) in &out.xobjects {
                     xo.set(n.clone(), Object::Ref(*r));
                 }
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
+            }
+            // For the tag pass: the original property-list names (in the content before) and the
+            // added ones (in the content after) both resolve.
+            let mut tags_res = resources.clone();
+            if !out.properties.is_empty() || !out.replaced_properties.is_empty() {
+                // The lists whose replacement text went with the glyphs they wrapped: the cleaned
+                // copies are added, the shared originals dropped once nothing names them.
+                let mut pr = res.get(b"Properties").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
+                for (n, d) in &out.properties {
+                    pr.set(n.clone(), Object::Dict(d.clone()));
+                }
+                tags_res.set(b"Properties".to_vec(), Object::Dict(pr.clone()));
+                interp::prune_names(&mut pr, &out.replaced_properties, &page_content, "BDC", 1);
+                res.set(b"Properties".to_vec(), Object::Dict(pr));
             }
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));
@@ -522,7 +536,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             // Tags must not keep what the page no longer shows.
             let after = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
             let (_, new_data) = page_streams(doc, &after, pi)?;
-            let (changed_ids, empty_ids) = tags::touched(doc, &resources, &data.join(&b'\n'), &new_data.join(&b'\n'));
+            let (changed_ids, empty_ids) = tags::touched(doc, &tags_res, &data.join(&b'\n'), &new_data.join(&b'\n'));
             report.tags += tags::clean(doc, page.obj, None, &changed_ids, &empty_ids)?;
         }
 

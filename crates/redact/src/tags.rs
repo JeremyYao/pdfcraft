@@ -2,8 +2,9 @@
 //!
 //! Marked content (MCIDs) that applying redactions changed is found by comparing each MCID's
 //! operators before and after. Elements owning such content lose their alternate text, actual
-//! text and expansion (which may spell out the removed words);
-//! references to marked content that is now empty are dropped from the element.
+//! text, expansion and title (which may spell out the removed words), and so does every element
+//! above them, since those describe the same subtree; references to marked content that is now
+//! empty are dropped from the element.
 
 use std::collections::{HashMap, HashSet};
 
@@ -114,25 +115,31 @@ pub(crate) fn clean(
     else {
         return Ok(0);
     };
-    // Indirect elements with the page they inherit.
-    let mut todo: Vec<(Object, Option<ObjRef>)> = root.get(b"K").map(|k| vec![(k.clone(), None)]).unwrap_or_default();
+    // Indirect elements with the page they inherit and the element above them.
+    let mut todo: Vec<(Object, Option<ObjRef>, Option<ObjRef>)> = root.get(b"K").map(|k| vec![(k.clone(), None, None)]).unwrap_or_default();
     let mut seen = HashSet::new();
+    // Each element's parent as the walk found it (not `/P`, which a malformed tree may point
+    // anywhere): an element is reached once, after its parent, so following this is acyclic.
+    let mut parents: HashMap<ObjRef, ObjRef> = HashMap::new();
     let mut hits: Vec<(ObjRef, Dict, Option<ObjRef>, bool)> = Vec::new();
-    while let Some((k, pg)) = todo.pop() {
+    while let Some((k, pg, parent)) = todo.pop() {
         match k {
-            Object::Array(a) => todo.extend(a.into_iter().map(|x| (x, pg))),
+            Object::Array(a) => todo.extend(a.into_iter().map(|x| (x, pg, parent))),
             Object::Ref(r) => {
                 if !seen.insert(r) || seen.len() > 2_000_000 {
                     continue;
                 }
                 let object = doc.get(r);
                 if let Object::Array(a) = &*object {
-                    todo.extend(a.iter().cloned().map(|x| (x, pg)));
+                    todo.extend(a.iter().cloned().map(|x| (x, pg, parent)));
                     continue;
                 }
                 let Some(d) = object.as_dict().cloned() else { continue };
                 if !d.contains(b"S") {
                     continue;
+                }
+                if let Some(p) = parent {
+                    parents.insert(r, p);
                 }
                 let pg = d.get(b"Pg").and_then(Object::as_ref).or(pg);
                 let kids: Vec<Object> = match d.get(b"K").map(|k| doc.resolve(k)) {
@@ -147,12 +154,13 @@ pub(crate) fn clean(
                 if sensitive || remap {
                     hits.push((r, d.clone(), pg, sensitive));
                 }
-                todo.extend(kids.into_iter().map(|x| (x, pg)));
+                todo.extend(kids.into_iter().map(|x| (x, pg, Some(r))));
             }
             _ => {}
         }
     }
     let mut n = 0;
+    let owners: Vec<ObjRef> = hits.iter().filter(|h| h.3).map(|h| h.0).collect();
     for (r, d, pg, sensitive) in hits {
         let kids = d.get(b"K").map(|k| doc.resolve(k));
         let array = kids.as_ref().is_some_and(|k| matches!(&**k, Object::Array(_)));
@@ -186,7 +194,7 @@ pub(crate) fn clean(
         }
         doc.update_dict(r, |e| {
             if sensitive {
-                for key in [&b"Alt"[..], b"ActualText", b"E"] {
+                for key in DESCRIPTIVE_KEYS {
                     e.remove(key);
                 }
             }
@@ -200,5 +208,35 @@ pub(crate) fn clean(
         })?;
         n += usize::from(sensitive && doc.get(r).as_dict() != Some(&d));
     }
+    // The elements above an owner describe the same subtree (their actual text replaces it, their
+    // alternate text and title describe it): they lose that text too, up to the tree root. One
+    // cleaned already was climbed from before, and so were its ancestors.
+    let mut cleaned: HashSet<ObjRef> = HashSet::new();
+    for owner in owners {
+        let mut cur = parents.get(&owner).copied();
+        let mut steps = 0usize;
+        while let Some(p) = cur {
+            steps = steps.saturating_add(1);
+            if steps > 100_000 || !cleaned.insert(p) {
+                break;
+            }
+            if doc.get(p).as_dict().is_some_and(|d| DESCRIPTIVE_KEYS.iter().any(|k| d.contains(k))) {
+                doc.update_dict(p, |e| {
+                    for key in DESCRIPTIVE_KEYS {
+                        e.remove(key);
+                    }
+                })?;
+                n += 1;
+            }
+            cur = parents.get(&p).copied();
+        }
+    }
     Ok(n)
 }
+
+/// What a structure element says about its content: the replacement text a reader may show in
+/// its place (`REPLACEMENT_KEYS`) and the title that names it. A title names a section rather
+/// than spelling its content, but nothing says it never repeats the removed words, so it goes
+/// too (fail closed).
+const DESCRIPTIVE_KEYS: [&[u8]; 4] =
+    [crate::interp::REPLACEMENT_KEYS[0], crate::interp::REPLACEMENT_KEYS[1], crate::interp::REPLACEMENT_KEYS[2], b"T"];

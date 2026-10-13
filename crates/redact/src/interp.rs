@@ -77,7 +77,18 @@ pub(crate) struct Output {
     /// is not everything the page shows: apply must fail closed.
     pub unreadable: bool,
     pub tag_changes: Vec<(ObjRef, ObjRef, HashSet<i64>, HashSet<i64>)>,
+    /// Property lists rewritten without their replacement text and added under a fresh name,
+    /// because the named list held indirect references and so could not be written inline.
+    pub properties: Vec<(Vec<u8>, Dict)>,
+    /// `/Properties` names whose `BDC` this scope rewrote (inline, or under a fresh name): the
+    /// caller drops them unless a surviving `BDC` still names them, so the shared original with
+    /// its replacement text does not stay in the file.
+    pub replaced_properties: Vec<Vec<u8>>,
 }
+
+/// The keys of a property list, or a structure element, whose value stands for the content: text
+/// a reader may show, search or read out in place of the glyphs.
+pub(crate) const REPLACEMENT_KEYS: [&[u8]; 3] = [b"ActualText", b"Alt", b"E"];
 
 pub(crate) struct Scope<'a> {
     pub rects: &'a [[f64; 4]],
@@ -208,21 +219,131 @@ fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
     }
 }
 
+fn fresh_property_name(scope: &mut Scope<'_>, props: &Dict) -> Vec<u8> {
+    let mut i = scope.used_names.len() + 1;
+    loop {
+        let n = format!("PCRedactedP{i}").into_bytes();
+        if !props.contains(&n) && !scope.used_names.contains(&n) {
+            scope.used_names.push(n.clone());
+            return n;
+        }
+        i += 1;
+    }
+}
+
 /// Drop every `replaced` resource name whose `Do` no longer appears in the rewritten `content`,
 /// so a full-rewrite save stops reaching the original image or form it named. A name that some
 /// surviving `Do` still draws (the same image shown again outside a mark) is kept.
 pub(crate) fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
+    prune_names(xo, replaced, content, "Do", 0);
+}
+
+/// Drop every `replaced` name of a resource dictionary that no surviving `operator` in `content`
+/// names as its operand `operand` (`Do` and an XObject, `BDC` and a property list), so a
+/// full-rewrite save stops reaching what it named.
+pub(crate) fn prune_names(dict: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>], operator: &str, operand: usize) {
     if replaced.is_empty() {
         return;
     }
     let joined = Pieces::join(content);
     let ops = joined.parse().ops;
-    let still_drawn = |n: &[u8]| ops.iter().any(|op| op.is("Do") && op.name(0) == Some(n));
+    let still_named = |n: &[u8]| ops.iter().any(|op| op.is(operator) && op.name(operand) == Some(n));
     for n in replaced {
-        if !still_drawn(n) {
-            xo.remove(n);
+        if !still_named(n) {
+            dict.remove(n);
         }
     }
+}
+
+/// Does this value hold an indirect reference anywhere (which a content stream cannot carry)?
+fn has_ref(o: &Object, depth: usize) -> bool {
+    if depth > 64 {
+        return true; // too deep to tell: treat as not inlinable
+    }
+    match o {
+        Object::Ref(_) => true,
+        Object::Array(a) => a.iter().any(|x| has_ref(x, depth + 1)),
+        Object::Dict(d) => d.iter().any(|(_, v)| has_ref(v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Strip the replacement text (`REPLACEMENT_KEYS`) from a `BDC`'s property list. An inline
+/// dictionary is edited in place. A named one is resolved and written inline, leaving the shared
+/// original for sequences that were not touched (the caller drops it once nothing names it); one
+/// that holds indirect references is added to `out.properties` under a fresh name instead.
+/// Returns whether the operator changed.
+fn clean_property_list(doc: &Document, scope: &mut Scope<'_>, op: &mut Op, props: &Dict, out: &mut Output) -> bool {
+    let has_text = |d: &Dict| REPLACEMENT_KEYS.iter().any(|k| d.contains(k));
+    let cleaned = |d: &Dict| {
+        let mut d = d.clone();
+        for k in REPLACEMENT_KEYS {
+            d.remove(k);
+        }
+        d
+    };
+    let new = match op.operands.get(1) {
+        Some(Object::Dict(d)) if has_text(d) => Object::Dict(cleaned(d)),
+        Some(Object::Name(n)) => {
+            let Some(list) = props.get(n).map(|o| doc.resolve(o)) else { return false };
+            let Some(d) = list.as_dict() else { return false };
+            if !has_text(d) {
+                return false;
+            }
+            out.replaced_properties.push(n.clone());
+            let d = cleaned(d);
+            if d.iter().any(|(_, v)| has_ref(v, 0)) {
+                let fresh = fresh_property_name(scope, props);
+                out.properties.push((fresh.clone(), d));
+                Object::Name(fresh)
+            } else {
+                Object::Dict(d)
+            }
+        }
+        _ => return false,
+    };
+    match op.operands.get_mut(1) {
+        Some(slot) => {
+            *slot = new;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The pieces of a content stream rewritten so far, and the marked-content sequences still open
+/// across them.
+#[derive(Default)]
+struct Built {
+    /// Each finished piece's operators and whether it changed; the piece being built is the next.
+    done: Vec<(Vec<Op>, bool)>,
+    /// The open sequences: where each `BDC` went (piece, index in that piece), `None` for a `BMC`
+    /// or a list cleaned already.
+    open: Vec<Option<(usize, usize)>>,
+}
+
+/// Something inside the open marked-content sequences was removed or cut: the text that stood
+/// for it goes from every enclosing `BDC`'s property list, whether that `BDC` is in the piece
+/// being built (`ops`) or an earlier one (whose piece is then flagged as changed). Returns
+/// whether `ops` changed. A sequence cleaned once is forgotten (`None`).
+fn cut_sequences(doc: &Document, scope: &mut Scope<'_>, built: &mut Built, ops: &mut [Op], props: &Dict, out: &mut Output) -> bool {
+    let current = built.done.len();
+    let mut changed = false;
+    for slot in built.open.iter_mut() {
+        let Some((piece, index)) = *slot else { continue };
+        *slot = None;
+        let op = if piece == current { ops.get_mut(index) } else { built.done.get_mut(piece).and_then(|(v, _)| v.get_mut(index)) };
+        let Some(op) = op else { continue };
+        if !clean_property_list(doc, scope, op, props, out) {
+            continue;
+        }
+        if piece == current {
+            changed = true;
+        } else if let Some((_, c)) = built.done.get_mut(piece) {
+            *c = true;
+        }
+    }
+    changed
 }
 
 /// Whether `content` draws the XObject `name` of the resource dictionary `xo`: directly, or
@@ -419,9 +540,9 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
     let joined = Pieces::join(streams);
     let mut parsed = joined.parse();
     out.unreadable |= parsed.unterminated_inline_image;
+    let props = res_dict(doc, resources, b"Properties");
     if !scope.hidden_layers.is_empty() {
-        let props = res_dict(doc, resources, b"Properties");
-        let (kept, removed, dropped) = strip_hidden_layers(doc, scope, parsed.ops, &props);
+        let (kept, removed, dropped) = strip_hidden_layers(doc, scope, parsed.ops, &props, &mut out);
         parsed.ops = kept;
         if removed > 0 {
             scope.layer_blocks += removed;
@@ -452,6 +573,9 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
         }
     }
 
+    // When something inside an open marked-content sequence is removed or cut, the enclosing
+    // property lists lose the text that stood for it (`cut_sequences`).
+    let mut built = Built { done: Vec::with_capacity(streams.len()), open: Vec::new() };
     for (piece, mut changed) in pieces.into_iter().zip(rewrite) {
         let mut ops: Vec<Op> = Vec::with_capacity(piece.len());
         for op in piece {
@@ -486,6 +610,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 }
                 let b = bbox.unwrap_or_default();
                 changed = true;
+                cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                 if scope.covered(b) {
                     scope.report.paths_removed += 1;
                     if clips {
@@ -630,6 +755,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     }
                     changed = true;
                     scope.report.glyphs += removed;
+                    cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                     match o {
                         b"\"" => {
                             ops.push(Op::new("Tw", vec![num(gs.word_spacing)]));
@@ -650,6 +776,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                         } else {
                             scope.report.images_removed += 1;
                             changed = true;
+                            cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                             continue;
                         }
                     }
@@ -658,6 +785,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     // A shading fills the current clip: clip the regions out.
                     if let Some(c) = clip_out(scope.rects, &gs.ctm, [-1e6, -1e6, 1e6, 1e6]) {
                         changed = true;
+                        cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                         ops.push(Op::new("q", vec![]));
                         ops.extend(c);
                         ops.push(op);
@@ -668,11 +796,17 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 b"Do" => {
                     if let Some(new) = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out) {
                         changed = true;
+                        cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                         if let Some(n) = new {
                             ops.push(n);
                         }
                         continue;
                     }
+                }
+                b"BDC" => built.open.push(Some((built.done.len(), ops.len()))),
+                b"BMC" => built.open.push(None),
+                b"EMC" => {
+                    built.open.pop();
                 }
                 _ => {}
             }
@@ -681,6 +815,9 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
         if !path.is_empty() {
             ops.append(&mut path);
         }
+        built.done.push((ops, changed));
+    }
+    for (ops, changed) in built.done {
         out.streams.push(changed.then(|| serialize_ops(&ops)));
     }
     out
@@ -876,6 +1013,16 @@ fn xobject(
             // `Do` the copy no longer makes stops keeping the original image or form reachable.
             let mut res = res;
             let mut rebuilt = false;
+            // For the tag pass: the original names (in the content before) and the added ones (in
+            // the content after) both resolve.
+            let mut tags_res = res.clone();
+            if !inner.properties.is_empty() {
+                let mut pr = res_dict(doc, &tags_res, b"Properties");
+                for (n, d) in &inner.properties {
+                    pr.set(n.clone(), Object::Dict(d.clone()));
+                }
+                tags_res.set(b"Properties".to_vec(), Object::Dict(pr));
+            }
             if !inner.xobjects.is_empty() || !inner.replaced.is_empty() {
                 let mut xo = res_dict(doc, &res, b"XObject");
                 if let Some(d) = &new_data {
@@ -899,10 +1046,23 @@ fn xobject(
                     rebuilt = true;
                 }
             }
-            if rebuilt {
-                dict.set(b"Resources".to_vec(), Object::Dict(res.clone()));
+            // And the property lists whose replacement text went with the glyphs they wrapped:
+            // the cleaned copies are added, the shared originals dropped once nothing names them.
+            if !inner.properties.is_empty() || !inner.replaced_properties.is_empty() {
+                let mut pr = res_dict(doc, &res, b"Properties");
+                if let Some(d) = &new_data {
+                    prune_names(&mut pr, &inner.replaced_properties, std::slice::from_ref(d), "BDC", 1);
+                }
+                for (n, d) in &inner.properties {
+                    pr.set(n.clone(), Object::Dict(d.clone()));
+                }
+                res.set(b"Properties".to_vec(), Object::Dict(pr));
+                rebuilt = true;
             }
-            let (changed, empty) = tags::touched(doc, &res, &data, new_data.as_deref().unwrap_or(&data));
+            if rebuilt {
+                dict.set(b"Resources".to_vec(), Object::Dict(res));
+            }
+            let (changed, empty) = tags::touched(doc, &tags_res, &data, new_data.as_deref().unwrap_or(&data));
             let stream = match new_data {
                 Some(d) => Stream::flate(dict, &d),
                 None => Stream { dict, raw: s.raw.clone() },
@@ -923,15 +1083,17 @@ fn xobject(
 
 /// Remove marked-content blocks of hidden layers (`/OC /name BDC … EMC`, nested blocks
 /// included). Returns the remaining operators, how many blocks went, and the XObject names of
-/// the `Do` operators that went with them.
-fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &Dict) -> (Vec<Op>, usize, Vec<Vec<u8>>) {
-    let mut out = Vec::with_capacity(ops.len());
-    // For each open marked-content block: does it hide its contents?
-    let mut stack: Vec<bool> = Vec::new();
+/// the `Do` operators that went with them. A kept sequence around a removed block loses the
+/// text that stood for its content (`clean_property_list`).
+fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, props: &Dict, out: &mut Output) -> (Vec<Op>, usize, Vec<Vec<u8>>) {
+    let mut kept = Vec::with_capacity(ops.len());
+    // For each open marked-content block: does it hide its contents, and where its `BDC` went in
+    // `kept` (when it was kept and not cleaned yet).
+    let mut stack: Vec<(bool, Option<usize>)> = Vec::new();
     let mut removed = 0;
     let mut dropped: Vec<Vec<u8>> = Vec::new();
     for op in ops {
-        let hidden_now = stack.last().copied().unwrap_or(false);
+        let hidden_now = stack.last().is_some_and(|s| s.0);
         match op.op.as_slice() {
             b"BDC" | b"BMC" => {
                 let this = op.is("BDC")
@@ -943,21 +1105,30 @@ fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &
                     };
                 if this && !hidden_now {
                     removed += 1;
+                    if scope.mode == Mode::Apply {
+                        for slot in stack.iter_mut() {
+                            let Some(i) = slot.1.take() else { continue };
+                            if let Some(bdc) = kept.get_mut(i) {
+                                clean_property_list(doc, scope, bdc, props, out);
+                            }
+                        }
+                    }
                 }
-                stack.push(hidden_now || this);
-                if !(hidden_now || this) {
-                    out.push(op);
+                let keep = !(hidden_now || this);
+                stack.push((hidden_now || this, (keep && op.is("BDC")).then_some(kept.len())));
+                if keep {
+                    kept.push(op);
                 }
             }
             b"EMC" => {
-                let was = stack.pop().unwrap_or(false);
+                let was = stack.pop().is_some_and(|s| s.0);
                 if !was {
-                    out.push(op);
+                    kept.push(op);
                 }
             }
             _ => {
                 if !hidden_now {
-                    out.push(op);
+                    kept.push(op);
                 } else if op.is("Do")
                     && let Some(n) = op.name(0)
                     && !dropped.iter().any(|d| d == n)
@@ -967,7 +1138,7 @@ fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &
             }
         }
     }
-    (out, removed, dropped)
+    (kept, removed, dropped)
 }
 
 /// Drop the `/Properties` entries that name a hidden layer (an off OCG, or an OCMD all of whose

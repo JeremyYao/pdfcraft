@@ -334,13 +334,18 @@ fn content_pass(doc: &mut Document, text: bool, layers: bool, write: bool) -> Re
                 }
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
             }
-            if layers {
+            if layers || !out.properties.is_empty() || !out.replaced_properties.is_empty() {
                 // The off layers' property lists go with their blocks, so the group dictionaries
-                // (and their names) stop being reachable through the page.
+                // (and their names) stop being reachable through the page; the lists whose
+                // replacement text went with hidden glyphs are replaced by cleaned copies.
                 let mut pr = res.get(b"Properties").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
                 let before = pr.len();
                 crate::interp::prune_properties(doc, &off, &mut pr, &page_content);
-                if pr.len() != before {
+                crate::interp::prune_names(&mut pr, &out.replaced_properties, &page_content, "BDC", 1);
+                for (n, d) in &out.properties {
+                    pr.set(n.clone(), Object::Dict(d.clone()));
+                }
+                if pr.len() != before || !out.properties.is_empty() {
                     res.set(b"Properties".to_vec(), Object::Dict(pr));
                 }
             }

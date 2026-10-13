@@ -1697,3 +1697,91 @@ fn multimedia_scripts_embedded_files_paths_and_thumbnails_are_removed() {
     assert_eq!(counts[&Hidden::Attachments], 7, "the embedded file, the five multimedia annotations and the rendition");
     assert_eq!(counts[&Hidden::LinksActionsScripts], 6, "the link, two Screen actions, the document script, the slideshow and the 3D script");
 }
+
+/// The property list of a `BDC` wrapping redacted glyphs (inline, or a named /Properties entry)
+/// kept /ActualText, /Alt and /E, whether every glyph in the span went or only part of it, so
+/// the saved content stream and the page's /Properties still spelled the redacted text.
+#[test]
+fn marked_content_property_lists_lose_the_replacement_text_of_redacted_glyphs() {
+    let src = b"/Span <</ActualText (QINLINEACTUAL)>> BDC BT /F1 10 Tf 10 250 Td (GLYPHAAA1) Tj ET EMC \
+/Span /PL1 BDC BT /F1 10 Tf 10 235 Td (GLYPHBBB2) Tj ET EMC \
+/Span <</Alt (QINLINEALT) /E (QINLINEEXP)>> BDC BT /F1 10 Tf 10 220 Td (GLYPHCCC3) Tj ET EMC \
+/Span /PL2 BDC BT /F1 10 Tf 10 205 Td (GLYPHDDD4) Tj ET EMC \
+/Span <</ActualText (QPARTIALACTUAL)>> BDC BT /F1 10 Tf 10 150 Td (HALFGONEHALFKEPT) Tj ET EMC \
+/Span <</ActualText (QCONTROLKEPT)>> BDC BT /F1 10 Tf 10 50 Td (OUTSIDEMARK) Tj ET EMC \
+/Span /PL1 BDC BT /F1 10 Tf 10 30 Td (NAMEDTWICE) Tj ET EMC";
+    // PL1 is named by a redacted span and by one outside the marks; PL2 holds an indirect
+    // reference, so it cannot be written inline.
+    let mut doc = one_page(
+        src,
+        "/Properties << /PL1 << /ActualText (QNAMEDACTUAL) /Lang (en) >> /PL2 << /ActualText (QNAMEDREFACTUAL) /Lang 7 0 R >> >>",
+        vec![b"(en-GB)".to_vec()],
+    );
+    mark(&mut doc, 0, &[[5.0, 200.0, 100.0, 262.0], [5.0, 145.0, 50.0, 162.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.glyphs, 9 * 4 + 8, "{r:?}");
+    for secret in [&b"QINLINEACTUAL"[..], b"QINLINEALT", b"QINLINEEXP", b"QNAMEDREFACTUAL", b"QPARTIALACTUAL", b"HALFGONE"] {
+        assert!(!saved_contains(&doc, secret), "{} survived the save", String::from_utf8_lossy(secret));
+    }
+    let c = content(&doc, 0);
+    assert!(c.contains("QNAMEDACTUAL") || saved_contains(&doc, b"QNAMEDACTUAL"), "the list a span outside the marks still names is kept: {c}");
+    assert!(!c.contains("/PL1 BDC\nBT\n/F1 10 Tf\n10 235 Td"), "the redacted span no longer names the shared list: {c}");
+    for kept in [&b"QCONTROLKEPT"[..], b"OUTSIDEMARK", b"HALFKEPT", b"NAMEDTWICE", b"en-GB"] {
+        assert!(saved_contains(&doc, kept), "{} was removed", String::from_utf8_lossy(kept));
+    }
+    // Every BDC still has its tag and a property list, and the one with the reference is named.
+    let saved = reopen(&doc);
+    let p = &pdfcraft_model::pages(&saved)[0];
+    let props = p
+        .dict
+        .get(b"Resources")
+        .and_then(|r| saved.resolve(r).as_dict().cloned())
+        .and_then(|r| r.get(b"Properties").and_then(|x| saved.resolve(x).as_dict().cloned()))
+        .unwrap();
+    assert!(!props.contains(b"PL2"), "the shared list nothing names any more is gone: {props:?}");
+    for op in pdfcraft_content::parse(content(&saved, 0).as_bytes()).ops.iter().filter(|op| op.is("BDC")) {
+        assert_eq!(op.operands.len(), 2, "{op:?}");
+        if let Some(n) = op.name(1) {
+            assert!(props.contains(n), "{} names nothing in {props:?}", String::from_utf8_lossy(n));
+        }
+    }
+}
+
+/// Structure elements above the one that directly owns the redacted marked content describe
+/// the same subtree, so their /ActualText, /Alt, /E (and /T) go too; an untouched sibling keeps
+/// its own.
+#[test]
+fn structure_elements_above_the_owner_lose_their_replacement_text() {
+    let content = b"/P <</MCID 0>> BDC BT /F1 10 Tf 10 200 Td (GLYPHDDD4) Tj ET EMC /P <</MCID 1>> BDC BT /F1 10 Tf 10 100 Td (Public) Tj ET EMC";
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 7 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /StructParents 0 /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+        stream("", content),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /StructTreeRoot /K 8 0 R >>".to_vec(),
+        b"<< /S /Document /P 7 0 R /ActualText (QGRANDACTUAL) /K [9 0 R] >>".to_vec(),
+        b"<< /S /Sect /P 8 0 R /ActualText (QPARENTACTUAL) /Alt (QPARENTALT) /E (QPARENTEXP) /T (QPARENTTITLE) /K [10 0 R 11 0 R] >>".to_vec(),
+        b"<< /S /P /P 9 0 R /Pg 3 0 R /ActualText (QOWNERACTUAL) /Alt (QOWNERALT) /E (QOWNEREXP) /T (QOWNERTITLE) /K 0 >>".to_vec(),
+        b"<< /S /P /P 9 0 R /Pg 3 0 R /ActualText (QSIBLINGKEPT) /T (QSIBLINGTITLE) /K 1 >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    for secret in [
+        &b"GLYPHDDD4"[..],
+        b"QOWNERACTUAL",
+        b"QOWNERALT",
+        b"QOWNEREXP",
+        b"QOWNERTITLE",
+        b"QPARENTACTUAL",
+        b"QPARENTALT",
+        b"QPARENTEXP",
+        b"QPARENTTITLE",
+        b"QGRANDACTUAL",
+    ] {
+        assert!(!saved_contains(&doc, secret), "{} survived the save", String::from_utf8_lossy(secret));
+    }
+    assert!(saved_contains(&doc, b"QSIBLINGKEPT") && saved_contains(&doc, b"QSIBLINGTITLE"), "the untouched sibling keeps its text");
+    assert_eq!(r.tags, 3, "the owner, its parent and its grandparent changed: {r:?}");
+}

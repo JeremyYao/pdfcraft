@@ -2280,3 +2280,44 @@ fn an_unsigned_signature_field_added_after_certifying_is_not_a_signature() {
     assert_eq!(s.status, Status::Valid, "{:?} {:?}", s.modification, s.details);
     assert!(matches!(&s.modification, Modification::Allowed(k) if k.contains(&"signature")), "{:?}", s.modification);
 }
+
+fn fill_amount(doc: &mut Document) {
+    doc.update_dict(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, |d| d.set(b"V".to_vec(), PdfString::text("999999"))).unwrap();
+}
+
+/// A signer who locks fields (the signature field's /Lock, written into the signature as a
+/// FieldMDP reference) means them not to change: filling a locked field afterwards is a change
+/// no permission covers, filling an unlocked one is still form fill, and another signature
+/// afterwards is still a signature.
+#[test]
+fn a_field_the_signer_locked_may_not_be_filled_in_afterwards() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let id2 = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone(), id2.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.field == "Approval").unwrap();
+    let cases = [
+        ("/Lock << /Type /SigFieldLock /Action /All >>", true),
+        ("/Lock << /Type /SigFieldLock /Action /Include /Fields [(Amount)] >>", true),
+        ("/Lock << /Type /SigFieldLock /Action /Include /Fields [(Other)] >>", false),
+        ("/Lock << /Type /SigFieldLock /Action /Exclude /Fields [(Amount)] >>", false),
+        ("", false),
+    ];
+    for (lock, locked) in cases {
+        let signed =
+            pdfcraft_sign::sign(&open(&fixture_with_text_field(lock)), &id, &SignOptions { field: Some("Approval".into()), ..opts() }).unwrap();
+        assert_eq!(String::from_utf8_lossy(&signed).contains("/FieldMDP"), !lock.is_empty(), "{lock}: the lock is written as a FieldMDP reference");
+        assert_eq!(check(&signed).status, Status::Valid, "{lock}: untouched");
+        let s = check(&edit_after(&signed, fill_amount));
+        if locked {
+            assert_eq!(s.status, Status::Invalid, "{lock}: {:?} {:?}", s.modification, s.details);
+            assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"other changes")), "{lock}: {:?}", s.modification);
+        } else {
+            assert_eq!(s.status, Status::Valid, "{lock}: {:?} {:?}", s.modification, s.details);
+            assert_eq!(s.modification, Modification::Allowed(vec![kind::FORM_FILL]), "{lock}");
+        }
+        let both = pdfcraft_sign::sign(&open(&signed), &id2, &opts()).unwrap();
+        let s = check(&both);
+        assert_eq!(s.status, Status::Valid, "{lock}, counter-signed: {:?} {:?}", s.modification, s.details);
+        assert_eq!(s.modification, Modification::Allowed(vec![kind::SIGNATURE]), "{lock}, counter-signed");
+    }
+}

@@ -1309,3 +1309,45 @@ fn text_set_through_an_extgstate_font_or_inherited_by_a_form_is_redacted() {
     assert_eq!((r.glyphs, r.forms_rewritten), (4, 1), "inherited font: {r:?}");
     assert!(!any_has(&saved_streams(&doc), b"1234"), "the form's text survived the save");
 }
+
+/// An annotation held directly in the page's /Annots array (not by reference) is an annotation
+/// all the same: under a mark it goes, with its link target or comment text, and a direct pop-up
+/// of a removed annotation goes with it.
+#[test]
+fn annotations_written_directly_in_annots_are_removed_under_a_mark() {
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [\
+          << /Type /Annot /Subtype /Link /Rect [10 195 60 212] /A << /S /URI /URI (http://leak.example/LEAKDIRECTLINK) >> >> \
+          << /Type /Annot /Subtype /Text /Rect [10 195 30 212] /Contents (LEAKDIRECTNOTE) /Popup 7 0 R >> \
+          << /Type /Annot /Subtype /Popup /Rect [100 100 200 150] /Parent 7 0 R >> \
+          7 0 R \
+          << /Type /Annot /Subtype /Square /Rect [200 20 240 60] /Contents (KEEPDIRECTFAR) >> ] >>"
+            .to_vec(),
+        stream("", b"BT /F1 10 Tf 10 200 Td (VISIBLE77) Tj ET"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /Annot /Subtype /Square /Rect [10 195 40 212] /Contents (LEAKINDIRECT) >>".to_vec(),
+    ]);
+    mark(&mut doc, 0, &[[5.0, 190.0, 125.0, 215.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    let mut texts = Vec::new();
+    for (_, object) in saved.scan_objects() {
+        let mut bytes = Vec::new();
+        pdfcraft_cos::serialize(&object, &mut bytes);
+        texts.push(bytes);
+    }
+    for secret in [&b"LEAKDIRECTLINK"[..], b"LEAKDIRECTNOTE", b"LEAKINDIRECT", b"VISIBLE77"] {
+        assert!(!any_has(&texts, secret), "{} survived the save", String::from_utf8_lossy(secret));
+    }
+    assert!(any_has(&texts, b"KEEPDIRECTFAR"));
+    assert_eq!(r.annotations, 3, "{r:?}");
+    let p = pdfcraft_model::pages(&doc).swap_remove(0);
+    let kept: Vec<String> = annots_of(&doc, &p.dict)
+        .iter()
+        .filter_map(|a| doc.resolve(a).as_dict().and_then(|d| d.name(b"Subtype")).map(|s| String::from_utf8_lossy(s).into_owned()))
+        .collect();
+    assert_eq!(kept, ["Square"], "only the far square stays");
+}

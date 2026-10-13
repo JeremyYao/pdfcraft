@@ -477,17 +477,20 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             report.tags += tags::clean(doc, page.obj, Some((old, new)), &changed, &empty)?;
         }
 
-        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups).
+        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups). An entry
+        // of /Annots may be a reference or a dictionary written directly in the array; both are
+        // annotations, so entries are judged resolved and removed by position.
         let annots = annots_of(doc, &doc.get(page.obj).as_dict().cloned().unwrap_or_default());
         let mut removed: Vec<ObjRef> = Vec::new();
-        for a in &annots {
-            let Some(r) = a.as_ref() else { continue };
-            let obj = doc.get(r);
+        let mut removed_at: Vec<usize> = Vec::new();
+        for (i, a) in annots.iter().enumerate() {
+            let obj = doc.resolve(a);
             let Some(d) = obj.as_dict() else { continue };
+            let r = a.as_ref();
             let subtype = d.name(b"Subtype").unwrap_or(b"");
             if subtype == b"Redact" {
-                if page_marks.iter().any(|m| m.obj == r) {
-                    removed.push(r);
+                if r.is_some_and(|r| page_marks.iter().any(|m| m.obj == r)) {
+                    removed_at.push(i);
                 }
                 continue;
             }
@@ -495,9 +498,10 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
                 continue;
             }
             if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| pdfcraft_content::overlaps(*x, b, 0.0))) {
-                removed.push(r);
+                removed_at.push(i);
+                removed.extend(r);
                 if subtype == b"Widget" {
-                    if let Some((_, field)) = widget_owner.iter().find(|(w, _)| *w == r)
+                    if let Some((_, field)) = r.and_then(|r| widget_owner.iter().find(|(w, _)| *w == r))
                         && !doomed_fields.contains(field)
                     {
                         doomed_fields.push(*field);
@@ -509,15 +513,16 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
         let kept: Vec<Object> = annots
             .into_iter()
-            .filter(|a| {
-                let Some(r) = a.as_ref() else { return true };
-                if removed.contains(&r) {
+            .enumerate()
+            .filter(|(i, a)| {
+                if removed_at.contains(i) {
                     return false;
                 }
                 // Pop-ups of removed annotations go too.
-                let obj = doc.get(r);
+                let obj = doc.resolve(a);
                 !obj.as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
             })
+            .map(|(_, a)| a)
             .collect();
         doc.update_dict(page.obj, |d| {
             if kept.is_empty() {

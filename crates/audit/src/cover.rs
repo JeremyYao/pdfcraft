@@ -3,16 +3,18 @@
 //! This is the geometric half of the faux-redaction audit: a rectangle filled with an opaque
 //! color (`re` + `f`) is the classic way a "redaction" is faked. A single closed `m`/`l` subpath
 //! whose four corners form an axis-aligned rectangle in user space is the same shape and counts
-//! too (#1510). Graphics state tracked here is deliberately small: the CTM stack (`q`/`Q`/`cm`),
-//! the non-stroking color (`g`/`rg`/`k`) and the non-stroking alpha from ExtGState (`gs` reading
-//! `/ca`). Form XObjects are followed read-only with a depth cap, and so are the normal
-//! appearance streams of the page's visible annotations, placed by `/Rect`, `/BBox` and
-//! `/Matrix` and painted after the page content. Anything fancier (other filled paths, shadings,
-//! patterns) is out of scope and documented as such.
+//! too (#1510). Graphics state tracked here is deliberately small: the CTM stack (`q`/`Q`/`cm`)
+//! and, from ExtGState (`gs`), the non-stroking alpha (`/ca`) and the blend mode (`/BM`): a fill
+//! hides what is under it only when it is opaque and in Normal (or Compatible) blend mode, so a
+//! translucent or Multiply highlight is not collected. The fill colour does not matter: an
+//! opaque fill hides the text whatever its colour. Form XObjects are followed read-only with a
+//! depth cap, and so are the normal appearance streams of the page's visible annotations, placed
+//! by `/Rect`, `/BBox` and `/Matrix` and painted after the page content. Anything fancier (other
+//! filled paths, shadings, patterns) is out of scope and documented as such.
 //!
 //! Paint order: a page's content streams are one stream in pieces (ISO 32000-2 §7.8.2), so they
 //! are parsed joined and walked once with a single graphics state — state set in an earlier
-//! stream (a `cm`, a fill color) is still in force in the later ones. Each rectangle records the
+//! stream (a `cm`, a `gs`) is still in force in the later ones. Each rectangle records the
 //! position of the fill operator that painted it, as `(content-stream index, operator index in
 //! the joined stream)`; rectangles inside a form XObject carry the `Do` operator's position.
 //! Positions compare lexicographically in paint order.
@@ -34,8 +36,6 @@ const MAX_OPS: usize = 2_000_000;
 pub struct FilledRect {
     /// `[x0, y0, x1, y1]`, normalized so `x0 <= x1` and `y0 <= y1`.
     pub rect: [f64; 4],
-    /// The fill color as sRGB-ish `[r, g, b]` (CMYK is converted approximately).
-    pub rgb: [f64; 3],
     /// Paint position: `(content-stream index, operator index in the joined stream)`.
     /// Rectangles inside a form XObject carry the `Do` operator's position; those painted by
     /// an annotation's appearance carry `(usize::MAX, annotation index)`, after every page
@@ -46,8 +46,11 @@ pub struct FilledRect {
 #[derive(Clone)]
 struct Gs {
     ctm: Matrix,
-    fill: [f64; 3],
+    /// The non-stroking alpha (`/ca`).
     alpha: f64,
+    /// Whether the blend mode (`/BM`) is Normal or Compatible: the only modes whose opaque
+    /// fills hide what is under them.
+    blend_normal: bool,
 }
 
 /// The path under construction, as far as the audit cares about it.
@@ -104,7 +107,7 @@ fn lines_rect(mut pts: Vec<[f64; 2]>) -> Option<[f64; 4]> {
 
 impl Default for Gs {
     fn default() -> Self {
-        Gs { ctm: Matrix::IDENTITY, fill: [0.0, 0.0, 0.0], alpha: 1.0 }
+        Gs { ctm: Matrix::IDENTITY, alpha: 1.0, blend_normal: true }
     }
 }
 
@@ -166,31 +169,9 @@ impl<'a> Walker<'a> {
                         path = Path::Other;
                     }
                 }
-                b"g" => {
-                    if let Some(v) = op.num(0).filter(|v| v.is_finite()) {
-                        let v = v.clamp(0.0, 1.0);
-                        gs.fill = [v, v, v];
-                    }
-                }
-                b"rg" => {
-                    if let Some([r, g, b]) = op.nums::<3>()
-                        && [r, g, b].iter().all(|v| v.is_finite())
-                    {
-                        gs.fill = [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)];
-                    }
-                }
-                b"k" => {
-                    if let Some([c, m, y, k]) = op.nums::<4>()
-                        && [c, m, y, k].iter().all(|v| v.is_finite())
-                    {
-                        // Naive CMYK -> RGB; good enough to tell black from white.
-                        let (c, m, y, k) = (c.clamp(0.0, 1.0), m.clamp(0.0, 1.0), y.clamp(0.0, 1.0), k.clamp(0.0, 1.0));
-                        gs.fill = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
-                    }
-                }
                 b"gs" => {
                     if let Some(name) = op.name(0) {
-                        gs.alpha = ext_alpha(self.doc, resources, name);
+                        apply_ext_gstate(self.doc, resources, name, gs);
                     }
                 }
                 b"re" => {
@@ -227,10 +208,12 @@ impl<'a> Walker<'a> {
                     };
                 }
                 b"f" | b"F" | b"f*" | b"B" | b"B*" => {
+                    // Only an opaque, normally blended fill hides what is under it.
                     if let Some(r) = std::mem::replace(&mut path, Path::Empty).rect()
                         && gs.alpha >= 1.0
+                        && gs.blend_normal
                     {
-                        self.out.push(FilledRect { rect: r, rgb: gs.fill, pos });
+                        self.out.push(FilledRect { rect: r, pos });
                     }
                 }
                 b"S" | b"s" | b"n" => path = Path::Empty,
@@ -369,16 +352,32 @@ fn user_point(gs: &Gs, op: &Op) -> Option<[f64; 2]> {
     Some([x, y])
 }
 
-/// The non-stroking alpha (`/ca`) of a named ExtGState, defaulting to opaque.
-fn ext_alpha(doc: &Document, resources: &Dict, name: &[u8]) -> f64 {
-    let alpha = resources
+/// Apply the named ExtGState's non-stroking alpha (`/ca`) and blend mode (`/BM`, a name or an
+/// array of names of which the first counts) to `gs`. An entry the dictionary does not have
+/// leaves the parameter as it is (ISO 32000-2 §8.4.5), and so does an unknown resource.
+fn apply_ext_gstate(doc: &Document, resources: &Dict, name: &[u8], gs: &mut Gs) {
+    let Some(ext) = resources
         .get(b"ExtGState")
         .map(|o| doc.resolve(o))
         .and_then(|o| o.as_dict().cloned())
         .and_then(|d| d.get(name).map(|o| doc.resolve(o)))
         .and_then(|o| o.as_dict().cloned())
-        .and_then(|d| d.get(b"ca").map(|o| doc.resolve(o)).and_then(|o| o.as_f64()));
-    alpha.filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 1.0)).unwrap_or(1.0)
+    else {
+        return;
+    };
+    if let Some(alpha) = ext.get(b"ca").map(|o| doc.resolve(o)).and_then(|o| o.as_f64()).filter(|a| a.is_finite()) {
+        gs.alpha = alpha.clamp(0.0, 1.0);
+    }
+    if let Some(bm) = ext.get(b"BM").map(|o| doc.resolve(o)) {
+        let mode = match &*bm {
+            Object::Name(n) => Some(n.as_ref()),
+            Object::Array(a) => a.first().and_then(Object::as_name),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            gs.blend_normal = matches!(mode, b"Normal" | b"Compatible");
+        }
+    }
 }
 
 /// Every opaque filled rectangle drawn by a page's content (and its form XObjects), then by the

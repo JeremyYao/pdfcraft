@@ -75,18 +75,6 @@ fn one_page(content: &[u8], page_extra: &str) -> Vec<u8> {
     b.build()
 }
 
-/// One page with two content streams (`/Contents [4 0 R 5 0 R]`).
-fn two_streams(s1: &[u8], s2: &[u8]) -> Vec<u8> {
-    let mut b = Builder::new();
-    b.add("<< /Type /Catalog /Pages 2 0 R >>");
-    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
-    b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << /Font << /F1 6 0 R >> >> >>");
-    b.add_stream(s1);
-    b.add_stream(s2);
-    b.add(FONT);
-    b.build()
-}
-
 /// One page whose content stream claims `/FlateDecode` but holds garbage: decoding must fail.
 fn bad_filter_page() -> Vec<u8> {
     let mut b = Builder::new();
@@ -317,21 +305,80 @@ fn background_before_text_is_not_flagged() {
 }
 
 #[test]
-fn light_shading_after_text_is_not_flagged() {
-    // Light table-style shading painted after the text leaves it readable: not a cover.
-    let content = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0.9 g\n100 688 220 32 re f\n";
-    let findings = audit_redactions(&open(one_page(content, ""))).expect("audit must run");
-    assert!(findings.is_empty(), "{findings:?}");
+fn opaque_cover_hides_text_whatever_the_colours() {
+    // An opaque fill painted after the text hides it whether the two colours are alike or
+    // not: grey, red or black text under a black box, black text under a white-out box, under
+    // light table-style shading, under mid grey or under opaque yellow.
+    let covers: [&[u8]; 7] = [
+        b"0.4 g\nBT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0 g\n100 688 220 32 re f\n",
+        b"1 0 0 rg\nBT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0 g\n100 688 220 32 re f\n",
+        b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n1 g\n100 688 220 32 re f\n",
+        b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0.9 g\n100 688 220 32 re f\n",
+        b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0.5 g\n100 688 220 32 re f\n",
+        b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n1 1 0 rg\n100 688 220 32 re f\n",
+        b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n0 0 0 0 k\n100 688 220 32 re f\n",
+    ];
+    for content in covers {
+        let findings = audit_redactions(&open(one_page(content, ""))).expect("audit must run");
+        assert_eq!(findings.len(), 1, "{:?}: {findings:?}", String::from_utf8_lossy(content));
+        assert_eq!(findings[0].kind, FindingKind::CoveredText);
+        assert_eq!(findings[0].covered_text, "SECRET DATA 123");
+    }
+}
+
+/// One page whose `/ExtGState /GS1` is `gs1`, with `s2` as a second content stream when given.
+fn with_gstate(s1: &[u8], s2: Option<&[u8]>, gs1: &str) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.add("<< /Type /Catalog /Pages 2 0 R >>");
+    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    let contents = if s2.is_some() { "[4 0 R 7 0 R]" } else { "4 0 R" };
+    b.add(&format!(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {contents} /Resources << /Font << /F1 5 0 R >> /ExtGState << /GS1 6 0 R >> >> >>"
+    ));
+    b.add_stream(s1);
+    b.add(FONT);
+    b.add(&format!("<< /Type /ExtGState {gs1} >>"));
+    if let Some(s2) = s2 {
+        b.add_stream(s2);
+    }
+    b.build()
+}
+
+#[test]
+fn blended_highlight_is_not_a_cover() {
+    // A yellow highlight drawn with a Multiply (or Darken) blend mode leaves the text visible;
+    // the blend mode may be a name or an array of names. A Normal or Compatible mode is opaque.
+    for (bm, hidden) in [("/BM /Multiply", false), ("/BM [/Darken /Compatible]", false), ("/BM /Normal", true), ("/BM /Compatible", true)] {
+        let content = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n/GS1 gs\n1 1 0 rg\n100 688 220 32 re f\n";
+        let findings = audit_redactions(&open(with_gstate(content, None, bm))).expect("audit must run");
+        assert_eq!(findings.len(), usize::from(hidden), "{bm}: {findings:?}");
+    }
 }
 
 #[test]
 fn graphics_state_carries_across_streams() {
-    // The first stream sets a white fill after the text; the second stream's rectangle over
-    // the text is therefore white, not the default black: no finding. Without the carry fix
-    // the rectangle would default to black and flag.
-    let s1 = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n1 g\n";
+    // The first stream makes fills translucent after the text; the second stream's rectangle
+    // over the text is therefore translucent, not the default opaque: no finding. Without the
+    // carry fix the rectangle would default to opaque and flag.
+    let s1 = b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n/GS1 gs\n";
     let s2 = b"100 688 220 32 re f\n";
-    let findings = audit_redactions(&open(two_streams(s1, s2))).expect("audit must run");
+    let findings = audit_redactions(&open(with_gstate(s1, Some(s2), "/ca 0.5"))).expect("audit must run");
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn ext_gstate_without_an_entry_leaves_it_unchanged() {
+    // ISO 32000-2 §8.4.5: an ExtGState sets only the parameters it names. A second `gs` that
+    // sets nothing relevant keeps the translucency (and a blend mode) of the first.
+    let mut b = Builder::new();
+    b.add("<< /Type /Catalog /Pages 2 0 R >>");
+    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /ExtGState << /GS1 6 0 R /GS2 7 0 R >> >> >>");
+    b.add_stream(b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n/GS1 gs /GS2 gs\n0 g\n100 688 220 32 re f\n");
+    b.add(FONT);
+    b.add("<< /Type /ExtGState /ca 0.5 >>");
+    b.add("<< /Type /ExtGState /LW 2 >>");
+    let findings = audit_redactions(&open(b.build())).expect("audit must run");
     assert!(findings.is_empty(), "{findings:?}");
 }
 

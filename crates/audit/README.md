@@ -8,13 +8,14 @@ let findings: Vec<Finding> = audit_redactions(&doc)?;  // page, kind, rect, cove
 
 It reports two kinds of finding:
 
-- **faux redaction**: an opaque filled rectangle painted *after* text it overlaps, dark enough
-  against the text's colour (WCAG contrast below 3) to hide it, while the text is still
-  extractable underneath;
+- **faux redaction**: an opaque filled rectangle painted *after* text it overlaps, while the
+  text is still extractable underneath. Its colour doesn't matter: a white-out box over black
+  text, or a black box over grey or coloured text, hides it as surely as black over black;
 - **unapplied mark**: a Redact annotation that was marked but never applied.
 
-A properly applied redaction removes the text, so it never flags. Page backgrounds, table
-shading and highlights don't either: they're painted before the text, or light against it.
+A properly applied redaction removes the text, so it never flags. Page backgrounds and table
+shading painted before the text don't either, nor do highlights drawn translucent (`/ca` below
+1) or with a blend mode such as Multiply, which leave the text visible.
 A cover hides a line when it spans most of the line's height over at least a glyph's width, so
 a box over one word of a sentence counts (and each of several boxes that together black out a
 line), while an underline, a strikethrough or a table rule does not. The finding's
@@ -28,8 +29,10 @@ over text with a shape or highlight tool is audited like one in the content.
 Limits, by design and documented rather than hidden:
 
 - only filled rectangles count as covers, drawn with `re` or as a single `m`/`l` subpath whose
-  corners form an axis-aligned rectangle (not other paths, shadings or patterns), and a
-  translucent one (`/ca` below 1) is not flagged;
+  corners form an axis-aligned rectangle (not other paths, shadings or patterns), and one that
+  is translucent (`/ca` below 1) or in a blend mode other than Normal or Compatible is not
+  flagged; an opaque light rectangle painted over text for another reason (shading added after
+  the text) is flagged, since it does hide the text;
 - covers inside form XObjects and annotation appearances are found, but only text drawn
   directly in the page content is checked under them;
 - an annotation whose `/AP /N` holds several states and no `/AS` has no appearance to show and

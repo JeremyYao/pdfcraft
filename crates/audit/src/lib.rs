@@ -5,12 +5,14 @@
 //! never applied. A properly applied redaction removes the text, so it never flags.
 //!
 //! A rectangle counts as a cover only when it was painted strictly *after* the text it
-//! overlaps, and only when it is dark enough against the text's color to make the text
-//! unreadable (WCAG contrast below 3.0). Page backgrounds, table shading and highlight
-//! marks are therefore not flagged. It hides a line when it spans most of the line's height
-//! over at least a glyph's width: a box over one word of a sentence counts, an underline, a
-//! strikethrough or a table rule does not. A finding reports the whole text of every line the
-//! cover touches, not only the hidden glyphs.
+//! overlaps and hides what is under it: opaque (`/ca` of 1) and in Normal or Compatible blend
+//! mode. Its colour does not matter: a white-out box over black text, or a black box over grey
+//! or coloured text, hides it as surely as black over black. Page backgrounds and table shading
+//! painted before the text are therefore not flagged, nor are highlights drawn translucent or
+//! with a Multiply blend mode, which leave the text visible. It hides a line when it spans most
+//! of the line's height over at least a glyph's width: a box over one word of a sentence counts,
+//! an underline, a strikethrough or a table rule does not. A finding reports the whole text of
+//! every line the cover touches, not only the hidden glyphs.
 //!
 //! Covers are collected from the page content, the form XObjects it draws, and the normal
 //! appearance stream of every annotation a viewer paints (not Hidden or NoView, not a popup),
@@ -19,7 +21,9 @@
 //!
 //! Detection limits (documented, not hidden): only `re` rectangles closed by a fill operator
 //! are considered — arbitrary filled paths, shadings and patterns are not; a rectangle drawn
-//! with a translucent ExtGState (`/ca < 1`) is not flagged; annotation rectangles are compared
+//! with a translucent ExtGState (`/ca < 1`) or a blend mode other than Normal or Compatible is
+//! not flagged; an opaque light rectangle painted over text for another reason (shading added
+//! after the text) is flagged, since it does hide the text; annotation rectangles are compared
 //! in unrotated user space, so pages with `/Rotate` may misalign; covers inside form XObjects
 //! and annotation appearances are found, but only text drawn directly in the page content is
 //! checked under them, so text inside a form XObject or an appearance is not audited; an
@@ -91,8 +95,6 @@ pub enum AuditError {
 const COVER_HEIGHT: f64 = 0.5;
 /// A glyph's width as a fraction of the line's height: the least width a cover must overlap.
 const GLYPH_WIDTH: f64 = 0.25;
-/// WCAG contrast ratio below which the text is unreadable against the cover.
-const COVER_CONTRAST: f64 = 3.0;
 
 /// Audit every page for faux redactions and unapplied redaction marks. Fails closed: any
 /// content that cannot be decoded is returned as an error, never as an empty finding list.
@@ -137,11 +139,11 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
 }
 
 /// A filled rectangle is a faux-redaction cover for a text line iff it was painted strictly
-/// after the line, hides glyphs of it, and is dark enough against the line's color to make the
-/// text unreadable. Light covers (table shading, highlights) over dark text fail the contrast
-/// check and are not flagged.
+/// after the line and hides glyphs of it. Its colour does not matter: an opaque fill hides the
+/// text whatever the two colours are. Fills that cannot hide it (translucent, or in a blend
+/// mode such as Multiply, as highlights are) are left out by the cover walker.
 fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
-    rect.pos > line.paint_pos() && covers(&rect.rect, &line.rect) && contrast(line.color, rect.rgb) < COVER_CONTRAST
+    rect.pos > line.paint_pos() && covers(&rect.rect, &line.rect)
 }
 
 /// Does `cover` hide glyphs of `line`? It must span most of the line's height (an underline, a
@@ -158,22 +160,6 @@ fn covers(cover: &[f64; 4], line: &[f64; 4]) -> bool {
         return false;
     }
     h >= line_h * COVER_HEIGHT && w >= (line_h * GLYPH_WIDTH).min(line_w)
-}
-
-/// WCAG 2.x relative luminance of an sRGB triple.
-fn luminance(rgb: [f64; 3]) -> f64 {
-    let lin = rgb.map(|c| {
-        let c = c.clamp(0.0, 1.0);
-        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-    });
-    0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
-}
-
-/// WCAG contrast ratio between two sRGB colors: 1.0 (identical) to 21.0 (black on white).
-fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
-    let (l1, l2) = (luminance(a), luminance(b));
-    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
-    (hi + 0.05) / (lo + 0.05)
 }
 
 /// The annotation dictionaries of a page, in `/Annots` order. A missing `/Annots` means no

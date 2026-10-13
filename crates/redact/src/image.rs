@@ -1,11 +1,14 @@
 //! Clearing the pixels of an image under redaction regions. The image is decoded, every pixel
 //! whose centre maps into a region is set to zero (no ink for image masks), and the result is
 //! written as a new Flate image; the original object is untouched (other pages may use it).
+//! The image's soft mask or stencil mask (`/SMask`, a `/Mask` stream) carries samples of the same
+//! pixels, so it is cleared over the same regions into a copy of its own.
 //! Images whose codec PdfCraft can't decode (DCT, JPX, JBIG2, CCITT) return `None`, and the
-//! caller removes the whole image instead; that is fail-closed.
+//! caller removes the whole image instead; that is fail-closed. So does a mask that can't be
+//! cleared.
 
 use pdfcraft_content::{Matrix, overlaps};
-use pdfcraft_cos::{Document, Object, Stream};
+use pdfcraft_cos::{Dict, Document, Object, Stream};
 
 /// Most pixels an image may have to be cleared in place (larger ones are removed).
 const MAX_PIXELS: u64 = 64 << 20;
@@ -33,14 +36,63 @@ fn components(doc: &Document, s: &Stream) -> Option<usize> {
     })
 }
 
-/// `Ok(Some(copy))` with the covered pixels cleared, `Ok(None)` when no pixel centre is covered,
-/// `Err(())` when the image can't be cleared (the caller removes it).
+/// `Ok(Some(copy))` with the covered pixels cleared (its masks cleared into new objects),
+/// `Ok(None)` when no pixel centre is covered, `Err(())` when the image can't be cleared (the
+/// caller removes it).
 #[allow(clippy::result_unit_err)]
-pub(crate) fn clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Result<Option<Stream>, ()> {
-    decode_and_clear(doc, s, ctm, rects).ok_or(())
+pub(crate) fn clear(doc: &mut Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Result<Option<Stream>, ()> {
+    let Some(cleared) = decode_and_clear(doc, s, ctm, rects) else { return Err(()) };
+    let Some(Cleared { mut dict, data, masks }) = cleared else { return Ok(None) };
+    for (key, mask) in masks {
+        let r = doc.add(Object::Stream(mask));
+        dict.set(key, Object::Ref(r));
+    }
+    Ok(Some(Stream::flate(dict, &data)))
 }
 
-fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<Stream>> {
+/// A cleared image: its dictionary (without the entries the new data makes stale), its samples,
+/// and the cleared copies of its masks to store under the given keys.
+struct Cleared {
+    dict: Dict,
+    data: Vec<u8>,
+    masks: Vec<(Vec<u8>, Stream)>,
+}
+
+fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<Cleared>> {
+    let Some((mut dict, data)) = clear_samples(doc, s, ctm, rects)? else { return Some(None) };
+    // Alternate images hold the same pixels again; the copy does without them.
+    dict.remove(b"Alternates");
+    dict.remove(b"OPI");
+    // The masks are drawn through the same unit square, so the same regions cover them, whatever
+    // their resolution. A mask that can't be cleared fails the whole image (removed by the caller).
+    let mut masks = Vec::new();
+    for key in [&b"SMask"[..], b"Mask"] {
+        let Some(m) = s.dict.get(key) else { continue };
+        match &*doc.resolve(m) {
+            // `None` from the mask: no mask pixel centre under the regions (a coarser mask), so
+            // it is kept as it is.
+            Object::Stream(mask) => {
+                if let Some((mut md, data)) = clear_samples(doc, mask, ctm, rects)? {
+                    // A mask has no masks of its own.
+                    md.remove(b"SMask");
+                    md.remove(b"Mask");
+                    masks.push((key.to_vec(), Stream::flate(md, &data)));
+                }
+            }
+            // A colour-key mask (an array) holds no samples; anything else is not a mask.
+            Object::Array(_) => {}
+            _ => {
+                dict.remove(key);
+            }
+        }
+    }
+    Some(Some(Cleared { dict, data, masks }))
+}
+
+/// Decode one image's samples and clear the pixels under the regions: `Some(Some((dict, data)))`
+/// with the copy's dictionary (`/Length` and the decode parameters removed) and the new samples,
+/// `Some(None)` when no pixel centre is covered, `None` when the image can't be cleared.
+fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<(Dict, Vec<u8>)>> {
     let supported = |n: &[u8]| {
         matches!(
             n,
@@ -114,5 +166,5 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
     let mut dict = s.dict.clone();
     dict.remove(b"Length");
     dict.remove(b"DecodeParms");
-    Some(Some(Stream::flate(dict, &data)))
+    Some(Some((dict, data)))
 }

@@ -940,3 +940,42 @@ fn redacting_every_inheriting_page_retires_the_parent_resources() {
         assert_eq!(under(&mut saved, page, &[[0.0, 190.0, 300.0, 220.0]]), 0);
     }
 }
+
+/// A partly covered image keeps its shape in its soft mask or stencil mask: the mask samples of
+/// the covered rows must be cleared with the colour samples, and the uncovered rows must stay.
+#[test]
+fn a_partly_redacted_images_soft_mask_and_stencil_mask_are_cleared_too() {
+    for (mask_key, mask_dict, secret, public) in [
+        (
+            "SMask",
+            "/Type /XObject /Subtype /Image /Width 16 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &b"ALPHASECRETROW00"[..],
+            &b"alphapublicrow01"[..],
+        ),
+        ("Mask", "/Type /XObject /Subtype /Image /Width 128 /Height 2 /ImageMask true", &b"MASKBSECRETROW00"[..], &b"maskbpublicrow01"[..]),
+    ] {
+        let mut mask_data = secret.to_vec();
+        mask_data.extend_from_slice(public);
+        let image = stream(
+            &format!("/Type /XObject /Subtype /Image /Width 16 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /{mask_key} 8 0 R"),
+            b"COLORSECRETROW00colorpublicrow01",
+        );
+        let mut doc = one_page(b"q 100 0 0 100 20 150 cm /Im1 Do Q", "/XObject << /Im1 7 0 R >>", vec![image, stream(mask_dict, &mask_data)]);
+        // The top row only.
+        mark(&mut doc, 0, &[[0.0, 200.0, 300.0, 260.0]], "");
+        let r = apply(&mut doc, None).unwrap();
+        assert_eq!((r.images_cleared, r.images_removed), (1, 0), "{mask_key}: {r:?}");
+        let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+        let saved = Document::open(Arc::new(bytes)).unwrap();
+        let mut decoded: Vec<Vec<u8>> = Vec::new();
+        for (_, object) in saved.scan_objects() {
+            if let Object::Stream(s) = &*object {
+                decoded.push(s.decoded().unwrap());
+            }
+        }
+        let has = |needle: &[u8]| decoded.iter().any(|d| d.windows(needle.len()).any(|w| w == needle));
+        assert!(!has(b"COLORSECRETROW00"), "{mask_key}: the covered colour row survived");
+        assert!(!has(secret), "{mask_key}: the covered mask row survived the save");
+        assert!(has(b"colorpublicrow01") && has(public), "{mask_key}: the uncovered rows must stay");
+    }
+}

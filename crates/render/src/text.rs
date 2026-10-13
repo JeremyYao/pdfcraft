@@ -40,16 +40,233 @@ pub struct TextGlyph {
 /// four are treated as one letter; this only adds matches where an `ı` or `İ` is involved.
 /// Greek sigma's normal and word-final forms (`σ`/`ς`) both fold to `σ`, as does `Σ`.
 pub fn fold_case(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            'I' | 'i' | '\u{130}' | '\u{131}' => out.push('i'),
-            'Σ' | 'σ' | 'ς' => out.push('σ'),
-            _ => out.extend(c.to_lowercase()),
+    s.chars().flat_map(fold_char).collect()
+}
+
+/// [`fold_case`] of one character.
+fn fold_char(c: char) -> impl Iterator<Item = char> {
+    let one = match c {
+        'I' | 'i' | '\u{130}' | '\u{131}' => Some('i'),
+        'Σ' | 'σ' | 'ς' => Some('σ'),
+        _ => None,
+    };
+    let rest = if one.is_none() { Some(c) } else { None };
+    one.into_iter().chain(rest.into_iter().flat_map(char::to_lowercase))
+}
+
+/// What search sees for one page or query character, pushed onto `out`: compatibility
+/// ligatures spelled out, dash variants as `-`, invisible format characters dropped, white
+/// space as a space, and a precomposed Latin letter as its base letter plus combining mark (its
+/// canonical decomposition), so the composed and decomposed spellings compare equal. The needle
+/// and the page text both go through this, so a term is found the way it reads. (Unicode
+/// Standard Annex #15 and UnicodeData.txt are the source; the tables are written by hand for
+/// the characters text set in PDFs actually carries.)
+fn search_chars(c: char, out: &mut Vec<char>) {
+    match c {
+        '\u{FB00}' => out.extend(['f', 'f']),
+        '\u{FB01}' => out.extend(['f', 'i']),
+        '\u{FB02}' => out.extend(['f', 'l']),
+        '\u{FB03}' => out.extend(['f', 'f', 'i']),
+        '\u{FB04}' => out.extend(['f', 'f', 'l']),
+        '\u{FB05}' | '\u{FB06}' => out.extend(['s', 't']),
+        // Soft hyphen; zero width space, non-joiner and joiner; word joiner; zero width
+        // no-break space.
+        '\u{AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' => {}
+        // Hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar; minus
+        // sign; small em dash, small hyphen-minus; fullwidth hyphen-minus.
+        '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{FE58}' | '\u{FE63}' | '\u{FF0D}' => out.push('-'),
+        _ if c.is_whitespace() => out.push(' '),
+        _ => match DECOMPOSE.binary_search_by_key(&c, |e| e.0).ok().and_then(|i| DECOMPOSE.get(i)) {
+            Some(&(_, base, mark)) => out.extend([base, mark]),
+            None => out.push(c),
+        },
+    }
+}
+
+/// Calls `push` with what search sees for `c` ([`search_chars`]), case-folded unless
+/// `case_sensitive`. `scratch` is reused between calls.
+fn for_search(c: char, case_sensitive: bool, scratch: &mut Vec<char>, mut push: impl FnMut(char)) {
+    scratch.clear();
+    search_chars(c, scratch);
+    for &s in scratch.iter() {
+        if case_sensitive {
+            push(s);
+        } else {
+            fold_char(s).for_each(&mut push);
         }
     }
-    out
 }
+
+/// Is `c` a combining mark (U+0300 to U+036F)? It continues the word of the letter before it.
+fn is_combining(c: char) -> bool {
+    ('\u{300}'..='\u{36F}').contains(&c)
+}
+
+/// The canonical decompositions of the precomposed letters of Latin-1 Supplement and Latin
+/// Extended-A (UnicodeData.txt field 5): `(letter, base letter, combining mark)`, in code point
+/// order for binary search. `İ` (U+0130) is left out: [`fold_case`] folds it to `i`.
+const DECOMPOSE: &[(char, char, char)] = &[
+    ('À', 'A', '\u{300}'),
+    ('Á', 'A', '\u{301}'),
+    ('Â', 'A', '\u{302}'),
+    ('Ã', 'A', '\u{303}'),
+    ('Ä', 'A', '\u{308}'),
+    ('Å', 'A', '\u{30A}'),
+    ('Ç', 'C', '\u{327}'),
+    ('È', 'E', '\u{300}'),
+    ('É', 'E', '\u{301}'),
+    ('Ê', 'E', '\u{302}'),
+    ('Ë', 'E', '\u{308}'),
+    ('Ì', 'I', '\u{300}'),
+    ('Í', 'I', '\u{301}'),
+    ('Î', 'I', '\u{302}'),
+    ('Ï', 'I', '\u{308}'),
+    ('Ñ', 'N', '\u{303}'),
+    ('Ò', 'O', '\u{300}'),
+    ('Ó', 'O', '\u{301}'),
+    ('Ô', 'O', '\u{302}'),
+    ('Õ', 'O', '\u{303}'),
+    ('Ö', 'O', '\u{308}'),
+    ('Ù', 'U', '\u{300}'),
+    ('Ú', 'U', '\u{301}'),
+    ('Û', 'U', '\u{302}'),
+    ('Ü', 'U', '\u{308}'),
+    ('Ý', 'Y', '\u{301}'),
+    ('à', 'a', '\u{300}'),
+    ('á', 'a', '\u{301}'),
+    ('â', 'a', '\u{302}'),
+    ('ã', 'a', '\u{303}'),
+    ('ä', 'a', '\u{308}'),
+    ('å', 'a', '\u{30A}'),
+    ('ç', 'c', '\u{327}'),
+    ('è', 'e', '\u{300}'),
+    ('é', 'e', '\u{301}'),
+    ('ê', 'e', '\u{302}'),
+    ('ë', 'e', '\u{308}'),
+    ('ì', 'i', '\u{300}'),
+    ('í', 'i', '\u{301}'),
+    ('î', 'i', '\u{302}'),
+    ('ï', 'i', '\u{308}'),
+    ('ñ', 'n', '\u{303}'),
+    ('ò', 'o', '\u{300}'),
+    ('ó', 'o', '\u{301}'),
+    ('ô', 'o', '\u{302}'),
+    ('õ', 'o', '\u{303}'),
+    ('ö', 'o', '\u{308}'),
+    ('ù', 'u', '\u{300}'),
+    ('ú', 'u', '\u{301}'),
+    ('û', 'u', '\u{302}'),
+    ('ü', 'u', '\u{308}'),
+    ('ý', 'y', '\u{301}'),
+    ('ÿ', 'y', '\u{308}'),
+    ('Ā', 'A', '\u{304}'),
+    ('ā', 'a', '\u{304}'),
+    ('Ă', 'A', '\u{306}'),
+    ('ă', 'a', '\u{306}'),
+    ('Ą', 'A', '\u{328}'),
+    ('ą', 'a', '\u{328}'),
+    ('Ć', 'C', '\u{301}'),
+    ('ć', 'c', '\u{301}'),
+    ('Ĉ', 'C', '\u{302}'),
+    ('ĉ', 'c', '\u{302}'),
+    ('Ċ', 'C', '\u{307}'),
+    ('ċ', 'c', '\u{307}'),
+    ('Č', 'C', '\u{30C}'),
+    ('č', 'c', '\u{30C}'),
+    ('Ď', 'D', '\u{30C}'),
+    ('ď', 'd', '\u{30C}'),
+    ('Ē', 'E', '\u{304}'),
+    ('ē', 'e', '\u{304}'),
+    ('Ĕ', 'E', '\u{306}'),
+    ('ĕ', 'e', '\u{306}'),
+    ('Ė', 'E', '\u{307}'),
+    ('ė', 'e', '\u{307}'),
+    ('Ę', 'E', '\u{328}'),
+    ('ę', 'e', '\u{328}'),
+    ('Ě', 'E', '\u{30C}'),
+    ('ě', 'e', '\u{30C}'),
+    ('Ĝ', 'G', '\u{302}'),
+    ('ĝ', 'g', '\u{302}'),
+    ('Ğ', 'G', '\u{306}'),
+    ('ğ', 'g', '\u{306}'),
+    ('Ġ', 'G', '\u{307}'),
+    ('ġ', 'g', '\u{307}'),
+    ('Ģ', 'G', '\u{327}'),
+    ('ģ', 'g', '\u{327}'),
+    ('Ĥ', 'H', '\u{302}'),
+    ('ĥ', 'h', '\u{302}'),
+    ('Ĩ', 'I', '\u{303}'),
+    ('ĩ', 'i', '\u{303}'),
+    ('Ī', 'I', '\u{304}'),
+    ('ī', 'i', '\u{304}'),
+    ('Ĭ', 'I', '\u{306}'),
+    ('ĭ', 'i', '\u{306}'),
+    ('Į', 'I', '\u{328}'),
+    ('į', 'i', '\u{328}'),
+    ('Ĵ', 'J', '\u{302}'),
+    ('ĵ', 'j', '\u{302}'),
+    ('Ķ', 'K', '\u{327}'),
+    ('ķ', 'k', '\u{327}'),
+    ('Ĺ', 'L', '\u{301}'),
+    ('ĺ', 'l', '\u{301}'),
+    ('Ļ', 'L', '\u{327}'),
+    ('ļ', 'l', '\u{327}'),
+    ('Ľ', 'L', '\u{30C}'),
+    ('ľ', 'l', '\u{30C}'),
+    ('Ń', 'N', '\u{301}'),
+    ('ń', 'n', '\u{301}'),
+    ('Ņ', 'N', '\u{327}'),
+    ('ņ', 'n', '\u{327}'),
+    ('Ň', 'N', '\u{30C}'),
+    ('ň', 'n', '\u{30C}'),
+    ('Ō', 'O', '\u{304}'),
+    ('ō', 'o', '\u{304}'),
+    ('Ŏ', 'O', '\u{306}'),
+    ('ŏ', 'o', '\u{306}'),
+    ('Ő', 'O', '\u{30B}'),
+    ('ő', 'o', '\u{30B}'),
+    ('Ŕ', 'R', '\u{301}'),
+    ('ŕ', 'r', '\u{301}'),
+    ('Ŗ', 'R', '\u{327}'),
+    ('ŗ', 'r', '\u{327}'),
+    ('Ř', 'R', '\u{30C}'),
+    ('ř', 'r', '\u{30C}'),
+    ('Ś', 'S', '\u{301}'),
+    ('ś', 's', '\u{301}'),
+    ('Ŝ', 'S', '\u{302}'),
+    ('ŝ', 's', '\u{302}'),
+    ('Ş', 'S', '\u{327}'),
+    ('ş', 's', '\u{327}'),
+    ('Š', 'S', '\u{30C}'),
+    ('š', 's', '\u{30C}'),
+    ('Ţ', 'T', '\u{327}'),
+    ('ţ', 't', '\u{327}'),
+    ('Ť', 'T', '\u{30C}'),
+    ('ť', 't', '\u{30C}'),
+    ('Ũ', 'U', '\u{303}'),
+    ('ũ', 'u', '\u{303}'),
+    ('Ū', 'U', '\u{304}'),
+    ('ū', 'u', '\u{304}'),
+    ('Ŭ', 'U', '\u{306}'),
+    ('ŭ', 'u', '\u{306}'),
+    ('Ů', 'U', '\u{30A}'),
+    ('ů', 'u', '\u{30A}'),
+    ('Ű', 'U', '\u{30B}'),
+    ('ű', 'u', '\u{30B}'),
+    ('Ų', 'U', '\u{328}'),
+    ('ų', 'u', '\u{328}'),
+    ('Ŵ', 'W', '\u{302}'),
+    ('ŵ', 'w', '\u{302}'),
+    ('Ŷ', 'Y', '\u{302}'),
+    ('ŷ', 'y', '\u{302}'),
+    ('Ÿ', 'Y', '\u{308}'),
+    ('Ź', 'Z', '\u{301}'),
+    ('ź', 'z', '\u{301}'),
+    ('Ż', 'Z', '\u{307}'),
+    ('ż', 'z', '\u{307}'),
+    ('Ž', 'Z', '\u{30C}'),
+    ('ž', 'z', '\u{30C}'),
+];
 
 /// The text of one page, in content order, with line structure.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -100,32 +317,49 @@ impl PageText {
         self.find_opts_limited(needle, case_sensitive, whole_words, usize::MAX)
     }
 
-    /// Search with Acrobat's find options, returning at most `limit` glyph ranges.
+    /// Search with Acrobat's find options, returning at most `limit` glyph ranges. The query and
+    /// the page text are compared the way they read (see [`search_chars`]): ligature glyphs as
+    /// their letters, soft hyphens and zero width characters ignored, composed and decomposed
+    /// accents alike, dash variants as a hyphen, a run of white space as one space.
     pub fn find_opts_limited(&self, needle: &str, case_sensitive: bool, whole_words: bool, limit: usize) -> Vec<std::ops::Range<usize>> {
         if limit == 0 {
             return Vec::new();
         }
-        let fold = |s: &str| if case_sensitive { s.to_string() } else { fold_case(s) };
-        let needle: Vec<char> = fold(needle).split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();
+        let mut scratch = Vec::new();
+        let mut needle_chars: Vec<char> = Vec::new();
+        for c in needle.chars() {
+            for_search(c, case_sensitive, &mut scratch, |c| {
+                // Leading spaces and runs of spaces collapse; trailing ones are cut below.
+                if c != ' ' || needle_chars.last().is_some_and(|k| *k != ' ') {
+                    needle_chars.push(c);
+                }
+            });
+        }
+        while needle_chars.last() == Some(&' ') {
+            needle_chars.pop();
+        }
+        let needle = needle_chars;
         if needle.is_empty() {
             return Vec::new();
         }
-        // Flatten to chars with the glyph index each char came from.
+        // Flatten to chars with the glyph index each char came from. A glyph that produces no
+        // character (a soft hyphen) still falls inside a match that spans it, since a match is
+        // the range from its first to its last glyph.
         let mut chars: Vec<(char, usize)> = Vec::new();
         for (i, g) in self.glyphs.iter().enumerate() {
             if i > 0 && (self.space_before[i] || self.line_of[i] != self.line_of[i - 1]) && chars.last().is_some_and(|c| c.0 != ' ') {
                 chars.push((' ', i));
             }
-            for c in fold(&g.text).chars() {
-                let c = if c.is_whitespace() { ' ' } else { c };
-                // The query collapses a run of whitespace to one space, so collapse the page too.
-                if c == ' ' && chars.last().is_some_and(|k| k.0 == ' ') {
-                    continue;
-                }
-                chars.push((c, i));
+            for c in g.text.chars() {
+                for_search(c, case_sensitive, &mut scratch, |c| {
+                    // The query collapses a run of whitespace to one space, so collapse the page too.
+                    if c != ' ' || chars.last().is_some_and(|k| k.0 != ' ') {
+                        chars.push((c, i));
+                    }
+                });
             }
         }
-        let word = |k: Option<&(char, usize)>| k.is_some_and(|c| c.0.is_alphanumeric());
+        let word = |k: Option<&(char, usize)>| k.is_some_and(|c| c.0.is_alphanumeric() || is_combining(c.0));
         let mut out = Vec::new();
         let mut i = 0;
         while i + needle.len() <= chars.len() {
@@ -146,12 +380,16 @@ impl PageText {
     }
 
     /// Glyph ranges of the matches a character matcher finds in the page text (words and lines
-    /// separated by one space, original case). Used for pattern search (Search & Redact).
+    /// separated by one space, original case, otherwise normalised as [`find_opts`] does: see
+    /// [`search_chars`]). Used for pattern search (Search & Redact).
+    ///
+    /// [`find_opts`]: Self::find_opts
     pub fn find_with(&self, matcher: impl Fn(&[char]) -> Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
         let mut chars: Vec<char> = Vec::new();
         // `None` is a word or line separator inserted between glyphs. It is not part of either
         // glyph, so a match that starts or ends on it must not take the neighbouring glyph.
         let mut owner: Vec<Option<usize>> = Vec::new();
+        let mut scratch = Vec::new();
         for (i, g) in self.glyphs.iter().enumerate() {
             let gap = self.space_before.get(i).copied().unwrap_or(false) || self.line_of.get(i) != self.line_of.get(i.saturating_sub(1));
             if i > 0 && gap && chars.last().is_some_and(|c| *c != ' ') {
@@ -159,8 +397,13 @@ impl PageText {
                 owner.push(None);
             }
             for c in g.text.chars() {
-                chars.push(if c.is_whitespace() { ' ' } else { c });
-                owner.push(Some(i));
+                for_search(c, true, &mut scratch, |c| {
+                    // A run of white space is one space, as in the phrase search.
+                    if c != ' ' || chars.last().is_some_and(|k| *k != ' ') {
+                        chars.push(c);
+                        owner.push(Some(i));
+                    }
+                });
             }
         }
         matcher(&chars)
@@ -1937,6 +2180,92 @@ mod tests {
             let x0 = x + i as f32 * advance;
             v.push(g(&c.to_string(), x0, y, x0 + 6.0));
         }
+    }
+
+    /// One line of glyphs, one per piece of `pieces` (a ligature, a soft hyphen or a combining
+    /// mark is a glyph of its own when the font draws it so), 6 pt apart.
+    fn glyph_line(pieces: &[&str]) -> PageText {
+        let v: Vec<TextGlyph> = pieces
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let x = 10.0 + i as f32 * 6.0;
+                g(p, x, 10.0, x + 6.0)
+            })
+            .collect();
+        let n = v.len();
+        PageText { glyphs: v, line_of: vec![0; n], space_before: vec![false; n] }
+    }
+
+    /// Search used to compare the glyphs' code points as they are, so text set with a ligature
+    /// glyph, a soft hyphen, a zero width space, a decomposed accent or a typographic dash was
+    /// not found by what the user types (and so not redacted). It now compares text the way it
+    /// reads, on both sides, and every match still covers the glyphs it came from.
+    #[test]
+    fn search_matches_text_the_way_it_reads() {
+        let ligature = glyph_line(&["C", "o", "n", "\u{FB01}", "d", "e", "n", "t", "i", "a", "l"]);
+        assert_eq!(ligature.find("Confidential"), vec![0..11], "fi ligature");
+        assert_eq!(ligature.find_opts("Confidential", true, false), vec![0..11], "case-sensitive");
+        assert!(ligature.find_opts("confidential", true, false).is_empty(), "case-sensitive still is");
+        assert_eq!(ligature.find("Con\u{AD}fidential"), vec![0..11], "a soft hyphen typed in the query is ignored too");
+        assert_eq!(ligature.find("fi"), vec![3..4], "the ligature glyph alone");
+        assert_eq!(glyph_line(&["o", "\u{FB03}", "c", "e"]).find("office"), vec![0..4], "ffi ligature");
+
+        let soft_hyphen = glyph_line(&["S", "e", "c", "\u{AD}", "r", "e", "t"]);
+        assert_eq!(soft_hyphen.find("Secret"), vec![0..7], "the soft-hyphen glyph lies inside the match");
+        assert_eq!(glyph_line(&["P", "a", "s", "s", "\u{200B}", "w", "o", "r", "d"]).find("Password"), vec![0..9], "zero width space");
+
+        let decomposed = glyph_line(&["R", "e", "n", "e", "\u{301}", "e"]);
+        assert_eq!(decomposed.find("Renée"), vec![0..6], "a precomposed query finds decomposed text");
+        assert_eq!(decomposed.find("RENÉE"), vec![0..6]);
+        assert_eq!(decomposed.find("Rene"), vec![0..4]);
+        assert!(decomposed.find_opts("Rene", false, true).is_empty(), "the accent continues the word");
+        assert_eq!(glyph_line(&["R", "e", "n", "é", "e"]).find("Rene\u{301}e"), vec![0..5], "a decomposed query finds precomposed text");
+        assert_eq!(glyph_line(&["Ž", "i", "ž", "e", "k"]).find("Z\u{30C}i\u{17E}ek"), vec![0..5], "Latin Extended-A, either form");
+
+        let dashes = glyph_line(&["1", "2", "3", "\u{2011}", "4", "5", "\u{2013}", "6", "7", "8", "9"]);
+        assert_eq!(dashes.find("123-45-6789"), vec![0..11], "non-breaking hyphen and en dash read as a hyphen");
+        assert_eq!(glyph_line(&["a", "\u{2014}", "b"]).find("a-b"), vec![0..3], "em dash");
+    }
+
+    /// Pattern search (Search & Redact) sees the same normalised text, with runs of white space
+    /// as one space, so the SSN, phone, card and date patterns match typeset numbers; each
+    /// match still maps back to the glyphs it came from.
+    #[test]
+    fn pattern_search_sees_normalised_text() {
+        let find_ascii = |needle: &'static str| {
+            move |chars: &[char]| {
+                let n: Vec<char> = needle.chars().collect();
+                chars.windows(n.len()).enumerate().filter(|(_, w)| *w == n.as_slice()).map(|(i, _)| i..i + n.len()).collect::<Vec<_>>()
+            }
+        };
+        let ssn = glyph_line(&["S", "S", "N", " ", "1", "2", "3", "\u{2011}", "4", "5", "\u{2011}", "6", "7", "8", "9"]);
+        assert_eq!(ssn.find_with(find_ascii("123-45-6789")), vec![4..15]);
+        let phone = glyph_line(&["T", "e", "l", " ", "5", "5", "5", " ", " ", "1", "2", "3", " ", "4", "5", "6", "7"]);
+        assert_eq!(phone.plain_text(), "Tel 555  123 4567", "extraction keeps both spaces");
+        assert_eq!(phone.find_with(find_ascii("555 123 4567")), vec![4..17], "search collapses them");
+        let ligature = glyph_line(&["o", "\u{FB03}", "c", "e", " ", "\u{AD}", "x"]);
+        assert_eq!(ligature.find_with(find_ascii("office x")), vec![0..7], "a glyph that produces nothing stays inside the match");
+        assert_eq!(ligature.find_with(find_ascii("ffi")), vec![1..2]);
+    }
+
+    #[test]
+    fn decomposition_table_is_sorted_and_canonical() {
+        for w in DECOMPOSE.windows(2) {
+            assert!(w[0].0 < w[1].0, "{:?} before {:?}", w[0].0, w[1].0);
+        }
+        for (c, base, mark) in DECOMPOSE {
+            assert!(base.is_ascii_alphabetic(), "{c}");
+            assert!(is_combining(*mark), "{c}");
+            assert_ne!(*c, '\u{130}', "İ is folded by fold_case, not decomposed");
+            // The decomposition round-trips through the standard library's view of the letter:
+            // its lowercase form decomposes to the lowercase base letter with the same mark.
+            let lower: String = c.to_lowercase().collect();
+            if let Some(&(_, lb, lm)) = lower.chars().next().and_then(|l| DECOMPOSE.iter().find(|e| e.0 == l)) {
+                assert_eq!((lb.to_ascii_lowercase(), lm), (base.to_ascii_lowercase(), *mark), "{c}");
+            }
+        }
+        assert_eq!(fold_case("İIıi"), "iiii", "fold_case is unchanged");
     }
 
     #[test]

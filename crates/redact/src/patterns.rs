@@ -68,6 +68,22 @@ fn digit_run(s: &[char], start: usize, seps: &[char], max_len: usize) -> (usize,
     (i, n)
 }
 
+/// The ends to try for a run of digits and separators from `start` to `end`: the whole run, then
+/// the run cut back at each space, longest first, with the separators before the cut trimmed. A
+/// space can also separate two numbers (page text joins lines with one, so a number that ends a
+/// line runs into a street number, an expiry date or another number on the next), and the longest
+/// run is then not a valid number while a shorter one is.
+fn run_ends(s: &[char], start: usize, end: usize) -> impl Iterator<Item = usize> + '_ {
+    let cuts = (start..end).rev().filter(move |&k| s.get(k) == Some(&' ')).map(move |k| {
+        let mut e = k;
+        while e > start && !s.get(e - 1).is_some_and(char::is_ascii_digit) {
+            e -= 1;
+        }
+        e
+    });
+    std::iter::once(end).chain(cuts).filter(move |&e| e > start)
+}
+
 fn phone(s: &[char], i: usize) -> Option<usize> {
     let start_ok = s[i] == '+' && digit(s.get(i + 1)) || s[i] == '(' && digit(s.get(i + 1)) || s[i].is_ascii_digit();
     if !start_ok || word(i.checked_sub(1).and_then(|p| s.get(p))) || s.get(i.wrapping_sub(1)) == Some(&'+') {
@@ -75,9 +91,15 @@ fn phone(s: &[char], i: usize) -> Option<usize> {
     }
     let plus = s[i] == '+';
     let first = if plus { i + 1 } else { i };
-    let (end, n) = digit_run(s, first, &[' ', '-', '.', '(', ')'], 28);
+    let (longest, _) = digit_run(s, first, &[' ', '-', '.', '(', ')'], 28);
+    run_ends(s, first, longest).find_map(|end| phone_run(s, i, first, end, plus))
+}
+
+/// Is `s[first..end]` a phone number (starting at `i`, after a `+` when `plus`)? Its length.
+fn phone_run(s: &[char], i: usize, first: usize, end: usize, plus: bool) -> Option<usize> {
     let run = s.get(first..end)?;
-    let seps = run.iter().filter(|c| !c.is_ascii_digit()).count();
+    let n = run.iter().filter(|c| c.is_ascii_digit()).count();
+    let seps = run.len() - n;
     // Always grouped by at least one separator, so plain numbers never match.
     if seps == 0 || digit(s.get(end)) {
         return None;
@@ -158,12 +180,14 @@ fn credit_card(s: &[char], i: usize) -> Option<usize> {
     if !s[i].is_ascii_digit() || digit(i.checked_sub(1).and_then(|p| s.get(p))) {
         return None;
     }
-    let (end, n) = digit_run(s, i, &[' ', '-'], 23);
-    if !(13..=19).contains(&n) || digit(s.get(end)) {
-        return None;
-    }
-    let digits: Vec<u32> = s[i..end].iter().filter_map(|c| c.to_digit(10)).collect();
-    luhn(&digits).then_some(end - i)
+    let (longest, _) = digit_run(s, i, &[' ', '-'], 23);
+    run_ends(s, i, longest).find_map(|end| {
+        let digits: Vec<u32> = s.get(i..end)?.iter().filter_map(|c| c.to_digit(10)).collect();
+        if !(13..=19).contains(&digits.len()) || digit(s.get(end)) {
+            return None;
+        }
+        luhn(&digits).then_some(end - i)
+    })
 }
 
 fn ssn(s: &[char], i: usize) -> Option<usize> {
@@ -352,10 +376,13 @@ mod tests {
         assert_eq!(
             found(
                 Pattern::Phone,
-                "on 01.10.2026 or 09-10-2026, ratio 0.1234567, id 0211123456, +4921511234567, +1 234 567, 0211 12, +49 1234 5678 9012 3456"
+                "on 01.10.2026 or 09-10-2026, ratio 0.1234567, id 0211123456, +4921511234567, +1 234 567, 0211 12, +4912345678901234"
             ),
             Vec::<String>::new()
         );
+        // A grouped run with too many digits cannot be told from a number followed by another
+        // number (see `run_ends`): its longest valid prefix is marked rather than nothing.
+        assert_eq!(found(Pattern::Phone, "+49 1234 5678 9012 3456"), ["+49 1234 5678 9012"]);
     }
 
     #[test]
@@ -384,6 +411,20 @@ mod tests {
             found(Pattern::CreditCard, "Visa 4111 1111 1111 1111, bad 4111 1111 1111 1112, amex 3782-822463-10005"),
             ["4111 1111 1111 1111", "3782-822463-10005"]
         );
+    }
+
+    /// Page text joins words and lines with one space, so a number at the end of a line runs
+    /// into a street number, an expiry date, a CVV or another number on the next. The longest run
+    /// is then not a valid number; the number before the space still has to be found.
+    #[test]
+    fn numbers_followed_by_another_number_still_match() {
+        assert_eq!(found(Pattern::Phone, "Tel 555-123-4567 12 Elm Street"), ["555-123-4567"]);
+        assert_eq!(found(Pattern::Phone, "Fax (555) 222-3333 25 Oak Road"), ["(555) 222-3333"]);
+        assert_eq!(found(Pattern::Phone, "Tel 555-123-4567 1234 Elm Street"), ["555-123-4567"]);
+        assert_eq!(found(Pattern::Phone, "555-123-4567 555-987-6543"), ["555-123-4567", "555-987-6543"]);
+        assert_eq!(found(Pattern::CreditCard, "Card 4111 1111 1111 1111 12/26 expiry"), ["4111 1111 1111 1111"]);
+        assert_eq!(found(Pattern::CreditCard, "Card 4111 1111 1111 1111 123"), ["4111 1111 1111 1111"]);
+        assert_eq!(found(Pattern::CreditCard, "4111 1111 1111 1111 5500 0000 0000 0004"), ["4111 1111 1111 1111", "5500 0000 0000 0004"]);
     }
 
     #[test]

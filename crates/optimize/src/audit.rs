@@ -8,6 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
+/// Deepest chain of nested Form XObject resources the space audit classifies. Real documents
+/// nest forms only a few levels; the cap keeps a crafted chain from overflowing the stack.
+const MAX_FORM_DEPTH: usize = 64;
+
 /// The categories, in Acrobat's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SpaceCategory {
@@ -118,6 +122,15 @@ impl Audit<'_> {
 
     /// A page's resources, by kind.
     fn resources(&mut self, res: &Dict) {
+        self.resources_at(res, 0);
+    }
+
+    /// `depth` is how many nested Form XObject resource dictionaries have been entered. A chain of
+    /// forms whose `/Resources` each references the next recurses once per form; without a bound a
+    /// crafted document overflows the stack, which aborts the process (as `create::collect` bounds
+    /// the same walk). Forms past the cap are still size-counted by the per-object pass in
+    /// [`audit_space`]; only the classification of their nested resources is skipped.
+    fn resources_at(&mut self, res: &Dict, depth: usize) {
         let xobjects = self.resolve_dict(res.get(b"XObject"));
         for (_, x) in xobjects.iter() {
             let Some(r) = x.as_ref() else { continue };
@@ -130,7 +143,9 @@ impl Audit<'_> {
                     let inner = self.resolve_dict(s.dict.get(b"Resources"));
                     if let std::collections::hash_map::Entry::Vacant(e) = self.owner.entry(r.num) {
                         e.insert(SpaceCategory::XObjectForms);
-                        self.resources(&inner);
+                        if depth < MAX_FORM_DEPTH {
+                            self.resources_at(&inner, depth + 1);
+                        }
                     }
                 }
                 self.claim(x, SpaceCategory::XObjectForms);

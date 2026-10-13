@@ -245,6 +245,48 @@ fn space_audit_counts_images_a_content_stream_dictionary_points_at_as_images() {
     assert!(images.percent > 80.0, "{audit:?}");
 }
 
+/// A page whose Form XObject resources chain one form to the next used to make the space audit
+/// recurse once per form with no depth bound, so a crafted chain overflowed the stack and aborted
+/// the process. The walk is now depth-bounded, so auditing completes on a small stack. Run on a
+/// thread with a small stack, where the unbounded recursion would overflow.
+#[test]
+fn space_audit_of_a_deep_form_chain_does_not_overflow_the_stack() {
+    fn build_chain(n: usize) -> Arc<Vec<u8>> {
+        let mut doc = Document::new_empty();
+        // Build innermost first; each outer form's /Resources references the next inner form.
+        let mut inner: Option<ObjRef> = None;
+        for _ in 0..n {
+            let mut d = Dict::new();
+            d.set(b"Type".to_vec(), Object::name("XObject"));
+            d.set(b"Subtype".to_vec(), Object::name("Form"));
+            d.set(b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]));
+            if let Some(next) = inner {
+                let mut xo = Dict::new();
+                xo.set(b"F".to_vec(), Object::Ref(next));
+                let mut res = Dict::new();
+                res.set(b"XObject".to_vec(), Object::Dict(xo));
+                d.set(b"Resources".to_vec(), Object::Dict(res));
+            }
+            inner = Some(doc.add(Object::Stream(Stream::from_raw(d, b"/F Do".to_vec()))));
+        }
+        let outer = inner.expect("at least one form");
+        page(&mut doc, &[("F0", outer)], "/F0 Do");
+        Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())
+    }
+    let bytes = build_chain(8_000);
+    let worker = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let doc = Document::open(bytes.clone()).unwrap();
+            let audit = audit_space(&doc, bytes.len() as u64);
+            assert_eq!(audit.len(), SpaceCategory::ALL.len());
+            audit.iter().map(|u| u.bytes).sum::<u64>()
+        })
+        .unwrap();
+    let summed = worker.join().expect("auditing a deep form chain must not overflow the stack");
+    assert!(summed > 0, "the audit counted some bytes");
+}
+
 #[test]
 fn invalid_links_and_unreferenced_destinations_go() {
     let mut doc = Document::new_empty();

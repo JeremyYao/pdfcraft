@@ -13,14 +13,18 @@ fn data(name: &str) -> Vec<u8> {
 
 /// One page with text and an unsigned signature field "Approval".
 fn fixture() -> Vec<u8> {
-    let objs: Vec<&[u8]> = vec![
+    build(&[
         b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>",
         b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
-    ];
+    ])
+}
+
+/// A classic-xref file from object bodies (object i+1 = objs[i]), with object 1 the catalog.
+fn build(objs: &[&[u8]]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objs.iter().enumerate() {
@@ -1977,4 +1981,182 @@ fn a_cross_reference_entry_that_misses_its_object_is_not_an_unchanged_object() {
     let honest = append_content_revision(&signed, "Contract text", |new| format!("4 1\n{}", xref_entry(new)));
     let s = signatures(&open(&honest), &honest, &trust).into_iter().find(|s| s.signed).unwrap();
     assert_eq!(s.status, Status::Valid, "{:?}", s.details);
+}
+
+/// The `startxref` value of `signed`, as written.
+fn prev_startxref(signed: &[u8]) -> String {
+    let at = signed.windows(9).rposition(|w| w == b"startxref").unwrap() + 9;
+    signed[at..].iter().skip_while(|b| b.is_ascii_whitespace()).take_while(|b| b.is_ascii_digit()).map(|b| *b as char).collect()
+}
+
+/// `signed` with one revision appended by hand: `objects` (number, body) each written out and
+/// listed by a classic section, under a trailer of the given entries (plus /Size and /Prev).
+fn append_objects_revision(signed: &[u8], objects: &[(u32, &str)], trailer: &str) -> Vec<u8> {
+    let prev = prev_startxref(signed);
+    let mut out = signed.to_vec();
+    let mut subsections = String::new();
+    for (num, body) in objects {
+        subsections += &format!("{num} 1\n{}", xref_entry(out.len()));
+        out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let section = out.len();
+    out.extend_from_slice(format!("xref\n{subsections}trailer\n<< /Size 60 /Prev {prev} {trailer} >>\nstartxref\n{section}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// `signed` with a classic cross-reference section appended by hand, with no objects.
+fn append_section(signed: &[u8], subsections: &str, trailer: &str) -> Vec<u8> {
+    let prev = prev_startxref(signed);
+    let mut out = signed.to_vec();
+    let section = out.len();
+    out.extend_from_slice(format!("xref\n{subsections}trailer\n<< /Size 60 /Prev {prev} {trailer} >>\nstartxref\n{section}\n%%EOF\n").as_bytes());
+    out
+}
+
+fn content_body(text: &str) -> String {
+    let content = format!("BT /F1 14 Tf 20 250 Td ({text}) Tj ET");
+    format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len())
+}
+
+/// The reader that judges changes resolves object 4 as the signed content stream, while the
+/// renderer, made to rebuild its cross-reference by scanning the file, takes the last `4 0
+/// obj` body it finds: a new one appended after signing, listed by nothing. Whatever makes the
+/// renderer rebuild (a section it reads differently from this reader, or any other cause), an
+/// object body after the signed revision that no entry locates is never a permitted change.
+#[test]
+fn an_object_body_after_the_signed_revision_that_no_entry_locates_is_a_change() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify, ..opts() }).unwrap();
+        type Subsections = Box<dyn Fn(usize) -> String>;
+        let attacks: [(&str, Subsections); 3] = [
+            // The section lists only an unused object, at the new body.
+            ("an entry for another object at the new body", Box::new(|new| format!("7 1\n{}", xref_entry(new)))),
+            // An entry a 32-bit reader refuses, and the whole table with it.
+            ("an entry whose offset does not fit 32 bits", Box::new(|_| "7 1\n9999999999 00000 n \n".to_string())),
+            // A 19-byte entry: a reader that counts bytes reads the table differently.
+            ("a 19-byte entry", Box::new(|_| "7 1\n0000000009 00000 n\n".to_string())),
+        ];
+        for (name, xref) in attacks {
+            let edited = append_content_revision(&signed, "Forged text", xref);
+            let doc = open(&edited);
+            assert_eq!(doc.objects_unlisted_from(signed.len()), [4], "{name}: the new body is listed by nothing");
+            let s = signatures(&doc, &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+            assert_eq!(s.status, Status::Invalid, "{certify:?}, {name}: {:?}", s.details);
+            assert!(
+                matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")),
+                "{certify:?}, {name}: {:?}",
+                s.modification
+            );
+        }
+        // The same through a cross-reference stream whose type field is two bytes wide (a
+        // reader that always takes one byte reads other rows), listing only the unused object.
+        let prev = prev_startxref(&signed);
+        let mut edited = signed.clone();
+        let body = edited.len();
+        edited.extend_from_slice(format!("4 0 obj\n{}\nendobj\n", content_body("Forged text")).as_bytes());
+        let section = edited.len();
+        let row = [0u8, 1, (body >> 8) as u8, body as u8, 0];
+        edited.extend_from_slice(
+            format!("8 0 obj\n<< /Type /XRef /Size 60 /W [2 2 1] /Index [7 1] /Root 1 0 R /Prev {prev} /Length 5 >>\nstream\n").as_bytes(),
+        );
+        edited.extend_from_slice(&row);
+        edited.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{section}\n%%EOF\n").as_bytes());
+        let s = signatures(&open(&edited), &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+        assert_eq!(s.status, Status::Invalid, "{certify:?}, two-byte type field: {:?}", s.details);
+        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")), "{certify:?}: {:?}", s.modification);
+        // And through a hybrid section whose cross-reference stream has a /Prev of its own,
+        // naming an older section that lists the new body: this reader follows the table's
+        // /Prev, a reader that follows the stream's draws the new body.
+        let mut edited = signed.clone();
+        let body = edited.len();
+        edited.extend_from_slice(format!("4 0 obj\n{}\nendobj\n", content_body("Forged text")).as_bytes());
+        let older = edited.len();
+        edited.extend_from_slice(format!("xref\n4 1\n{}trailer\n<< /Size 60 /Root 1 0 R >>\n", xref_entry(body)).as_bytes());
+        let stream = edited.len();
+        edited.extend_from_slice(
+            format!("8 0 obj\n<< /Type /XRef /Size 60 /W [1 2 1] /Index [0 0] /Prev {older} /Length 0 >>\nstream\n\nendstream\nendobj\n").as_bytes(),
+        );
+        let table = edited.len();
+        edited.extend_from_slice(
+            format!("xref\n0 0\ntrailer\n<< /Size 60 /Root 1 0 R /XRefStm {stream} /Prev {prev} >>\nstartxref\n{table}\n%%EOF\n").as_bytes(),
+        );
+        let s = signatures(&open(&edited), &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+        assert_eq!(s.status, Status::Invalid, "{certify:?}, hybrid /Prev: {:?}", s.details);
+        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")), "{certify:?}: {:?}", s.modification);
+    }
+}
+
+/// A revision appended after signing that frees a signed object: the content stream, the page
+/// or the font of a signed page is page content, which no signature permits removing; a comment
+/// is a comment, which an approval signature and a P=3 certification permit.
+#[test]
+fn objects_freed_after_signing_are_classified_by_what_they_were() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let with_comment = build(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R 7 0 R] >>",
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
+        b"<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /Contents (A note) >>",
+    ]);
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&with_comment), &id, &SignOptions { certify, ..opts() }).unwrap();
+        for (what, num) in [("the content stream", 4), ("the page", 3), ("the font", 5)] {
+            let edited = append_section(&signed, &format!("{num} 1\n0000000000 00001 f \n"), "/Root 1 0 R");
+            let doc = open(&edited);
+            assert!(matches!(doc.xref_entry(num), Some(pdfcraft_cos::XrefEntry::Free { .. })), "{what} is freed");
+            let s = signatures(&doc, &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+            assert_eq!(s.status, Status::Invalid, "{certify:?}, {what} freed: {:?}", s.details);
+            assert!(
+                matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")),
+                "{certify:?}, {what}: {:?}",
+                s.modification
+            );
+        }
+        let edited = append_section(&signed, "7 1\n0000000000 00001 f \n", "/Root 1 0 R");
+        let s = signatures(&open(&edited), &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+        match certify {
+            None | Some(3) => {
+                assert_eq!(s.status, Status::Valid, "{certify:?}, comment freed: {:?}", s.details);
+                assert!(matches!(&s.modification, Modification::Allowed(k) if k == &["comments"]), "{certify:?}: {:?}", s.modification);
+            }
+            _ => {
+                assert_eq!(s.status, Status::Invalid, "{certify:?}, comment freed: {:?}", s.details);
+                assert!(matches!(&s.modification, Modification::Disallowed(k) if k == &["comments"]), "{certify:?}: {:?}", s.modification);
+            }
+        }
+    }
+}
+
+/// The trailer of a revision appended after signing can point /Root at a catalog of its own,
+/// or replace the file identifier, without touching a signed object. Neither is permitted.
+#[test]
+fn trailer_changes_after_signing_are_changes() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify, ..opts() }).unwrap();
+        // A catalog of the attacker's: the signed one, with the pages opened on the attachments.
+        let signed_doc = open(&signed);
+        let mut catalog = signed_doc.get(signed_doc.root().unwrap()).as_dict().cloned().unwrap();
+        catalog.set(b"PageMode".to_vec(), Object::name("UseAttachments"));
+        let mut body = Vec::new();
+        pdfcraft_cos::serialize(&Object::Dict(catalog), &mut body);
+        let edited = append_objects_revision(&signed, &[(9, &String::from_utf8(body).unwrap())], "/Root 9 0 R");
+        let doc = open(&edited);
+        assert_eq!(doc.root(), Some(pdfcraft_cos::ObjRef::new(9, 0)));
+        let s = signatures(&doc, &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+        assert_eq!(s.status, Status::Invalid, "{certify:?}, new catalog: {:?}", s.details);
+        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"document structure")), "{certify:?}: {:?}", s.modification);
+        // A new file identifier, and nothing else.
+        let edited = append_section(&signed, "", "/Root 1 0 R /ID [(0123456789abcdef) (0123456789abcdef)]");
+        let s = signatures(&open(&edited), &edited, &trust).into_iter().find(|s| s.signed).unwrap();
+        assert_eq!(s.status, Status::Invalid, "{certify:?}, new /ID: {:?}", s.details);
+        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"other changes")), "{certify:?}: {:?}", s.modification);
+    }
 }

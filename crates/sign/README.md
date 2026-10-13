@@ -87,6 +87,15 @@ needs a prompt to open is listed and asks at signing (issue #179).
   document's XMP, and only objects reached through the `/DSS` keys above are the security store. A
   `/Type /Metadata` or `/Type /DSS` *label* on any other dictionary or stream (a page's Form
   XObject, say) makes nothing permitted, at every DocMDP level.
+- **The verdict is bound to what the page can show.** The classifier reads the file through
+  `pdfcraft-cos`, the page is drawn by a renderer with a reader of its own, and an appended
+  revision may be read differently by the two. So, after signing: any cross-reference entry the
+  reader sets aside or records as read differently elsewhere (`Document::xref_oddities`), any
+  object body no entry locates (`Document::objects_unlisted_from`, what a reader rebuilding its
+  table by scanning the file would draw), a trailer that points `/Root` elsewhere, adds or changes
+  `/Encrypt` or replaces `/ID`, and any signed object a later revision frees are changes, judged
+  by the role the object had when signed, and never permitted unless that role is (a freed
+  comment is a comment).
 - **Strict in what it checks, tolerant where signers differ.** RSA PKCS #1 signatures are checked
   against the one encoding the digest should have, built here and compared byte for byte; the
   `DigestInfo` may omit its NULL parameter, as older signers write it (RFC 8017 App. B.1), but a

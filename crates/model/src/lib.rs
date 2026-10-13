@@ -86,24 +86,38 @@ pub fn pages(doc: &Document) -> Vec<Page> {
     let Some(top) = doc.get(root).as_dict().and_then(|d| d.reference(b"Pages")) else { return Vec::new() };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<(ObjRef, Dict)> = vec![(top, Dict::new())];
+    seen.insert(top);
+    // The inherited attributes are shared (an `Arc`), so a node with many `/Kids` entries queues
+    // one cheap pointer per kid rather than a deep copy of the attributes per kid, and a kid is
+    // queued at most once (the seen-set is consulted before pushing, not after popping). Peak
+    // memory is then bounded by the number of distinct nodes, not by kids × attribute size.
+    let mut stack: Vec<(ObjRef, std::sync::Arc<Dict>)> = vec![(top, std::sync::Arc::new(Dict::new()))];
     while let Some((node, inherited)) = stack.pop() {
-        if !seen.insert(node) || seen.len() > 1_000_000 {
-            continue;
-        }
         let obj = doc.get(node);
         let Some(d) = obj.as_dict() else { continue };
-        let mut attrs = inherited.clone();
-        for k in INHERITABLE {
-            if let Some(v) = d.get(k) {
-                attrs.set(k.to_vec(), v.clone());
+        // Only build a fresh attribute set when this node overrides an inheritable key; otherwise
+        // reuse the parent's, so a chain of plain nodes shares one allocation.
+        let attrs = if INHERITABLE.iter().any(|k| d.get(k).is_some()) {
+            let mut a = (*inherited).clone();
+            for k in INHERITABLE {
+                if let Some(v) = d.get(k) {
+                    a.set(k.to_vec(), v.clone());
+                }
             }
-        }
+            std::sync::Arc::new(a)
+        } else {
+            inherited.clone()
+        };
         let is_pages = d.name(b"Type") == Some(b"Pages") || (d.contains(b"Kids") && d.name(b"Type") != Some(b"Page"));
         if is_pages {
             let kids = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default();
             for k in kids.iter().rev() {
-                if let Some(r) = k.as_ref() {
+                if seen.len() > 1_000_000 {
+                    break;
+                }
+                if let Some(r) = k.as_ref()
+                    && seen.insert(r)
+                {
                     stack.push((r, attrs.clone()));
                 }
             }
@@ -182,6 +196,46 @@ mod tests {
             };
             assert_eq!(tl, expect, "rotation {rotate}");
         }
+    }
+
+    /// A `/Pages` node that lists the same page thousands of times under a large inherited
+    /// `/Resources` used to deep-copy that `/Resources` once per `/Kids` entry and keep every copy
+    /// alive at once, so memory grew as (kids × resource size) while the file grew only as their
+    /// sum: a small file exhausted memory and aborted the process. The inherited attributes are now
+    /// shared and a kid already queued is not queued again, so enumeration is bounded by the number
+    /// of distinct nodes. The repeated page is still one page.
+    #[test]
+    fn a_page_repeated_under_a_large_inherited_resources_is_bounded() {
+        let kids = 4_000;
+        let elements = 10_000;
+        let procset = std::iter::repeat_n("0", elements).collect::<Vec<_>>().join(" ");
+        let refs = std::iter::repeat_n("3 0 R", kids).collect::<Vec<_>>().join(" ");
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [{refs}] /Count 1 /MediaBox [0 0 200 200] /Resources << /ProcSet [{procset}] >> >>"),
+            "<< /Type /Page /Parent 2 0 R >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offs = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offs.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let x = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for o in offs {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1).as_bytes());
+        let doc = Document::open(Arc::new(out)).unwrap();
+        let start = std::time::Instant::now();
+        let got = pages(&doc);
+        assert_eq!(got.len(), 1, "the repeated page is one page");
+        assert!(got[0].dict.contains(b"Resources"), "the inherited resources reach the page");
+        // The deep-copy-per-kid version did (kids × elements) ≈ 4e9 element clones here, a
+        // multi-GiB peak taking many seconds; the shared version is near-instant.
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_millis() < 200, "pages() took {elapsed:?}");
     }
 
     /// Display space is in points: `/UserUnit 2` doubles it. As in Acrobat, the value isn't

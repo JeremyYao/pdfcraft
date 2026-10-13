@@ -19,7 +19,8 @@ pub enum Hidden {
     Attachments,
     /// Comments and markup annotations (with their pop-ups).
     Comments,
-    /// Interactive form fields (flattened: their appearance stays as page content).
+    /// Interactive form fields (flattened: their appearance stays as page content; Hidden and
+    /// NoView ones go with nothing drawn).
     FormFields,
     /// Text drawn invisibly (render modes 3 and 7) or wholly off the page.
     HiddenText,
@@ -293,8 +294,25 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
         doc.update_dict(root, |d| {
             d.remove(b"AcroForm");
         })?;
-        // The widgets flattening took off the pages are deleted, and so is a field none of
-        // whose widgets is on a page any more (its /V would otherwise stay reachable).
+        // Flattening leaves Hidden and NoView annotations alone (neither drawn nor removed),
+        // which is right for Flatten but not here: a widget the user cannot see still holds its
+        // field's name and value. Every widget still on a page goes, undrawn.
+        for p in pdfcraft_model::pages(doc) {
+            let list = annots_of(doc, &p.dict);
+            let kept: Vec<Object> =
+                list.iter().filter(|a| doc.resolve(a).as_dict().and_then(|d| d.name(b"Subtype")) != Some(b"Widget")).cloned().collect();
+            if kept.len() != list.len() {
+                doc.update_dict(p.obj, |d| {
+                    if kept.is_empty() {
+                        d.remove(b"Annots");
+                    } else {
+                        d.set(b"Annots".to_vec(), Object::Array(kept));
+                    }
+                })?;
+            }
+        }
+        // The widgets taken off the pages are deleted, and so is a field none of whose widgets
+        // is on a page any more (its /V would otherwise stay reachable).
         let on_page: std::collections::HashSet<ObjRef> =
             pdfcraft_model::pages(doc).iter().flat_map(|p| annots_of(doc, &p.dict)).filter_map(|a| a.as_ref()).collect();
         for f in &fields {

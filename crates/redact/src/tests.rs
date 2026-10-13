@@ -1506,3 +1506,41 @@ fn removed_hidden_annotations_and_fields_do_not_survive_through_the_structure_tr
     remove_hidden(&mut doc, &[Hidden::FormFields]).unwrap();
     assert!(!saved_has_dict(&doc, is_widget), "the flattened widget dictionary survived Remove Hidden Information > Form fields");
 }
+
+/// A form with a visible field and two the user cannot see (Hidden and NoView widget flags).
+fn hidden_fields_fixture() -> Document {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R 7 0 R] >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << >> /Annots [5 0 R 6 0 R 7 0 R] >>".to_vec(),
+        stream("", b""),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (visible) /V (MARK_VISIBLE_VALUE) /Rect [10 250 150 270] /F 4 /P 3 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (ssn) /V (MARK_HIDDEN_VALUE) /Rect [10 200 150 220] /F 6 /P 3 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (memo) /V (MARK_NOVIEW_VALUE) /Rect [10 150 150 170] /F 36 /P 3 0 R >>".to_vec(),
+    ])
+}
+
+/// Flattening leaves Hidden and NoView annotations alone (neither drawn nor removed), and the
+/// Form fields category relied on it to take every widget off the pages: the hidden fields
+/// stayed in /Annots with their values, and were live fields again once the file was reopened.
+#[test]
+fn hidden_and_noview_form_fields_are_removed_with_the_rest() {
+    use crate::sanitize::{Hidden, remove_hidden, sanitize, scan};
+    for all in [false, true] {
+        let mut doc = hidden_fields_fixture();
+        assert_eq!(scan(&doc).into_iter().find(|c| c.0 == Hidden::FormFields), Some((Hidden::FormFields, 3)));
+        if all {
+            sanitize(&mut doc).unwrap();
+        } else {
+            remove_hidden(&mut doc, &[Hidden::FormFields]).unwrap();
+        }
+        assert!(saved_contains(&doc, b"MARK_VISIBLE_VALUE"), "the visible field's value stays as page content (sanitize: {all})");
+        for secret in [&b"MARK_HIDDEN_VALUE"[..], b"MARK_NOVIEW_VALUE"] {
+            assert!(!saved_contains(&doc, secret), "{} survived (sanitize: {all})", String::from_utf8_lossy(secret));
+        }
+        assert!(!saved_has_dict(&doc, |d| d.name(b"Subtype") == Some(b"Widget")), "a widget survived (sanitize: {all})");
+        let saved = reopen(&doc);
+        assert!(pdfcraft_forms::fields(&saved).is_empty(), "the saved file still has fields (sanitize: {all})");
+        assert_eq!(scan(&saved).into_iter().find(|c| c.0 == Hidden::FormFields), Some((Hidden::FormFields, 0)));
+    }
+}

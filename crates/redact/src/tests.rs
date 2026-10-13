@@ -1242,3 +1242,48 @@ fn streams_cos_cannot_decode_cleanly_fail_closed() {
     assert!(!any_has(&saved_streams(&doc), b"COLORSECRETROW19"), "the marked image row survived the save: {r:?}");
     assert_eq!((r.images_removed, r.images_cleared), (1, 0), "{r:?}");
 }
+
+/// The renderer takes a font's writing mode from the parsed CMap: `/WMode 1 def` in an embedded
+/// CMap's program (whatever its stream dictionary says) and the predefined CMap named plainly `V`
+/// lay the glyphs out vertically. The fail-closed check must see them as the `-V` names and a
+/// stream-dictionary `/WMode` are seen, or the marked column is never matched.
+#[test]
+fn vertical_writing_from_the_cmap_program_or_the_cmap_named_v_fails_closed() {
+    let cmap = |wmode: u8| {
+        format!(
+            "%!PS-Adobe-3.0 Resource-CMap\n/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n/CMapName /TestV def\n/WMode {wmode} def\n1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 begincidrange <0000> <FFFF> 0 endcidrange\nendcmap CMapName currentdict /CMap defineresource pop end end"
+        )
+    };
+    let make = |encoding: &str, extra: Vec<Vec<u8>>| -> Document {
+        let t0 = format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding {encoding} /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 1000 /W [1 [500 500] 3 4 250] >>] >>"
+        );
+        let mut doc = one_page(b"BT /F2 10 Tf 0 1 -1 0 100 50 Tm <0001000200030004> Tj ET", "", extra);
+        let font_ref = doc.add(pdfcraft_cos::Lexer::new(t0.as_bytes(), 0).object().unwrap());
+        doc.update_dict(ObjRef::new(3, 0), |d| {
+            let mut res = d.get(b"Resources").and_then(Object::as_dict).cloned().unwrap();
+            let mut fonts = res.get(b"Font").and_then(Object::as_dict).cloned().unwrap();
+            fonts.set(b"F2".to_vec(), Object::Ref(font_ref));
+            res.set(b"Font".to_vec(), Object::Dict(fonts));
+            d.set(b"Resources".to_vec(), Object::Dict(res));
+        })
+        .unwrap();
+        mark(&mut doc, 0, &[[85.0, 55.5, 105.0, 61.0]], "");
+        doc
+    };
+    // The embedded CMap's program says vertical; its stream dictionary has no /WMode.
+    let mut doc = make(
+        "7 0 R",
+        vec![stream("/Type /CMap /CMapName /TestV /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>", cmap(1).as_bytes())],
+    );
+    assert_eq!(apply(&mut doc, None), Err(RedactError::VerticalText(1)), "WMode 1 in the CMap program");
+    // The predefined vertical CMap whose name does not end in -V.
+    let mut doc = make("/V", vec![]);
+    assert_eq!(apply(&mut doc, None), Err(RedactError::VerticalText(1)), "the CMap named V");
+    // Control: the same embedded CMap with /WMode 0 is horizontal and redacted normally.
+    let mut doc = make(
+        "7 0 R",
+        vec![stream("/Type /CMap /CMapName /TestV /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>", cmap(0).as_bytes())],
+    );
+    assert_eq!(apply(&mut doc, None).unwrap().glyphs, 2, "the horizontal control is redacted");
+}

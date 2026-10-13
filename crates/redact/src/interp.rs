@@ -38,9 +38,10 @@ pub(crate) enum Mode {
 struct Gs {
     ctm: Matrix,
     font: Rc<Metrics>,
-    /// The current font writes vertically (a Type0 font with an `-V` encoding or a CMap whose
-    /// `/WMode` is 1). Glyph layout here is horizontal, so such text cannot be placed under a
-    /// region; apply fails closed when it meets any (see `show`).
+    /// The current font writes vertically (a Type0 font with a predefined vertical CMap or an
+    /// embedded CMap whose `/WMode` is 1, see [`is_vertical`]). Glyph layout here is horizontal,
+    /// so such text cannot be placed under a region; apply fails closed when it meets any (see
+    /// `show`).
     vertical: bool,
     size: f64,
     char_spacing: f64,
@@ -169,15 +170,23 @@ fn res_dict(doc: &Document, res: &Dict, key: &[u8]) -> Dict {
 }
 
 /// Does this font write vertically? Only a Type0 (composite) font can: its `/Encoding` is a
-/// predefined CMap name ending in `-V` (Identity-V and the like), or an embedded CMap stream
-/// whose `/WMode` is 1 (ISO 32000-2 §9.7.5).
+/// predefined vertical CMap name (ending in `-V`, Identity-V and the like, or the one named
+/// plainly `V`; ISO 32000-2 Table 118), or an embedded CMap stream whose `/WMode` is 1, in its
+/// stream dictionary or, as a viewer reads it, in its program (§9.7.5.4). An embedded CMap that
+/// cannot be decoded counts as vertical, so apply fails closed.
 fn is_vertical(doc: &Document, font: &Dict) -> bool {
     if font.name(b"Subtype") != Some(b"Type0".as_slice()) {
         return false;
     }
     match font.get(b"Encoding").map(|e| doc.resolve(e)).as_deref() {
-        Some(Object::Name(n)) => n.ends_with(b"-V"),
-        Some(Object::Stream(s)) => s.dict.int(b"WMode") == Some(1),
+        Some(Object::Name(n)) => n == b"V" || n.ends_with(b"-V"),
+        Some(Object::Stream(s)) => {
+            s.dict.int(b"WMode") == Some(1)
+                || match s.decoded() {
+                    Ok(program) => pdfcraft_fonts::pdf::cmap_is_vertical(&program),
+                    Err(_) => true,
+                }
+        }
         _ => false,
     }
 }

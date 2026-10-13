@@ -1751,31 +1751,40 @@ fn mark_shown_text(s: &mut Session, id: DocId, needle: &str) {
     s.apply(id, mark).unwrap();
 }
 
-/// Redaction removes text by the positions its own interpreter works out. Here the font and size
-/// come from an ExtGState /Font entry (`gs`), which the renderer honours and the interpreter does
-/// not model, so it places no glyph under the mark the user drew over the word as displayed: it
-/// used to report success and leave the word in the file. The renderer is asked now, and the edit
-/// is refused.
+/// Redaction removes text by the positions its own interpreter works out, and the marks were
+/// drawn over the page as the renderer shows it, so after applying, the renderer has the last
+/// word (`shown_under_redactions`): a glyph still drawn half under a mark means the edit is
+/// refused with nothing changed. The backstop is asked here about a document whose marked word
+/// was not removed at all. Text whose font and size come from an ExtGState /Font entry (`gs`),
+/// which once reached the backstop because the interpreter did not model it, is placed by both
+/// now and goes, like text set with `Tf`.
 #[test]
 fn redaction_is_refused_when_the_page_still_shows_text_under_a_mark() {
     let line = "Public words then SECRET42 and more";
     let mut s = Session::new().with_clock(|| 1_700_000_000);
-    let by_gs = one_line_page("/ExtGState << /GS1 << /Type /ExtGState /Font [4 0 R 16] >> >>", &format!("BT /GS1 gs 20 150 Td ({line}) Tj ET"));
-    let id = s.open("gs.pdf", None, Arc::new(by_gs), None).unwrap();
-    mark_shown_text(&mut s, id, "SECRET42");
-    let refused = s.apply(id, Edit::ApplyRedactions { pages: None });
-    assert!(matches!(refused, Err(EditError::Redact(pdfcraft_redact::RedactError::Residue(n))) if n > 0), "{refused:?}");
-    // Nothing was changed: the mark is still pending and the page still shows the line.
-    assert_eq!(s.get(id).unwrap().redaction_marks(), 1);
-    assert_eq!(page_texts(&s, id), [line]);
-
-    // The same line with its font set by `Tf`: the mark is applied and the word is gone.
     let by_tf = one_line_page("/Font << /F1 4 0 R >>", &format!("BT /F1 16 Tf 20 150 Td ({line}) Tj ET"));
-    let id = s.open("tf.pdf", None, Arc::new(by_tf), None).unwrap();
+    let id = s.open("kept.pdf", None, Arc::new(by_tf.clone()), None).unwrap();
     mark_shown_text(&mut s, id, "SECRET42");
-    s.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
-    let shown = page_texts(&s, id).swap_remove(0);
-    assert!(shown.starts_with("Public words then") && shown.ends_with("and more") && !shown.contains("SECRET42"), "{shown}");
+    let doc = s.get(id).unwrap();
+    let cos = &doc.editor.as_ref().unwrap().cos;
+    let marks = pdfcraft_redact::marks(cos);
+    assert_eq!(marks.len(), 1);
+    let refused = shown_under_redactions(cos, &marks, &doc.info.pages, None);
+    assert!(matches!(refused, Err(EditError::Redact(pdfcraft_redact::RedactError::Residue(n))) if n > 0), "{refused:?}");
+    // A mark over nothing drawn is clean.
+    let mut off = marks.clone();
+    off[0].rects = vec![[300.0, 20.0, 400.0, 60.0]];
+    assert!(shown_under_redactions(cos, &off, &doc.info.pages, None).is_ok());
+
+    // The line with its font set by `gs` or by `Tf`: the mark is applied and the word is gone.
+    let by_gs = one_line_page("/ExtGState << /GS1 << /Type /ExtGState /Font [4 0 R 16] >> >>", &format!("BT /GS1 gs 20 150 Td ({line}) Tj ET"));
+    for (name, bytes) in [("gs.pdf", by_gs), ("tf.pdf", by_tf)] {
+        let id = s.open(name, None, Arc::new(bytes), None).unwrap();
+        mark_shown_text(&mut s, id, "SECRET42");
+        s.apply(id, Edit::ApplyRedactions { pages: None }).unwrap();
+        let shown = page_texts(&s, id).swap_remove(0);
+        assert!(shown.starts_with("Public words then") && shown.ends_with("and more") && !shown.contains("SECRET42"), "{name}: {shown}");
+    }
 }
 
 #[test]

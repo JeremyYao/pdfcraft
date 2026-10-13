@@ -1034,3 +1034,56 @@ fn redacting_one_of_two_same_named_fields_deletes_that_field_by_object() {
     assert!(!has(&texts, b"V034-GONE-DDD") && !has(&texts, b"V034-KEEP-CCC"), "a marked value survived the save");
     assert!(pdfcraft_forms::fields(&saved_doc).is_empty());
 }
+
+/// The samples cleared under a mark must be the ones the page shows there. The renderer resolves
+/// an image's colour space by rules of its own (the short /CS key first, an ICC profile's
+/// /Alternate when the profile does not load, DeviceGray for anything it cannot resolve), so a
+/// layout the redactor cannot be sure of must remove the image whole rather than clear bytes the
+/// renderer never draws (here: padding after the real samples).
+#[test]
+fn an_image_whose_sample_layout_is_uncertain_is_removed_whole() {
+    // 8×8 gray samples; rows 4–5 hold the marker; padded to a 3- or 5-component length.
+    let samples = |len: usize| {
+        let mut d = vec![0x4Du8; 32];
+        d.extend_from_slice(b"REDIMGSECRETROW!");
+        d.extend(vec![0x4Du8; 16]);
+        d.extend(vec![0xFFu8; len - 64]);
+        d
+    };
+    let draw = b"q 80 0 0 80 60 110 cm /Im1 Do Q";
+    let variants: [(&str, &str, usize); 6] = [
+        ("icc N 3 with a gray alternate and a profile that does not load", "/ColorSpace [/ICCBased 8 0 R]", 192),
+        ("bare CalRGB", "/ColorSpace /CalRGB", 192),
+        ("short /CS key beside a different /ColorSpace", "/CS /DeviceGray /ColorSpace /DeviceRGB", 192),
+        ("icc N 5 without an alternate", "/ColorSpace [/ICCBased 9 0 R]", 320),
+        ("CalRGB array without its dictionary", "/ColorSpace [/CalRGB]", 192),
+        ("short /F key beside /Filter", "/ColorSpace /DeviceGray /F /ASCIIHexDecode", 64),
+    ];
+    for (what, cs, len) in variants {
+        let image = stream(&format!("/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 8 {cs}"), &samples(len));
+        let profiles = vec![stream("/N 3 /Alternate /DeviceGray", b"JUNK"), stream("/N 5", b"JUNK")];
+        let mut doc = one_page(draw, "/XObject << /Im1 7 0 R >>", [vec![image], profiles].concat());
+        // Rows 4 and 5 (y 130–150 of the 80 pt image at y 110).
+        mark(&mut doc, 0, &[[60.0, 130.0, 140.0, 150.0]], "");
+        let r = apply(&mut doc, None).unwrap();
+        let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        let survived = saved.scan_objects().any(|(_, o)| match &*o {
+            Object::Stream(s) => s.decoded().unwrap().windows(16).any(|w| w == b"REDIMGSECRETROW!"),
+            _ => false,
+        });
+        assert!(!survived, "{what}: the marked samples survived the save");
+        assert_eq!((r.images_removed, r.images_cleared), (1, 0), "{what}: {r:?}");
+    }
+    // The control, a plain DeviceGray image, is cleared in place and keeps its other rows.
+    let image = stream("/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 8 /ColorSpace /DeviceGray", &samples(64));
+    let mut doc = one_page(draw, "/XObject << /Im1 7 0 R >>", vec![image]);
+    mark(&mut doc, 0, &[[60.0, 130.0, 140.0, 150.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.images_removed, r.images_cleared), (0, 1), "control: {r:?}");
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    let cleared = saved.scan_objects().find_map(|(_, o)| match &*o {
+        Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Image") => Some(s.decoded().unwrap()),
+        _ => None,
+    });
+    assert_eq!(cleared.as_deref(), Some(&[vec![0x4Du8; 32], vec![0u8; 16], vec![0x4Du8; 16]].concat()[..]), "control");
+}

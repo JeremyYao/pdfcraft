@@ -76,6 +76,14 @@ fn is_delim(b: u8) -> bool {
 
 /// Parse a (decoded) content stream.
 pub fn parse(data: &[u8]) -> Parsed {
+    parse_capped(data, usize::MAX)
+}
+
+/// Like [`parse`], but stops once `max_ops` operators have been produced, so a caller that must
+/// bound how much a crafted stream can allocate never materialises more than `max_ops` of them.
+/// The rest of the stream is counted in [`Parsed::skipped`]; `out.ops.len() == max_ops` means the
+/// parse was cut short.
+pub fn parse_capped(data: &[u8], max_ops: usize) -> Parsed {
     let mut out = Parsed::default();
     let mut lx = Lexer::new(data, 0);
     let mut operands: Vec<Object> = Vec::new();
@@ -147,6 +155,11 @@ pub fn parse(data: &[u8]) -> Parsed {
                 let s = start.take().unwrap_or(at);
                 out.ops.push(Op { op: kw.to_vec(), operands: std::mem::take(&mut operands), inline: None, span: s..lx.pos });
             }
+        }
+        if out.ops.len() >= max_ops {
+            // Cut short: count the rest of the stream as skipped and stop materialising operators.
+            out.skipped += data.len().saturating_sub(lx.pos);
+            return out;
         }
     }
     out.skipped += operands.len();
@@ -291,6 +304,11 @@ impl Pieces {
     /// Parse the pieces as one stream.
     pub fn parse(&self) -> Parsed {
         parse(&self.data)
+    }
+
+    /// [`Pieces::parse`] with the operator cap of [`parse_capped`].
+    pub fn parse_capped(&self, max_ops: usize) -> Parsed {
+        parse_capped(&self.data, max_ops)
     }
 
     /// The piece holding joined position `at` (the last piece for positions past the end).

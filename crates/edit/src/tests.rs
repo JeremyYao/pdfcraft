@@ -2897,6 +2897,35 @@ fn group_move_budget_refusals_keep_the_original_page_selectable() {
     }
 }
 
+/// A page whose `/Contents` array decodes to millions of operators (a few KB of Flate per million
+/// `q`) used to make text_lines allocate several GiB: each piece was decoded under only the
+/// per-stream cap, every operator was materialised with no count cap, and every `q` saved a copy
+/// of the text state with no depth cap. The page is now refused within its budgets, while saves
+/// past the depth cap are counted rather than kept, so the text after them still reads.
+#[test]
+fn page_content_past_the_budgets_is_refused_not_read() {
+    fn page_with(doc: &mut Document, pieces: Vec<Stream>) {
+        let page = pdfcraft_model::pages(doc)[0].obj;
+        let refs: Vec<Object> = pieces.into_iter().map(|s| Object::Ref(doc.add(Object::Stream(s)))).collect();
+        doc.update_dict(page, |d| d.set(b"Contents".to_vec(), Object::Array(refs))).unwrap();
+    }
+    // Two million operators in two pieces of a million each.
+    let mut doc = text_page("");
+    let piece = Stream::flate(Dict::new(), &b"q\n".repeat(1 << 20));
+    page_with(&mut doc, vec![piece.clone(), piece]);
+    let err = text::text_lines(&doc, 0).unwrap_err().to_string();
+    assert!(err.contains("too many"), "{err}");
+    // 130 MiB of content in two raw pieces, each within the per-stream cap.
+    let mut doc = text_page("");
+    let piece = Stream::from_raw(Dict::new(), vec![b' '; 65 << 20]);
+    page_with(&mut doc, vec![piece.clone(), piece]);
+    let err = text::text_lines(&doc, 0).unwrap_err().to_string();
+    assert!(err.contains("can't be read"), "{err}");
+    // More saves than the depth cap, then text: the saves past the cap are matched, not kept.
+    let doc = text_page(&format!("{}BT /F1 12 Tf 40 400 Td (Hi) Tj ET {}", "q\n".repeat(5000), "Q\n".repeat(5000)));
+    assert_eq!(text::text_lines(&doc, 0).unwrap().iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["Hi"]);
+}
+
 #[test]
 fn arabic_actual_text_keeps_typing_order_when_opened_for_editing() {
     for logical in ["مرحبا بالعالم", "سَلَام 123 (PDF)", "English مرحبا ١٢٣", "PDFمرحبا", "مرحبا", "שלום עולם", "Latin text"]

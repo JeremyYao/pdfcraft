@@ -692,7 +692,7 @@ pub(super) fn rewrite_styled_block(
         };
     }
     block_ops.push(Op::new("Q", vec![]));
-    let streams = content_streams(doc, &p.dict);
+    let streams = content_streams(doc, &p.dict)?;
     let pieces = Pieces::join(&streams.iter().map(|(_, d)| d.as_slice()).collect::<Vec<_>>());
     let ops = pieces.parse().ops;
     let members: Vec<_> = block.lines.iter().filter_map(|i| lines.get(*i)).collect();

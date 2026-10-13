@@ -1087,3 +1087,31 @@ fn an_image_whose_sample_layout_is_uncertain_is_removed_whole() {
     });
     assert_eq!(cleared.as_deref(), Some(&[vec![0x4Du8; 32], vec![0u8; 16], vec![0x4Du8; 16]].concat()[..]), "control");
 }
+
+/// An inline image whose data runs straight into `EI` (no white space) used to swallow the rest
+/// of the stream as image data, so the text after it was neither redacted nor verified while the
+/// renderer drew it. A filter terminator before `EI` (`>` for ASCIIHex, `~>` for ASCII85) ends the
+/// data; otherwise the page is unreadable and apply fails closed.
+#[test]
+fn content_after_an_inline_image_without_white_space_before_ei_is_redacted_or_refused() {
+    let text = b" Q BT /F1 10 Tf 10 100 Td (AB1234CD) Tj ET";
+    // ASCIIHex data ending in its `>` terminator, then `EI` at once: the text after it is redacted.
+    let mut src = b"q 10 0 0 10 250 20 cm BI /W 1 /H 1 /BPC 8 /CS /G /F /AHx ID 00>EI".to_vec();
+    src.extend_from_slice(text);
+    let mut doc = one_page(&src, "", vec![]);
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.glyphs, 4, "{r:?}");
+    let c = content(&doc, 0);
+    assert!(!c.contains("1234") && c.contains("BI") && c.contains("(CD)"), "{c}");
+    assert!(!content(&reopen(&doc), 0).contains("1234"));
+
+    // Binary data with no terminator before `EI`: the image's end cannot be told, so nothing is
+    // changed rather than the following text left under the box.
+    let mut src = b"q 10 0 0 10 250 20 cm BI /W 1 /H 1 /BPC 8 /CS /G ID \x80EI".to_vec();
+    src.extend_from_slice(text);
+    let mut doc = one_page(&src, "", vec![]);
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+    assert_eq!(apply(&mut doc, None), Err(RedactError::Unreadable(1)));
+    assert!(content(&doc, 0).contains("(AB1234CD) Tj"), "nothing was changed");
+}

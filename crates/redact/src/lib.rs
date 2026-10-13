@@ -416,6 +416,12 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         if out.vertical {
             return Err(RedactError::VerticalText(pi + 1));
         }
+        // Content the interpreter could not read the way a viewer draws it (an inline image
+        // with no `EI`, which swallowed everything after it) may hold text under the mark that
+        // was never seen: fail closed.
+        if out.unreadable {
+            return Err(RedactError::Unreadable(pi + 1));
+        }
         doomed_xobjects.extend_from_slice(&out.doomed);
         let mut new_list = list.clone();
         let mut changed = false;
@@ -589,7 +595,11 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
         let mut scratch = Report::default();
         let mut scope = Scope::new(&rects, Mode::Verify, &mut scratch);
-        residue += process(doc, &mut scope, &original, &resources, pdfcraft_content::Matrix::IDENTITY).residue;
+        let checked = process(doc, &mut scope, &original, &resources, pdfcraft_content::Matrix::IDENTITY);
+        if checked.unreadable {
+            return Err(RedactError::Unreadable(pi + 1));
+        }
+        residue += checked.residue;
     }
     if residue > 0 {
         return Err(RedactError::Residue(residue));

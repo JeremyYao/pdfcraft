@@ -60,6 +60,10 @@ pub struct Parsed {
     pub ops: Vec<Op>,
     /// Bytes that could not be read as operands or operators.
     pub skipped: usize,
+    /// An inline image's data ran to the end of the stream because no `EI` ended it, so its `BI`
+    /// operator holds whatever followed. A consumer that must see every operator a viewer draws
+    /// (redaction) treats such a stream as unreadable.
+    pub unterminated_inline_image: bool,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -126,8 +130,9 @@ pub fn parse(data: &[u8]) -> Parsed {
                 operands.push(Object::Null);
             }
             b"BI" => match inline_image(data, lx.pos) {
-                Ok((dict, img, end)) => {
+                Ok((dict, img, end, terminated)) => {
                     lx.pos = end;
+                    out.unterminated_inline_image |= !terminated;
                     out.ops.push(Op { op: b"BI".to_vec(), operands: Vec::new(), inline: Some((dict, img)), span: start.take().unwrap_or(at)..end });
                     operands.clear();
                 }
@@ -148,9 +153,10 @@ pub fn parse(data: &[u8]) -> Parsed {
     out
 }
 
-/// Read an inline image starting after `BI`: (parameters, data, position after `EI`). `Err` holds
-/// the position after the `EI` (or the end of the stream) of an image whose parameters can't be read.
-fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize), usize> {
+/// Read an inline image starting after `BI`: (parameters, data, position after `EI`, whether an
+/// `EI` ended the data). `Err` holds the position after the `EI` (or the end of the stream) of an
+/// image whose parameters can't be read.
+fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize, bool), usize> {
     let mut lx = Lexer::new(data, pos);
     let mut dict = Dict::new();
     loop {
@@ -164,35 +170,49 @@ fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize), usize
             _ => None,
         };
         let Some((k, v)) = entry else {
-            // A stream that ends inside the parameters is cut short, not unreadable: keep what was read.
+            // A stream that ends inside the parameters is cut short, not unreadable: keep what was
+            // read (nothing follows it, so nothing is swallowed).
             if at >= data.len() {
-                return Ok((dict, Vec::new(), data.len()));
+                return Ok((dict, Vec::new(), data.len(), true));
             }
             // Without an `EI` after it, the image runs to the end of the stream.
-            return Err(end_of_image(data, at).map_or(data.len(), |(_, end)| end));
+            return Err(end_of_image(data, at, &dict).map_or(data.len(), |(_, end)| end));
         };
         dict.set(k, v);
     }
     // One whitespace byte separates ID from the data.
     let begin = (lx.pos + 1).min(data.len());
-    Ok(match end_of_image(data, begin) {
-        Some((end_data, end)) => (dict, data[begin..end_data].to_vec(), end),
-        None => (dict, data[begin..].to_vec(), data.len()),
+    Ok(match end_of_image(data, begin, &dict) {
+        Some((end_data, end)) => (dict, data[begin..end_data].to_vec(), end, true),
+        None => (dict, data[begin..].to_vec(), data.len(), false),
     })
 }
 
 /// Where inline image data starting at `begin` ends: (end of the data, position after `EI`). The
-/// data ends at whitespace + `EI` + (whitespace, a delimiter or the end).
-fn end_of_image(data: &[u8], begin: usize) -> Option<(usize, usize)> {
+/// data ends at whitespace + `EI` + (whitespace, a delimiter or the end); or, when its first
+/// filter has an end-of-data marker (`>` for ASCIIHexDecode, `~>` for ASCII85Decode), at that
+/// marker + `EI`, since the marker already ends the data (§7.4.2, §7.4.3).
+fn end_of_image(data: &[u8], begin: usize, params: &Dict) -> Option<(usize, usize)> {
+    let first_filter = match params.get(b"F").or_else(|| params.get(b"Filter")) {
+        Some(Object::Name(n)) => Some(n.as_slice()),
+        Some(Object::Array(a)) => a.first().and_then(Object::as_name),
+        _ => None,
+    };
+    let marker: &[u8] = match first_filter {
+        Some(b"AHx" | b"ASCIIHexDecode") => b">",
+        Some(b"A85" | b"ASCII85Decode") => b"~>",
+        _ => b"",
+    };
     let mut i = begin;
     while i + 2 <= data.len() {
-        if data[i] == b'E'
-            && data.get(i + 1) == Some(&b'I')
-            && (i == begin || is_ws(data[i - 1]))
-            && data.get(i + 2).is_none_or(|b| is_ws(*b) || is_delim(*b))
-        {
-            let end_data = if i > begin && is_ws(data[i - 1]) { i - 1 } else { i };
-            return Some((end_data, i + 2));
+        if data[i] == b'E' && data.get(i + 1) == Some(&b'I') && data.get(i + 2).is_none_or(|b| is_ws(*b) || is_delim(*b)) {
+            if i == begin || is_ws(data[i - 1]) {
+                let end_data = if i > begin && is_ws(data[i - 1]) { i - 1 } else { i };
+                return Some((end_data, i + 2));
+            }
+            if !marker.is_empty() && data.get(begin..i).is_some_and(|d| d.ends_with(marker)) {
+                return Some((i, i + 2));
+            }
         }
         i += 1;
     }

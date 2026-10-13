@@ -71,6 +71,10 @@ pub(crate) struct Output {
     /// Apply mode met vertical-writing text (which it cannot remove) while a redaction region was
     /// in force: the operation must fail closed rather than leave that text under the mark.
     pub vertical: bool,
+    /// The content could not be read the way a viewer draws it (an inline image without an `EI`
+    /// swallowed the operators after it, in this scope or a nested form), so what was processed
+    /// is not everything the page shows: apply must fail closed.
+    pub unreadable: bool,
     pub tag_changes: Vec<(ObjRef, ObjRef, HashSet<i64>, HashSet<i64>)>,
 }
 
@@ -380,6 +384,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     // next. Parse them joined, then give each operator back to the piece its keyword is in.
     let joined = Pieces::join(streams);
     let mut parsed = joined.parse();
+    out.unreadable |= parsed.unterminated_inline_image;
     if !scope.hidden_layers.is_empty() {
         let props = res_dict(doc, resources, b"Properties");
         let (kept, removed) = strip_hidden_layers(doc, scope, parsed.ops, &props);
@@ -797,6 +802,7 @@ fn xobject(
             scope.fonts = saved_fonts;
             out.residue += inner.residue;
             out.vertical |= inner.vertical;
+            out.unreadable |= inner.unreadable;
             out.doomed.extend_from_slice(&inner.doomed);
             out.tag_changes.extend(inner.tag_changes);
             if scope.mode == Mode::Verify {

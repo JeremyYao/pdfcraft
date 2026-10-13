@@ -1418,3 +1418,91 @@ fn off_layer_blocks_inside_a_form_take_their_images_with_them() {
     assert!(!has(b"LAYERBLOCKIMAGEB"), "the image the off layer's block drew inside the form survived the save");
     assert!(!has(b"SECRETLAYERNAME"), "the off layer's name survived the save");
 }
+
+/// Whether `needle` is anywhere in the file a save would write: in an object's serialized form
+/// or in a decoded stream (the save is a full rewrite once anything was removed).
+fn saved_contains(doc: &Document, needle: &[u8]) -> bool {
+    let saved = reopen(doc);
+    saved.scan_objects().any(|(_, object)| {
+        let mut bytes = Vec::new();
+        pdfcraft_cos::serialize(&object, &mut bytes);
+        bytes.windows(needle.len()).any(|w| w == needle)
+            || matches!(&*object, Object::Stream(s) if s.decoded().is_ok_and(|d| d.windows(needle.len()).any(|w| w == needle)))
+    })
+}
+
+/// Whether the saved file holds a dictionary `pred` accepts (stream dictionaries included).
+fn saved_has_dict(doc: &Document, pred: impl Fn(&Dict) -> bool) -> bool {
+    reopen(doc).scan_objects().any(|(_, object)| object.as_dict().is_some_and(&pred))
+}
+
+/// A tagged page whose structure tree holds OBJR kids for a text field's widget (7), a FreeText
+/// comment (8), a link (9) and a file attachment (10); a reply (11) points at the comment with
+/// /IRT and the form's /CO names the field. Taking an annotation out of /Annots (or a field out
+/// of the field tree) left it reachable through those referrers, so the full rewrite wrote it.
+fn referenced_annotations_fixture() -> Document {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] /CO [7 0 R] >> /StructTreeRoot 12 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >>".to_vec(),
+        stream("", b"BT /F1 10 Tf 10 100 Td (Public) Tj ET"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (acct) /V (FIELDVALUESECRET) /Rect [10 200 100 220] /P 3 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [10 150 100 170] /Contents (ANNOTBODYSECRET) /DA (/Helv 10 Tf 0 g) /P 3 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [10 120 100 140] /A << /S /URI /URI (http://leak.example/LINKURISECRET) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /FileAttachment /Rect [200 10 210 20] /FS << /Type /Filespec /F (a.txt) /EF << /F 17 0 R >> >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [150 150 170 170] /Contents (REPLYKEPT) /IRT 8 0 R >>".to_vec(),
+        b"<< /Type /StructTreeRoot /K 13 0 R >>".to_vec(),
+        b"<< /S /Document /P 12 0 R /K [14 0 R 15 0 R 16 0 R 18 0 R] >>".to_vec(),
+        b"<< /S /Form /P 13 0 R /Pg 3 0 R /K << /Type /OBJR /Obj 7 0 R >> >>".to_vec(),
+        b"<< /S /Annot /P 13 0 R /Pg 3 0 R /K << /Type /OBJR /Obj 8 0 R >> >>".to_vec(),
+        b"<< /S /Link /P 13 0 R /Pg 3 0 R /K << /Type /OBJR /Obj 9 0 R >> >>".to_vec(),
+        stream("", b"ATTACHMENTSECRET"),
+        b"<< /S /Annot /P 13 0 R /Pg 3 0 R /K << /Type /OBJR /Obj 10 0 R >> >>".to_vec(),
+    ])
+}
+
+#[test]
+fn redacted_annotations_and_fields_do_not_survive_through_the_structure_tree_irt_or_co() {
+    let mut doc = referenced_annotations_fixture();
+    // The mark covers the widget, the comment and the link; not the reply or the attachment.
+    mark(&mut doc, 0, &[[5.0, 115.0, 105.0, 225.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.annotations, r.fields), (2, 1), "{r:?}");
+    for secret in [&b"FIELDVALUESECRET"[..], b"ANNOTBODYSECRET", b"LINKURISECRET"] {
+        assert!(!saved_contains(&doc, secret), "{} survived the save", String::from_utf8_lossy(secret));
+    }
+    assert!(saved_contains(&doc, b"REPLYKEPT") && saved_contains(&doc, b"ATTACHMENTSECRET"), "what was not under the mark stays");
+    // The dangling referrers are cleaned, not left pointing at nothing.
+    let saved = reopen(&doc);
+    let reply = saved.scan_objects().find_map(|(_, o)| o.as_dict().filter(|d| d.name(b"Subtype") == Some(b"Text")).cloned()).unwrap();
+    assert!(!reply.contains(b"IRT"), "the reply still points at the redacted comment: {reply:?}");
+    let cat = saved.get(saved.root().unwrap()).as_dict().cloned().unwrap();
+    let co = saved.resolve(cat.get(b"AcroForm").unwrap()).as_dict().and_then(|a| a.get(b"CO").cloned());
+    assert!(co.as_ref().is_none_or(|c| saved.resolve(c).as_array().is_some_and(|a| a.is_empty())), "/CO still names the field: {co:?}");
+}
+
+#[test]
+fn removed_hidden_annotations_and_fields_do_not_survive_through_the_structure_tree() {
+    use crate::sanitize::{Hidden, remove_hidden, sanitize};
+    let is_widget = |d: &Dict| d.name(b"Subtype") == Some(b"Widget");
+    // Sanitize: every category.
+    let mut doc = referenced_annotations_fixture();
+    sanitize(&mut doc).unwrap();
+    for secret in [&b"ANNOTBODYSECRET"[..], b"LINKURISECRET", b"ATTACHMENTSECRET", b"REPLYKEPT"] {
+        assert!(!saved_contains(&doc, secret), "{} survived Sanitize", String::from_utf8_lossy(secret));
+    }
+    assert!(!saved_has_dict(&doc, is_widget), "the flattened widget dictionary survived Sanitize");
+    // Each category on its own.
+    for (which, secret) in
+        [(Hidden::Comments, &b"ANNOTBODYSECRET"[..]), (Hidden::Attachments, b"ATTACHMENTSECRET"), (Hidden::LinksActionsScripts, b"LINKURISECRET")]
+    {
+        let mut doc = referenced_annotations_fixture();
+        remove_hidden(&mut doc, &[which]).unwrap();
+        assert!(!saved_contains(&doc, secret), "{} survived Remove Hidden Information > {which:?}", String::from_utf8_lossy(secret));
+    }
+    let mut doc = referenced_annotations_fixture();
+    remove_hidden(&mut doc, &[Hidden::FormFields]).unwrap();
+    assert!(!saved_has_dict(&doc, is_widget), "the flattened widget dictionary survived Remove Hidden Information > Form fields");
+}

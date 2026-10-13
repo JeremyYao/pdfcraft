@@ -276,9 +276,14 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
     if (text && count(Hidden::HiddenText) > 0) || (layers && count(Hidden::HiddenLayers) > 0) {
         content_pass(doc, text, layers, true)?;
     }
+    // The annotation, widget and field objects removed: nulled at the end (`retire`), so a
+    // structure element, a reply or anything else that still refers to one cannot carry it into
+    // the saved file.
+    let mut retired: Vec<ObjRef> = Vec::new();
     if which.contains(&Hidden::FormFields) && count(Hidden::FormFields) > 0 {
+        let fields = pdfcraft_forms::fields(doc);
         // Fields without appearances get one first, so their values stay visible.
-        for f in pdfcraft_forms::fields(doc) {
+        for f in &fields {
             if f.widgets.iter().any(|w| !doc.get(w.obj).as_dict().is_some_and(|d| d.contains(b"AP"))) {
                 pdfcraft_forms::redraw_field(doc, &f.name)?;
             }
@@ -288,6 +293,17 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
         doc.update_dict(root, |d| {
             d.remove(b"AcroForm");
         })?;
+        // The widgets flattening took off the pages are deleted, and so is a field none of
+        // whose widgets is on a page any more (its /V would otherwise stay reachable).
+        let on_page: std::collections::HashSet<ObjRef> =
+            pdfcraft_model::pages(doc).iter().flat_map(|p| annots_of(doc, &p.dict)).filter_map(|a| a.as_ref()).collect();
+        for f in &fields {
+            let gone: Vec<ObjRef> = f.widgets.iter().map(|w| w.obj).filter(|w| !on_page.contains(w)).collect();
+            if gone.len() == f.widgets.len() {
+                retired.push(f.obj);
+            }
+            retired.extend(gone);
+        }
     }
     // Annotations: comments, attachments, links, actions.
     let drop_annot = |a: &Dict| -> bool {
@@ -315,6 +331,7 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
             let d = doc.get(r).as_dict().cloned().unwrap_or_default();
             let parent_gone = d.get(b"Parent").and_then(Object::as_ref).is_some_and(|x| removed.contains(&x));
             if removed.contains(&r) || (d.name(b"Subtype") == Some(b"Popup") && parent_gone) {
+                retired.push(r);
                 continue;
             }
             if which.contains(&Hidden::LinksActionsScripts) && (d.contains(b"AA") || (d.name(b"Subtype") == Some(b"Widget") && d.contains(b"A"))) {
@@ -407,6 +424,8 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
         cat.set(b"Names".to_vec(), Object::Dict(n));
     }
     doc.set(root, Object::Dict(cat));
+    // What was removed is deleted, so no other referrer keeps it in the saved file.
+    crate::retire(doc, &retired)?;
     if done.is_empty() {
         return Err(RedactError::NothingToApply);
     }

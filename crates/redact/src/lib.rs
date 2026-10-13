@@ -140,6 +140,33 @@ pub(crate) fn annots_of(doc: &Document, page: &Dict) -> Vec<Object> {
     page.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default()
 }
 
+/// Treat removal as deletion: overwrite each removed annotation, widget or field object with
+/// `null`, which a full save skips, so a referrer other than the page's /Annots and the field
+/// tree (a structure element's OBJR kid, a reply's /IRT, the form's /CO) cannot carry its content
+/// into the saved file. A surviving annotation that replied to a removed one loses its /IRT
+/// (and /RT) rather than point at nothing.
+pub(crate) fn retire(doc: &mut Document, objects: &[ObjRef]) -> Result<(), pdfcraft_cos::CosError> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let gone: HashSet<ObjRef> = objects.iter().copied().collect();
+    for p in pdfcraft_model::pages(doc) {
+        for a in annots_of(doc, &p.dict) {
+            let Some(r) = a.as_ref() else { continue };
+            if !gone.contains(&r) && doc.get(r).as_dict().and_then(|d| d.reference(b"IRT")).is_some_and(|t| gone.contains(&t)) {
+                doc.update_dict(r, |d| {
+                    d.remove(b"IRT");
+                    d.remove(b"RT");
+                })?;
+            }
+        }
+    }
+    for &r in &gone {
+        doc.set(r, Object::Null);
+    }
+    Ok(())
+}
+
 /// Every redaction mark in the document, page by page.
 pub fn marks(doc: &Document) -> Vec<Mark> {
     let mut out = Vec::new();
@@ -370,6 +397,29 @@ fn localize_resources(doc: &mut Document, selected: &[usize]) -> Result<(), pdfc
     Ok(())
 }
 
+/// Drop the deleted fields (`gone`) from the form's calculation order (`/AcroForm /CO`).
+fn drop_from_calculation_order(doc: &mut Document, gone: &[ObjRef]) -> Result<(), pdfcraft_cos::CosError> {
+    let Some(root) = doc.root() else { return Ok(()) };
+    let Some(af) = doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) else { return Ok(()) };
+    let Some(co) = doc.resolve(&af).as_dict().and_then(|d| d.get(b"CO").cloned()) else { return Ok(()) };
+    let Some(list) = doc.resolve(&co).as_array().cloned() else { return Ok(()) };
+    let kept: Vec<Object> = list.iter().filter(|o| !o.as_ref().is_some_and(|r| gone.contains(&r))).cloned().collect();
+    if kept.len() == list.len() {
+        return Ok(());
+    }
+    match (af, co.as_ref()) {
+        // The array is its own object: replace it where it is.
+        (_, Some(r)) if doc.get(r).as_array().is_some() => doc.set(r, Object::Array(kept)),
+        (Object::Ref(af), _) => doc.update_dict(af, |d| d.set(b"CO".to_vec(), Object::Array(kept)))?,
+        (Object::Dict(mut af), _) => {
+            af.set(b"CO".to_vec(), Object::Array(kept));
+            doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Apply every redaction mark (or only those on `pages`, 0-based). Irreversible for the saved
 /// file; callers keep the previous document for undo.
 pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, RedactError> {
@@ -396,6 +446,9 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     let mut doomed_fields: Vec<ObjRef> = Vec::new();
     // The original image and form XObjects the rewrite drops or replaces, on any page.
     let mut doomed_xobjects: Vec<ObjRef> = Vec::new();
+    // The annotation, widget and field objects removed: nulled at the end (`retire`), so nothing
+    // that still refers to them can carry them into the saved file.
+    let mut retired: Vec<ObjRef> = Vec::new();
     let widget_owner: Vec<(ObjRef, ObjRef)> =
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.obj)).collect::<Vec<_>>()).collect();
 
@@ -511,6 +564,13 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
                 }
             }
         }
+        // The removed annotations and their pop-ups are deleted, not merely unlisted.
+        let popups = annots.iter().filter_map(Object::as_ref).filter(|r| {
+            !removed.contains(r)
+                && doc.get(*r).as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
+        });
+        retired.extend(popups);
+        retired.extend_from_slice(&removed);
         let kept: Vec<Object> = annots
             .into_iter()
             .enumerate()
@@ -537,11 +597,19 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     // object: deleting by name would take the first field of that name, which with two
     // same-named fields leaves the marked one, and its value, in the file.
     for field in &doomed_fields {
-        if pdfcraft_forms::fields(doc).iter().any(|f| f.obj == *field) {
+        // The field and its widgets, retired once the field is out of the tree.
+        let doomed: Option<Vec<ObjRef>> = pdfcraft_forms::fields(doc)
+            .iter()
+            .find(|f| f.obj == *field)
+            .map(|f| std::iter::once(f.obj).chain(f.widgets.iter().map(|w| w.obj)).collect());
+        if let Some(doomed) = doomed {
             pdfcraft_forms::delete_field_object(doc, *field)?;
             report.fields += 1;
+            retired.extend(doomed);
         }
     }
+    // The calculation order must not keep a deleted field reachable either.
+    drop_from_calculation_order(doc, &retired)?;
 
     // 3b. An XFA form mirrors its field values in the /XFA datasets packet, and a relayout
     // rebuilds fields and pages from that packet, so deleting the AcroForm field alone leaves the
@@ -586,6 +654,8 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     // A removed image or form must not stay reachable through another resource dictionary (an
     // inherited or shared /Resources): a full save keeps whatever is still referenced.
     interp::unlink_doomed(doc, &doomed_xobjects)?;
+    // Nor a removed annotation or field through a structure element, a reply or /CO.
+    retire(doc, &retired)?;
 
     // 5. Verify: nothing readable may remain under a region.
     let mut residue = 0;

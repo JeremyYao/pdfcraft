@@ -91,8 +91,9 @@ needs a prompt to open is listed and asks at signing (issue #179).
   `pdfcraft-cos`, the page is drawn by a renderer with a reader of its own, and an appended
   revision may be read differently by the two. So, after signing: any cross-reference entry the
   reader sets aside or records as read differently elsewhere (`Document::xref_oddities`), any
-  object body no entry locates (`Document::objects_unlisted_from`, what a reader rebuilding its
-  table by scanning the file would draw), a trailer that points `/Root` elsewhere, adds or changes
+  object body no cross-reference section locates, current or superseded by a later revision
+  (`Document::objects_unlisted_from`, what a reader rebuilding its table by scanning the file would
+  draw), a trailer that points `/Root` elsewhere, adds or changes
   `/Encrypt` or replaces `/ID`, and any signed object a later revision frees are changes, judged
   by the role the object had when signed, and never permitted unless that role is (a freed
   comment is a comment).

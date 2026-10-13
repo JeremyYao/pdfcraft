@@ -107,6 +107,9 @@ pub struct Document {
     revisions: Arc<Vec<Revision>>,
     /// See [`Self::xref_oddities`].
     xref_oddities: Arc<Vec<(u64, u32)>>,
+    /// In-file entries an older cross-reference section gives that a newer one overrides, as
+    /// (object number, offset): bodies the file still lists, though not as the current object.
+    superseded: Arc<BTreeSet<(u32, u64)>>,
     /// The trailer dictionary was read leniently (tokens skipped as garbage): another reader
     /// may read what it names, an /Encrypt dictionary above all, differently.
     trailer_lenient: bool,
@@ -225,6 +228,7 @@ impl Document {
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             xref_oddities: Arc::default(),
+            superseded: Arc::default(),
             trailer_lenient: false,
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
@@ -290,6 +294,7 @@ impl Document {
             trailer: Dict::new(),
             revisions: Arc::new(Vec::new()),
             xref_oddities: Arc::default(),
+            superseded: Arc::default(),
             trailer_lenient: false,
             repair_log: Arc::new(Vec::new()),
             cache: Arc::default(),
@@ -313,12 +318,13 @@ impl Document {
         let parsed = doc.read_xref_chain(&mut log);
         let mut authenticated = false;
         let ok = match parsed {
-            Ok((entries, trailer, revisions, oddities, lenient)) => {
+            Ok(XrefChain { entries, trailer, revisions, oddities, lenient, superseded }) => {
                 doc.entries = Arc::new(entries);
                 doc.trailer = trailer;
                 doc.trailer_lenient = lenient;
                 doc.revisions = Arc::new(revisions);
                 doc.xref_oddities = Arc::new(oddities);
+                doc.superseded = Arc::new(superseded);
                 // Authenticate before checking the catalog: it may sit in an encrypted object
                 // stream, which reads as garbage until the key is known.
                 if let Some(enc) = doc.trailer.get(b"Encrypt").cloned() {
@@ -665,10 +671,11 @@ impl Document {
     }
 
     /// Object numbers whose `N G obj` header is in the bytes from `from` on, at a line start
-    /// (as a reader that rebuilds its cross-reference by scanning the file finds it), while the
-    /// entry this reader holds for the number does not place it at that header. Such a reader
-    /// reads that body for the number; this one reads another, or none. A writer lists every
-    /// object it appends, so after a signed revision such a header is never part of a
+    /// (as a reader that rebuilds its cross-reference by scanning the file finds it), while no
+    /// cross-reference section places the number at that header: neither the entry this reader
+    /// holds nor one an older section gave before a newer revision wrote the object again. Such
+    /// a reader reads that body for the number; this one reads another, or none. A writer lists
+    /// every object it appends, so after a signed revision such a header is never part of a
     /// permitted change. Headers inside stream data count too: a scanning reader takes them.
     pub fn objects_unlisted_from(&self, from: usize) -> Vec<u32> {
         let mut out = BTreeSet::new();
@@ -676,7 +683,13 @@ impl Document {
             let here = |off: u64| {
                 usize::try_from(off).is_ok_and(|off| off == at || (self.header_offset != 0 && off.saturating_add(self.header_offset) == at))
             };
-            if !matches!(self.entries.get(&num), Some(XrefEntry::InFile { offset, .. }) if here(*offset)) {
+            let current = matches!(self.entries.get(&num), Some(XrefEntry::InFile { offset, .. }) if here(*offset));
+            let older = || {
+                let at = at as u64;
+                self.superseded.contains(&(num, at))
+                    || (self.header_offset != 0 && at.checked_sub(self.header_offset as u64).is_some_and(|off| self.superseded.contains(&(num, off))))
+            };
+            if !current && !older() {
                 out.insert(num);
             }
         });
@@ -1046,8 +1059,7 @@ impl Document {
         matches!(self.try_get(r.num).as_deref(), Ok(Object::Dict(d)) if d.name(b"Type") == Some(b"Catalog") || d.contains(b"Pages"))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn read_xref_chain(&self, log: &mut Vec<String>) -> Result<(BTreeMap<u32, XrefEntry>, Dict, Vec<Revision>, Vec<(u64, u32)>, bool), CosError> {
+    fn read_xref_chain(&self, log: &mut Vec<String>) -> Result<XrefChain, CosError> {
         let data = &self.data;
         let tail_start = data.len().saturating_sub(4096);
         let sx = rfind(data, b"startxref", tail_start).ok_or(CosError::Syntax { offset: data.len(), detail: "no startxref".into() })?;
@@ -1057,6 +1069,7 @@ impl Document {
             _ => return Err(CosError::Syntax { offset: sx, detail: "bad startxref value".into() }),
         };
         let mut entries = BTreeMap::new();
+        let mut superseded = BTreeSet::new();
         let mut trailer: Option<Dict> = None;
         let mut trailer_lenient = false;
         let mut revisions = Vec::new();
@@ -1075,13 +1088,13 @@ impl Document {
             let mut sect = BTreeMap::new();
             // Object numbers whose entry in this section was set aside ([`Self::xref_oddities`]).
             let mut odd = Vec::new();
-            let (sect_trailer, is_stream, lenient) = match self.read_section(off as usize, &mut sect, &mut odd) {
+            let (sect_trailer, is_stream, lenient) = match self.read_section(off as usize, &mut sect, &mut odd, &mut superseded) {
                 Ok(v) => v,
                 Err(e) if self.header_offset > 0 => {
                     log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
                     sect.clear();
                     odd.clear();
-                    self.read_section(off as usize + self.header_offset, &mut sect, &mut odd)?
+                    self.read_section(off as usize + self.header_offset, &mut sect, &mut odd, &mut superseded)?
                 }
                 Err(e) => {
                     if revisions.is_empty() {
@@ -1096,7 +1109,7 @@ impl Document {
             // free entries it gives objects only a cross-reference stream can locate.
             if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
                 let mut stm = BTreeMap::new();
-                match self.read_section(x as usize, &mut stm, &mut odd) {
+                match self.read_section(x as usize, &mut stm, &mut odd, &mut superseded) {
                     Ok((stm_dict, _, _)) => {
                         for (num, e) in stm {
                             match sect.get(&num) {
@@ -1104,7 +1117,10 @@ impl Document {
                                     sect.insert(num, e);
                                 }
                                 // The table already places the object somewhere else.
-                                Some(old) if *old != e => note(&mut odd, num),
+                                Some(old) if *old != e => {
+                                    note(&mut odd, num);
+                                    supersede(&mut superseded, num, &e);
+                                }
                                 Some(_) => {}
                             }
                         }
@@ -1127,7 +1143,9 @@ impl Document {
             }
             oddities.extend(odd.into_iter().map(|num| (off, num)));
             for (num, e) in sect {
-                entries.entry(num).or_insert(e);
+                if *entries.entry(num).or_insert(e) != e {
+                    supersede(&mut superseded, num, &e);
+                }
             }
             next = sect_trailer.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
             if trailer.is_none() {
@@ -1143,7 +1161,7 @@ impl Document {
         for k in [&b"Prev"[..], b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"] {
             trailer.remove(k);
         }
-        Ok((entries, trailer, revisions, oddities, trailer_lenient))
+        Ok(XrefChain { entries, trailer, revisions, oddities, lenient: trailer_lenient, superseded })
     }
 
     /// The entries the cross-reference stream of a hybrid file reaches through its own /Prev
@@ -1158,8 +1176,8 @@ impl Document {
             if !visited.insert(off) || visited.len() > 10_000 {
                 break;
             }
-            let (mut sect, mut odd) = (BTreeMap::new(), Vec::new());
-            let Ok((dict, _, _)) = self.read_section(off as usize, &mut sect, &mut odd) else { break };
+            let (mut sect, mut odd, mut dup) = (BTreeMap::new(), Vec::new(), BTreeSet::new());
+            let Ok((dict, _, _)) = self.read_section(off as usize, &mut sect, &mut odd, &mut dup) else { break };
             for (num, e) in sect {
                 out.entry(num).or_insert(e);
             }
@@ -1170,8 +1188,15 @@ impl Document {
 
     /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
     /// collects the object numbers whose entry here is set aside or read differently by another
-    /// reader ([`Self::xref_oddities`]).
-    fn read_section(&self, off: usize, entries: &mut BTreeMap<u32, XrefEntry>, odd: &mut Vec<u32>) -> Result<(Dict, bool, bool), CosError> {
+    /// reader ([`Self::xref_oddities`]); `superseded` the in-file entries a row gives a number
+    /// that already has one.
+    fn read_section(
+        &self,
+        off: usize,
+        entries: &mut BTreeMap<u32, XrefEntry>,
+        odd: &mut Vec<u32>,
+        superseded: &mut BTreeSet<(u32, u64)>,
+    ) -> Result<(Dict, bool, bool), CosError> {
         let data = &self.data;
         let mut lx = Lexer::new(data, off);
         if lx.eat_keyword(b"xref") {
@@ -1229,6 +1254,7 @@ impl Document {
                     }
                     if *entries.entry(num).or_insert(entry) != entry {
                         note(odd, num);
+                        supersede(superseded, num, &entry);
                     }
                 }
             }
@@ -1307,6 +1333,7 @@ impl Document {
                 }
                 if *entries.entry(num).or_insert(entry) != entry {
                     note(odd, num);
+                    supersede(superseded, num, &entry);
                 }
             }
         }
@@ -1452,6 +1479,28 @@ fn note(odd: &mut Vec<u32>, num: u32) {
     if odd.len() < ODDITIES_PER_SECTION {
         odd.push(num);
     }
+}
+
+/// Record the in-file entry `e` for `num` as one a newer section overrides: the body it
+/// locates is listed, though not current. Capped at [`MAX_XREF_OBJECTS`] entries, the most a
+/// document can have: past that a file is spending its sections on redefinitions, and a body
+/// only such a row lists counts as unlisted, which is the safe side.
+fn supersede(superseded: &mut BTreeSet<(u32, u64)>, num: u32, e: &XrefEntry) {
+    if let XrefEntry::InFile { offset, .. } = e
+        && superseded.len() < MAX_XREF_OBJECTS
+    {
+        superseded.insert((num, *offset));
+    }
+}
+
+/// What the cross-reference chain of a file holds.
+struct XrefChain {
+    entries: BTreeMap<u32, XrefEntry>,
+    trailer: Dict,
+    revisions: Vec<Revision>,
+    oddities: Vec<(u64, u32)>,
+    lenient: bool,
+    superseded: BTreeSet<(u32, u64)>,
 }
 
 #[cfg(test)]

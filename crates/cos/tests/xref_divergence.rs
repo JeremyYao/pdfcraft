@@ -129,6 +129,17 @@ fn object_bodies_no_entry_locates_are_listed() {
     bytes.extend_from_slice(
         format!("xref\n3 1\n{body:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /Prev {prev} >>\nstartxref\n{section}\n%%EOF\n").as_bytes(),
     );
+    let doc = Document::open(Arc::new(bytes.clone())).unwrap();
+    assert!(doc.objects_unlisted_from(body).is_empty(), "{:?}", doc.objects_unlisted_from(body));
+    // A later revision defining object 3 once more leaves the earlier body listed by the section
+    // that placed it there: a redefinition is not an unlisted body, however many follow.
+    let body2 = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n(newer)\nendobj\n");
+    let section2 = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n3 1\n{body2:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R /Prev {section} >>\nstartxref\n{section2}\n%%EOF\n").as_bytes(),
+    );
     let doc = Document::open(Arc::new(bytes)).unwrap();
     assert!(doc.objects_unlisted_from(body).is_empty(), "{:?}", doc.objects_unlisted_from(body));
+    assert_eq!(doc.xref_entry(3), Some(XrefEntry::InFile { offset: body2 as u64, generation: 0 }));
 }

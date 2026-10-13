@@ -457,6 +457,29 @@ fn a_document_timestamp_covers_the_file_and_validates() {
     assert_eq!(stamp.status, Status::Valid, "{:?}", stamp.details);
 }
 
+/// Every later signature writes the page (its /Annots grows) and the form again. The body an
+/// intermediate revision wrote is located by that revision's cross-reference section, not by
+/// the final one, and is still a listed body: a signature under two later ones is intact.
+#[test]
+fn a_signature_stays_intact_under_two_later_signatures() {
+    let ids: Vec<_> = ["rsa-aes.p12", "ec-p256.p12", "ec-p384.p12"].iter().map(|f| pkcs12::open(&data(f), "test").unwrap()).collect();
+    let trust = TrustStore { certs: ids.iter().map(|id| id.certificate.clone()).collect() };
+    let mut bytes = fixture();
+    for (i, id) in ids.iter().enumerate() {
+        let y = 100.0 + 60.0 * i as f64;
+        bytes = pdfcraft_sign::sign(&open(&bytes), id, &SignOptions { rect: Some([20.0, y, 220.0, y + 50.0]), ..opts() }).unwrap();
+    }
+    let mut all: Vec<_> = signatures(&open(&bytes), &bytes, &trust).into_iter().filter(|s| s.signed).collect();
+    all.sort_by_key(|s| s.revision);
+    assert_eq!(all.len(), 3);
+    for s in &all {
+        assert_eq!(s.status, Status::Valid, "{}: {:?} {:?}", s.field, s.modification, s.details);
+    }
+    assert_eq!(all[0].modification, Modification::Allowed(vec![kind::SIGNATURE]), "{}", all[0].field);
+    assert_eq!(all[1].modification, Modification::Allowed(vec![kind::SIGNATURE]), "{}", all[1].field);
+    assert_eq!(all[2].modification, Modification::None, "{}", all[2].field);
+}
+
 #[test]
 fn cached_discovery_still_validates_current_timestamp_bytes_ranges_and_trust() {
     let tsa = TestTsa {

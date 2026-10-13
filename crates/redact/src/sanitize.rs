@@ -15,8 +15,9 @@ use crate::{RedactError, Report, annots_of, page_streams};
 pub enum Hidden {
     /// Document information (`/Info`) and XMP metadata streams, on any object.
     Metadata,
-    /// Embedded files, file attachment annotations and associated files (`/AF`, wherever they
-    /// hang).
+    /// Embedded files, file attachment annotations, associated files (`/AF`, wherever they
+    /// hang), multimedia annotations (Screen, Movie, RichMedia, 3D: their media, assets, models
+    /// and file paths) and renditions.
     Attachments,
     /// Comments and markup annotations (with their pop-ups).
     Comments,
@@ -28,7 +29,8 @@ pub enum Hidden {
     /// Optional content (layers) that is off: its content, then the layers themselves.
     HiddenLayers,
     Bookmarks,
-    /// Links, actions (open action, additional actions) and document JavaScript.
+    /// Links, actions (open action, additional actions, every annotation's), document
+    /// JavaScript, slideshows (`/AlternatePresentations`) and 3D instantiation scripts.
     LinksActionsScripts,
     /// Private data of other applications (`/PieceInfo`, on any object).
     PrivateData,
@@ -222,6 +224,33 @@ fn is_comment(subtype: &[u8]) -> bool {
     !matches!(subtype, b"FileAttachment" | b"Redact") && pdfcraft_annot::is_comment_subtype(&String::from_utf8_lossy(subtype))
 }
 
+/// An annotation that embeds or names media content (ISO 32000-2 §12.5.6.17–19, §13.6–13.7):
+/// removed with Attachments, since what it holds (media, assets, 3D models, file paths) is
+/// embedded content the user cannot see on the page.
+fn is_multimedia(subtype: &[u8]) -> bool {
+    matches!(subtype, b"Screen" | b"Movie" | b"RichMedia" | b"3D")
+}
+
+/// The 3D stream of a 3D annotation: `/3DD` is the stream, or a 3D reference dictionary to it.
+fn three_d_stream(doc: &Document, annot: &Dict) -> Option<ObjRef> {
+    let via_ref = |d: &Dict| d.reference(b"3DD").filter(|s| matches!(&*doc.get(*s), Object::Stream(_)));
+    match annot.get(b"3DD")? {
+        Object::Ref(r) => match &*doc.get(*r) {
+            Object::Stream(_) => Some(*r),
+            Object::Dict(d) => via_ref(d),
+            _ => None,
+        },
+        Object::Dict(d) => via_ref(d),
+        _ => None,
+    }
+}
+
+/// Does this 3D annotation's stream run a script when it is instantiated (`/OnInstantiate`)?
+fn has_3d_script(doc: &Document, annot: &Dict) -> bool {
+    annot.name(b"Subtype") == Some(b"3D")
+        && three_d_stream(doc, annot).is_some_and(|s| doc.get(s).as_dict().is_some_and(|d| d.contains(b"OnInstantiate")))
+}
+
 /// The layers that are off in the default configuration.
 fn hidden_layers(doc: &Document) -> Vec<ObjRef> {
     let Some((_, cat)) = catalog(doc) else { return Vec::new() };
@@ -355,6 +384,8 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
                 Hidden::Attachments => sub(doc, &names, b"EmbeddedFiles")
                     .map_or(0, |t| name_tree_len(doc, &t, 0))
                     .saturating_add(count_sub(b"FileAttachment"))
+                    .saturating_add(annots.iter().filter(|a| is_multimedia(a.name(b"Subtype").unwrap_or(b""))).count())
+                    .saturating_add(sub(doc, &names, b"Renditions").map_or(0, |t| name_tree_len(doc, &t, 0)))
                     .saturating_add(af),
                 Hidden::Comments => annots.iter().filter(|a| is_comment(a.name(b"Subtype").unwrap_or(b""))).count(),
                 Hidden::FormFields => pdfcraft_forms::fields(doc).len(),
@@ -369,8 +400,10 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
                         + usize::from(cat.get(b"OpenAction").is_some_and(|a| doc.resolve(a).as_dict().is_some()))
                         + usize::from(cat.contains(b"AA"))
                         + pages.iter().filter(|p| p.dict.contains(b"AA")).count()
-                        + annots.iter().filter(|a| a.contains(b"AA") || (a.name(b"Subtype") == Some(b"Widget") && a.contains(b"A"))).count()
+                        + annots.iter().filter(|a| a.contains(b"AA") || (a.name(b"Subtype") != Some(b"Link") && a.contains(b"A"))).count()
+                        + annots.iter().filter(|a| has_3d_script(doc, a)).count()
                         + sub(doc, &names, b"JavaScript").map_or(0, |t| name_tree_len(doc, &t, 0))
+                        + sub(doc, &names, b"AlternatePresentations").map_or(0, |t| name_tree_len(doc, &t, 0))
                 }
                 Hidden::PrivateData => piece,
             };
@@ -436,13 +469,22 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
             retired.extend(gone);
         }
     }
-    // Annotations: comments, attachments, links, actions.
+    // Annotations: comments, attachments (multimedia included), links, actions.
     let drop_annot = |a: &Dict| -> bool {
         let s = a.name(b"Subtype").unwrap_or(b"");
         (which.contains(&Hidden::Comments) && is_comment(s))
-            || (which.contains(&Hidden::Attachments) && s == b"FileAttachment")
+            || (which.contains(&Hidden::Attachments) && (s == b"FileAttachment" || is_multimedia(s)))
             || (which.contains(&Hidden::LinksActionsScripts) && s == b"Link")
     };
+    let actions = which.contains(&Hidden::LinksActionsScripts);
+    // A stored page thumbnail shows the page as it was: it goes whenever a category changes
+    // what the page shows (content, annotations or fields).
+    let thumbs = which.iter().any(|h| {
+        matches!(
+            h,
+            Hidden::HiddenText | Hidden::HiddenLayers | Hidden::Comments | Hidden::Attachments | Hidden::FormFields | Hidden::LinksActionsScripts
+        )
+    });
     for p in pdfcraft_model::pages(doc) {
         let list = annots_of(doc, &p.dict);
         let mut removed: Vec<ObjRef> = Vec::new();
@@ -465,20 +507,31 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
                 retired.push(r);
                 continue;
             }
-            if which.contains(&Hidden::LinksActionsScripts) && (d.contains(b"AA") || (d.name(b"Subtype") == Some(b"Widget") && d.contains(b"A"))) {
+            // Every annotation's actions: a Screen's rendition or script as much as a widget's.
+            if actions && (d.contains(b"AA") || d.contains(b"A")) {
                 doc.update_dict(r, |d| {
                     d.remove(b"AA");
                     d.remove(b"A");
                 })?;
             }
+            if actions
+                && has_3d_script(doc, &d)
+                && let Some(s) = three_d_stream(doc, &d)
+            {
+                doc.update_dict(s, |d| {
+                    d.remove(b"OnInstantiate");
+                })?;
+            }
             kept.push(a);
         }
-        let actions = which.contains(&Hidden::LinksActionsScripts);
         doc.update_dict(p.obj, |d| {
             if kept.is_empty() {
                 d.remove(b"Annots");
             } else {
                 d.set(b"Annots".to_vec(), Object::Array(kept));
+            }
+            if thumbs {
+                d.remove(b"Thumb");
             }
             if actions {
                 d.remove(b"AA");
@@ -496,6 +549,7 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
             Hidden::Attachments => {
                 if let Some(n) = names.as_mut() {
                     n.remove(b"EmbeddedFiles");
+                    n.remove(b"Renditions");
                 }
             }
             Hidden::Bookmarks => {
@@ -511,6 +565,7 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
                 cat.remove(b"AA");
                 if let Some(n) = names.as_mut() {
                     n.remove(b"JavaScript");
+                    n.remove(b"AlternatePresentations");
                 }
             }
             Hidden::HiddenLayers if !off.is_empty() => {

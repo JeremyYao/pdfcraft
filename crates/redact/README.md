@@ -53,10 +53,15 @@ sanitize::remove_hidden(&mut doc, &[Hidden::Comments])?;   // chosen categories
 sanitize::sanitize(&mut doc)?;                             // all of them
 ```
 
-Categories: metadata (`/Info`, XMP), file attachments, comments, form fields (flattened so the
-values stay visible), hidden text (render modes 3 and 7, or wholly off the page), hidden layers
-(content of off optional-content groups, then the groups), bookmarks, links/actions/JavaScript,
-and `/PieceInfo` private data. Both make the next save a full rewrite.
+Categories: metadata (`/Info`, and XMP on any object), file attachments (embedded files,
+attachment annotations, `/AF` associated files anywhere, multimedia annotations and renditions),
+comments, form fields (flattened so the values stay visible; hidden ones go undrawn), hidden text
+(render modes 3 and 7, or wholly off the page), hidden layers (content of off optional-content
+groups and the XObjects it drew, then the groups), bookmarks, links/actions/JavaScript (every
+annotation's actions, slideshows, 3D scripts), and `/PieceInfo` private data on any object. A
+category that changes what a page shows drops the page's stored thumbnail too. Both make the next
+save a full rewrite, and what they remove is deleted (nulled), so a structure element, a reply or
+a calculation order that still refers to it cannot carry it into the saved file.
 
 `patterns` finds phone numbers, e-mail addresses, credit card numbers (Luhn-checked), US Social
 Security numbers and dates for Search & Redact.

@@ -1621,3 +1621,79 @@ fn metadata_private_data_and_associated_files_below_the_page_are_removed() {
     assert_eq!(counts[&Hidden::Attachments], 5, "five associated files");
     assert_eq!(counts[&Hidden::PrivateData], 2, "the page's and the form's");
 }
+
+/// Multimedia content: Screen annotations with a Rendition action (carrying a script) and a
+/// JavaScript action, a Movie with an external path, a RichMedia with an embedded asset, a 3D
+/// annotation whose stream runs a script on instantiation, /Names /Renditions with embedded
+/// media, /Names /AlternatePresentations and a page /Thumb. Controls that were already removed:
+/// an embedded file, a Sound annotation, a document script and a link with a script.
+fn multimedia_fixture() -> Document {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Names << /Renditions << /Names [(r) 13 0 R] >> /AlternatePresentations << /Names [(slides) 14 0 R] >> /EmbeddedFiles << /Names [(a.txt) 15 0 R] >> /JavaScript << /Names [(init) 16 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << >> /Thumb 17 0 R /Annots [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R] >>".to_vec(),
+        stream("", b""),
+        b"<< /Type /Annot /Subtype /Screen /Rect [10 10 50 50] /A << /S /Rendition /OP 0 /AN 5 0 R /R 12 0 R /JS (SCRIPTMARKER_RENDITION_ACTION) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Screen /Rect [60 10 100 50] /A << /S /JavaScript /JS (SCRIPTMARKER_SCREEN_JS) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Movie /Rect [110 10 150 50] /Movie << /F (/Volumes/MOVIEPATHMARKER.mov) >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /RichMedia /Rect [160 10 200 50] /RichMediaContent << /Assets << /Names [(asset.swf) 18 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /3D /Rect [210 10 250 50] /3DD 19 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Sound /Rect [10 60 50 100] /Sound 20 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Link /Rect [60 60 100 100] /A << /S /JavaScript /JS (CONTROL_LINK_JS) >> >>".to_vec(),
+        b"<< /Type /Rendition /S /MR /C << /Type /MediaClip /S /MCD /D 21 0 R /CT (video/mp4) >> >>".to_vec(),
+        b"<< /Type /Rendition /S /MR /C << /Type /MediaClip /S /MCD /D 22 0 R /CT (video/mp4) >> >>".to_vec(),
+        b"<< /Type /SlideShow /Subtype /Embedded /Resources << /Names [(index.html) 23 0 R] >> /StartResource (index.html) >>".to_vec(),
+        b"<< /Type /Filespec /F (a.txt) /EF << /F 24 0 R >> >>".to_vec(),
+        b"<< /S /JavaScript /JS (CONTROL_DOC_JS) >>".to_vec(),
+        stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"THUMBMARKER_PRE_"),
+        b"<< /Type /Filespec /F (asset.swf) /EF << /F 25 0 R >> >>".to_vec(),
+        stream("/Type /3D /Subtype /U3D /OnInstantiate 26 0 R", b"EMBEDMARKER_3D_STREAM"),
+        stream("/Type /Sound /R 8000 /C 1 /B 8", b"CONTROL_SOUND_DATA"),
+        b"<< /Type /Filespec /F (screen.mp4) /EF << /F 27 0 R >> >>".to_vec(),
+        b"<< /Type /Filespec /F (clip.mp4) /EF << /F 28 0 R >> >>".to_vec(),
+        stream("", b"SCRIPTMARKER_ALTPRES_RESOURCE"),
+        stream("", b"CONTROL_ATTACHMENT"),
+        stream("", b"EMBEDMARKER_RICHMEDIA_ASSET"),
+        stream("", b"SCRIPTMARKER_3D_ONINSTANTIATE"),
+        stream("", b"EMBEDMARKER_SCREEN_MEDIA"),
+        stream("", b"EMBEDMARKER_RENDITION_MEDIA"),
+    ])
+}
+
+/// Sanitize looked at a fixed list of containers, so scripts, embedded files, a file path and
+/// the stored page image held by multimedia content stayed in the saved file while the scan
+/// counted none of them and the operation reported success.
+#[test]
+fn multimedia_scripts_embedded_files_paths_and_thumbnails_are_removed() {
+    use crate::sanitize::{Hidden, remove_hidden, sanitize, scan};
+    const SCRIPTS: [&[u8]; 4] =
+        [b"SCRIPTMARKER_RENDITION_ACTION", b"SCRIPTMARKER_SCREEN_JS", b"SCRIPTMARKER_3D_ONINSTANTIATE", b"SCRIPTMARKER_ALTPRES_RESOURCE"];
+    const EMBEDDED: [&[u8]; 5] =
+        [b"EMBEDMARKER_RENDITION_MEDIA", b"EMBEDMARKER_SCREEN_MEDIA", b"EMBEDMARKER_RICHMEDIA_ASSET", b"EMBEDMARKER_3D_STREAM", b"MOVIEPATHMARKER"];
+    const CONTROLS: [&[u8]; 4] = [b"CONTROL_ATTACHMENT", b"CONTROL_SOUND_DATA", b"CONTROL_DOC_JS", b"CONTROL_LINK_JS"];
+    let check = |doc: &Document, gone: &[&[u8]], kept: &[&[u8]], what: &str| {
+        for m in gone {
+            assert!(!saved_contains(doc, m), "{} survived {what}", String::from_utf8_lossy(m));
+        }
+        for m in kept {
+            assert!(saved_contains(doc, m), "{} was removed by {what}", String::from_utf8_lossy(m));
+        }
+    };
+    let mut doc = multimedia_fixture();
+    sanitize(&mut doc).unwrap();
+    check(&doc, &[SCRIPTS.as_slice(), &EMBEDDED, &CONTROLS, &[b"THUMBMARKER_PRE_"]].concat(), &[], "Sanitize");
+    let mut doc = multimedia_fixture();
+    remove_hidden(&mut doc, &[Hidden::LinksActionsScripts]).unwrap();
+    check(&doc, &SCRIPTS, &[EMBEDDED[0], EMBEDDED[3], CONTROLS[0], CONTROLS[1]], "Links, actions and scripts");
+    let mut doc = multimedia_fixture();
+    remove_hidden(&mut doc, &[Hidden::Attachments]).unwrap();
+    check(&doc, &EMBEDDED, &[CONTROLS[2], CONTROLS[3], SCRIPTS[3]], "Attachments");
+    // A category that changes what a page shows drops its stored thumbnail too.
+    let mut doc = multimedia_fixture();
+    remove_hidden(&mut doc, &[Hidden::Comments]).unwrap();
+    check(&doc, &[b"THUMBMARKER_PRE_", CONTROLS[1]], &[EMBEDDED[3], CONTROLS[0]], "Comments");
+    // The scan counts them, so the dialog and doc_hidden_info show them.
+    let counts: std::collections::HashMap<Hidden, usize> = scan(&multimedia_fixture()).into_iter().collect();
+    assert_eq!(counts[&Hidden::Attachments], 7, "the embedded file, the five multimedia annotations and the rendition");
+    assert_eq!(counts[&Hidden::LinksActionsScripts], 6, "the link, two Screen actions, the document script, the slideshow and the 3D script");
+}

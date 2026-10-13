@@ -294,6 +294,44 @@ fn flattening_fields_drops_the_ones_on_no_page() {
     assert_eq!(left, [pdfcraft_cos::ObjRef::new(7, 0)], "only the hidden field on the page stays");
 }
 
+/// A field tree may name one node twice in `/Kids` (a tolerated producer fault, so a crafted file
+/// can do it at every level): pruning the form after flattening judges each node once, not once
+/// per path to it, or 24 levels of pairs are sixteen million visits.
+#[test]
+fn flattening_prunes_a_field_tree_with_shared_kids_in_linear_time() {
+    const LEVELS: usize = 24;
+    // 1 catalog, 2 pages, 3 page A (flattened), 4 page B (kept), 5 content, 6 widget on A, 7 its
+    // appearance, then the chain: node k has /Kids [k+1 k+1], and the last node is a widget on B.
+    let first = 8;
+    let last = first + LEVELS;
+    let page = stream("", " ");
+    let mut objs: Vec<String> = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R {first} 0 R] >> >>"),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 5 0 R /Annots [6 0 R] >>".into(),
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> /Contents 5 0 R /Annots [{last} 0 R] >>"),
+        page,
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (flat) /Rect [10 10 150 40] /F 4 /AP << /N 7 0 R >> >>".into(),
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 140 30] /Length 0 >>\nstream\n\nendstream".into(),
+    ];
+    for k in first..last {
+        let parent = if k == first { String::new() } else { format!("/Parent {} 0 R", k - 1) };
+        objs.push(format!("<< /T (n{k}) {parent} /Kids [{} 0 R {} 0 R] >>", k + 1, k + 1));
+    }
+    objs.push(format!("<< /Type /Annot /Subtype /Widget /FT /Tx /T (deep) /Parent {} 0 R /Rect [10 10 150 40] /F 4 /AP << /N 7 0 R >> >>", last - 1));
+    let objs: Vec<&str> = objs.iter().map(String::as_str).collect();
+    let mut doc = build(&objs);
+    let started = std::time::Instant::now();
+    assert_eq!(flatten(&mut doc, &[0], false, true).unwrap(), 1, "the widget on page A is drawn");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "pruning the form took {:?}", started.elapsed());
+    let doc = reopen(&doc);
+    let root = doc.root().unwrap();
+    let af = doc.resolve(doc.get(root).as_dict().unwrap().get(b"AcroForm").unwrap());
+    let fields = doc.resolve(af.as_dict().unwrap().get(b"Fields").unwrap());
+    let left: Vec<pdfcraft_cos::ObjRef> = fields.as_array().unwrap().iter().filter_map(|f| f.as_ref()).collect();
+    assert_eq!(left, [pdfcraft_cos::ObjRef::new(first as u32, 0)], "the chain, whose widget is on page B, stays");
+}
+
 /// Flattening never makes a `?` permanent: it refuses, changing nothing, a text box without an
 /// appearance whose text Helvetica can't draw (another program's), and a comment or form field
 /// whose appearance PdfCraft drew with `?` (marked `PCUndrawn`). A comment another program drew

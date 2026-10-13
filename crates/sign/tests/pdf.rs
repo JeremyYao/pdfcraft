@@ -13,14 +13,18 @@ fn data(name: &str) -> Vec<u8> {
 
 /// One page with text and an unsigned signature field "Approval".
 fn fixture() -> Vec<u8> {
-    let objs: Vec<&[u8]> = vec![
+    build(&[
         b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>",
         b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
-    ];
+    ])
+}
+
+/// A classic-xref file from object bodies (object i+1 = objs[i]), with object 1 the catalog.
+fn build(objs: &[&[u8]]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objs.iter().enumerate() {
@@ -1985,4 +1989,114 @@ fn a_trusted_certificate_without_the_timestamping_purpose_is_not_a_time_authorit
     let stamped = pdfcraft_sign::timestamp_document(&open(&fixture()), &tsa, "D:20261006120000Z").unwrap();
     let s = signatures(&open(&stamped), &stamped, &trust).into_iter().find(|s| s.doc_timestamp).unwrap();
     assert_eq!(s.status, Status::Unknown, "{:?}", s.details);
+}
+
+/// Add widget `w` to the AcroForm's /Fields, wherever the form dictionary lives.
+fn register_field(doc: &mut Document, w: pdfcraft_cos::ObjRef) {
+    fn push(af: &mut pdfcraft_cos::Dict, w: pdfcraft_cos::ObjRef) {
+        match af.get_mut(b"Fields") {
+            Some(Object::Array(a)) => a.push(Object::Ref(w)),
+            _ => af.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(w)])),
+        }
+    }
+    let root = doc.root().unwrap();
+    match doc.get(root).as_dict().and_then(|c| c.get(b"AcroForm").cloned()) {
+        Some(Object::Ref(r)) => doc.update_dict(r, |af| push(af, w)).unwrap(),
+        _ => doc
+            .update_dict(root, |c| {
+                if let Some(Object::Dict(af)) = c.get_mut(b"AcroForm") {
+                    push(af, w);
+                }
+            })
+            .unwrap(),
+    }
+}
+
+/// A second signature field whose value copies the genuine signature dictionary, /ByteRange and
+/// /Contents included, under a reason and date of the attacker's: the borrowed range verifies,
+/// but it is not this dictionary's own contents, so the field is invalid, and the genuine one is
+/// untouched.
+#[test]
+fn a_signature_field_borrowing_another_fields_byte_range_is_invalid() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &opts()).unwrap();
+    let edited = edit_after(&signed, |doc| {
+        let page = pdfcraft_cos::ObjRef { num: 3, generation: 0 };
+        // The genuine signature dictionary, wherever the signer put it.
+        let genuine = doc
+            .object_numbers()
+            .into_iter()
+            .map(|n| doc.get(pdfcraft_cos::ObjRef::new(n, doc.generation(n))))
+            .find_map(|o| o.as_dict().filter(|d| d.name(b"Type") == Some(b"Sig") && d.contains(b"ByteRange")).cloned())
+            .unwrap();
+        let mut forged = genuine;
+        forged.set(b"Reason".to_vec(), PdfString::text("I also agree to the amended terms"));
+        forged.set(b"M".to_vec(), PdfString::text("D:20270101090000Z"));
+        let v = doc.add(Object::Dict(forged));
+        let mut w = pdfcraft_cos::Dict::new();
+        w.set(b"Type".to_vec(), Object::name("Annot"));
+        w.set(b"Subtype".to_vec(), Object::name("Widget"));
+        w.set(b"FT".to_vec(), Object::name("Sig"));
+        w.set(b"T".to_vec(), PdfString::text("Amendment approval"));
+        w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(10), Object::Int(100), Object::Int(40)]));
+        w.set(b"F".to_vec(), Object::Int(4));
+        w.set(b"P".to_vec(), Object::Ref(page));
+        w.set(b"V".to_vec(), Object::Ref(v));
+        let w = doc.add(Object::Dict(w));
+        doc.update_dict(page, |p| {
+            if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
+                a.push(Object::Ref(w));
+            }
+        })
+        .unwrap();
+        register_field(doc, w);
+    });
+    let all = signatures(&open(&edited), &edited, &trust);
+    let forged = all.iter().find(|s| s.field == "Amendment approval").unwrap();
+    assert!(forged.signed);
+    assert_eq!(forged.status, Status::Invalid, "{:?}", forged.details);
+    assert!(forged.details.iter().any(|d| d.message.contains("does not exclude exactly its contents")), "{:?}", forged.details);
+    // The signature made by sign() goes into a field of its own, "Signature1".
+    let genuine = all.iter().find(|s| s.field == "Signature1").unwrap();
+    assert_eq!(genuine.status, Status::Valid, "{:?}", genuine.details);
+    assert_eq!(all.iter().filter(|s| s.signed).count(), 2, "both fields are signed, only one validly");
+}
+
+/// The fixture with a page whose resources name an object the file does not define: the signed
+/// page draws nothing for it, so the signer sees the text alone.
+fn fixture_with_dangling_xobject() -> Vec<u8> {
+    build(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /X 50 0 R >> >> /Annots [6 0 R] >>",
+        b"<< /Length 54 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET q /X Do Q\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
+    ])
+}
+
+/// Defining, after signing, an object the signed page's resources already named changes what
+/// the page shows while every signed object is byte-for-byte the same: never a permitted change,
+/// at any level.
+#[test]
+fn defining_an_object_the_signed_page_already_named_is_a_change() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture_with_dangling_xobject()), &id, &SignOptions { certify, ..opts() }).unwrap();
+        assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
+        let edited = edit_after(&signed, |doc| {
+            let mut d = pdfcraft_cos::Dict::new();
+            d.set(b"Type".to_vec(), Object::name("XObject"));
+            d.set(b"Subtype".to_vec(), Object::name("Form"));
+            d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+            let s = pdfcraft_cos::Stream::from_raw(d, b"0 0 0 rg 20 60 260 140 re f".to_vec());
+            doc.set(pdfcraft_cos::ObjRef { num: 50, generation: 0 }, Object::Stream(s));
+        });
+        let s = check(&edited);
+        assert_eq!(s.status, Status::Invalid, "{certify:?}: {:?} {:?}", s.modification, s.details);
+        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")), "{certify:?}: {:?}", s.modification);
+    }
 }

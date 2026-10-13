@@ -609,7 +609,10 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
             details: Vec::new(),
         };
         if let Some(v) = v {
-            validate_into(doc, bytes, trust, &v, &mut info, cache);
+            // The object whose own /Contents the byte range must exclude: /V when indirect,
+            // else the field that holds the dictionary.
+            let holder = f.dict.get(b"V").and_then(Object::as_ref).or(f.r);
+            validate_into(doc, bytes, trust, &v, &mut info, cache, holder);
         }
         out.push(info);
     }
@@ -651,7 +654,7 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
             modification: Modification::None,
             details: Vec::new(),
         };
-        validate_doc_timestamp(doc, bytes, d, &mut info, cache, trust);
+        validate_doc_timestamp(doc, bytes, d, &mut info, cache, trust, Some(r));
         out.push(info);
     }
     out
@@ -666,6 +669,37 @@ pub fn validate(doc: &Document, bytes: &[u8], trust: &TrustStore, field: &str) -
     list(doc, bytes, trust).into_iter().find(|s| s.field == field)
 }
 
+/// Whether the byte-range gap `[l0, o1)` is the `/Contents` token of `holder`, the object that
+/// carries the signature dictionary (its /V object, or the field when /V is direct): the object's
+/// header lies in the file before the gap, nothing ends the object between the two, and the
+/// last token before the gap is the `/Contents` key. A dictionary that borrows another
+/// signature's range verifies over bytes that are not its own, under a reason, a date and a
+/// field name of its author's: it is not a signature at all, whatever the borrowed range says.
+fn gap_is_own_contents(doc: &Document, bytes: &[u8], holder: Option<ObjRef>, l0: usize, o1: usize) -> bool {
+    use pdfcraft_cos::XrefEntry;
+    let Some(holder) = holder else { return false };
+    // Only an object in the file at a known place can hold a byte range (never one in an object
+    // stream, nor one the reader had to search for).
+    let Some(XrefEntry::InFile { offset, .. }) = doc.xref_entry(holder.num) else { return false };
+    if !doc.xref_entry_is_exact(holder.num) {
+        return false;
+    }
+    let Ok(offset) = usize::try_from(offset) else { return false };
+    // Offsets may count from a header that does not start the file.
+    let header = bytes.get(..1024).unwrap_or(bytes).windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+    let starts_here = |at: usize| -> bool {
+        let Some(head) = bytes.get(at..l0) else { return false };
+        let mut lx = pdfcraft_cos::Lexer::new(head, 0);
+        let num = std::str::from_utf8(lx.token()).ok().and_then(|s| s.parse::<u32>().ok());
+        lx.skip_ws();
+        let generation = lx.token();
+        num == Some(holder.num) && !generation.is_empty() && lx.eat_keyword(b"obj")
+    };
+    let Some(start) = [offset, offset.saturating_add(header)].into_iter().find(|at| starts_here(*at)) else { return false };
+    let Some(head) = bytes.get(start..l0) else { return false };
+    head.trim_ascii_end().ends_with(b"/Contents") && !head.windows(6).any(|w| w == b"endobj") && o1 <= bytes.len()
+}
+
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
     let digits: Vec<u8> = s.iter().copied().filter(|c| !c.is_ascii_whitespace()).collect();
     let val = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
@@ -678,7 +712,7 @@ fn is_doc_timestamp(d: &Dict) -> bool {
     d.name(b"SubFilter") == Some(b"ETSI.RFC3161") && matches!(d.name(b"Type"), Some(b"DocTimeStamp" | b"Sig"))
 }
 
-fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, info: &mut SignatureInfo, cache: &DigestCache) {
+fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, info: &mut SignatureInfo, cache: &DigestCache, holder: Option<ObjRef>) {
     // A document timestamp can also be the value of a signature field (Documenso writes
     // `Timestamp_1` that way). Its `/Contents` is a bare RFC 3161 token, not a signature over the
     // document, so it must not be read as one.
@@ -686,7 +720,7 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         info.sub_filter = Some("ETSI.RFC3161".to_string());
         info.doc_timestamp = true;
         info.timestamp = true;
-        validate_doc_timestamp(doc, bytes, v, info, cache, trust);
+        validate_doc_timestamp(doc, bytes, v, info, cache, trust, holder);
         return;
     }
     info.date = text(doc, v, b"M");
@@ -719,7 +753,7 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         return invalid(info, Detail::plain("The signature's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
+    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, holder, l0, o1) {
         return invalid(info, Detail::plain("The signature's byte range does not exclude exactly its contents."));
     }
     let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, Detail::plain("The signature contents are not hexadecimal.")) };
@@ -994,7 +1028,16 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
 
 /// Validate a standalone document timestamp dictionary (`/ETSI.RFC3161`): the token must be
 /// cryptographically valid and its message imprint must cover the file's signed bytes.
-fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut SignatureInfo, cache: &DigestCache, trust: &TrustStore) {
+#[allow(clippy::too_many_arguments)]
+fn validate_doc_timestamp(
+    doc: &Document,
+    bytes: &[u8],
+    v: &Dict,
+    info: &mut SignatureInfo,
+    cache: &DigestCache,
+    trust: &TrustStore,
+    holder: Option<ObjRef>,
+) {
     info.date = text(doc, v, b"M");
     let invalid = |info: &mut SignatureInfo, why: Detail| {
         info.status = Status::Invalid;
@@ -1008,7 +1051,7 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
         return invalid(info, Detail::plain("The timestamp's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
+    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, holder, l0, o1) {
         return invalid(info, Detail::plain("The timestamp's byte range does not exclude exactly its contents."));
     }
     let Some(contents) = unhex(&gap[1..gap.len() - 1]) else {
@@ -1211,6 +1254,32 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
     let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
     let (mut allowed, mut disallowed): (Vec<&'static str>, Vec<&'static str>) = (Vec::new(), Vec::new());
     let dss = dss_parts(doc, &old);
+    // Object numbers the signed revision referenced but did not define (a page's /Resources
+    // naming an XObject, a font or a pattern that does not exist yet). The signed objects that
+    // name them are unchanged bytes, yet defining one later changes what they show: never
+    // "just a new object", at any level.
+    let old_dangling: HashSet<u32> = {
+        fn walk(o: &Object, out: &mut Vec<u32>, depth: u8) {
+            if depth > 64 {
+                return;
+            }
+            match o {
+                Object::Ref(r) => out.push(r.num),
+                Object::Array(a) => a.iter().for_each(|x| walk(x, out, depth + 1)),
+                Object::Dict(d) => d.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
+                Object::Stream(s) => s.dict.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
+                _ => {}
+            }
+        }
+        let mut named = Vec::new();
+        walk(&Object::Dict(old.trailer().clone()), &mut named, 0);
+        for (_, o) in old.scan_objects() {
+            walk(&o, &mut named, 0);
+        }
+        named.sort_unstable();
+        named.dedup();
+        named.into_iter().filter(|n| old.try_get(*n).is_ok_and(|o| matches!(*o, Object::Null))).collect()
+    };
     // Stored at the same place in both (and not edited since): the same bytes, unchanged.
     let same_place = |num: u32| -> bool {
         use pdfcraft_cos::XrefEntry;
@@ -1254,6 +1323,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             continue;
         }
         let what = match &*new {
+            // The signed revision already pointed here: a change to what it showed.
+            _ if before.is_none() && old_dangling.contains(&num) => kind::PAGE_CONTENT,
             // The Document Security Store's own arrays and dictionaries, when they only grew.
             _ if dss.contains(&num) => kind::SECURITY_STORE,
             Object::Dict(d) => {

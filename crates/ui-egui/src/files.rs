@@ -190,9 +190,37 @@ pub(crate) fn file_stem_from_user(name: &str) -> String {
     if reserved { format!("_{stem}") } else { stem.to_string() }
 }
 
-/// A safe native Save suggestion for a PDF-supplied attachment name.
-/// This changes only the suggestion, never the stored name or the selected destination.
-#[cfg(any(test, not(target_arch = "wasm32")))]
+/// `name` as exactly one safe file name to write into a chosen folder: its stem cleaned by
+/// [`file_stem_from_user`] (separators, `..`, drive prefixes and reserved names can't survive
+/// it), its extension (a short alphanumeric suffix, when it has one) kept, and "document" when
+/// nothing usable is left. Names that reach the file sinks come from the document (an embedded
+/// file's `/UF`, a signer certificate's CN) as much as from the user, so every one goes through
+/// this before it is joined onto the folder.
+pub(crate) fn safe_file_name(name: &str) -> String {
+    let split = name.rfind('.').filter(|&i| i > 0).and_then(|i| {
+        let (stem, ext) = (name.get(..i)?, name.get(i + 1..)?);
+        (!ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric())).then_some((stem, ext))
+    });
+    let (stem, ext) = split.unwrap_or((name, ""));
+    let stem = file_stem_from_user(stem);
+    let stem = if stem.is_empty() { "document" } else { stem.as_str() };
+    if ext.is_empty() { stem.to_string() } else { format!("{stem}.{ext}") }
+}
+
+/// `dir/name` when `name` is one normal path component (see [`safe_file_name`]), so the file
+/// lands directly inside `dir`; `None` for anything else. The sinks refuse such a name rather
+/// than write beside or outside the chosen folder.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn inside(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let mut components = std::path::Path::new(name).components();
+    let one = matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None));
+    let path = dir.join(name);
+    (one && path.parent() == Some(dir)).then_some(path)
+}
+
+/// A safe native Save suggestion for a PDF-supplied attachment name, and the name an attachment
+/// opened in its own tab gets. This changes only those names, never the stored name or the
+/// selected destination.
 pub(crate) fn attachment_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -662,12 +690,20 @@ impl PdfCraftApp {
 
     /// [`Self::write_files`], then `after` once every file is written: now, or on a later frame
     /// when the user chooses the folder. `after` never runs when writing fails or is cancelled.
+    /// Every name is made one safe file name first ([`safe_file_name`]): the files land directly
+    /// inside the chosen folder whatever the document called them.
     pub(crate) fn write_files_then(&mut self, named: Vec<(String, Arc<Vec<u8>>)>, title: &str, after: impl FnOnce(&mut Self) + Send + 'static) {
+        let named: Vec<(String, Arc<Vec<u8>>)> = named.into_iter().map(|(name, bytes)| (safe_file_name(&name), bytes)).collect();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let write = move |app: &mut Self, dir: std::path::PathBuf| {
                 for (name, bytes) in &named {
-                    if let Err(e) = crate::editing::write_atomically(&dir.join(name).to_string_lossy(), bytes) {
+                    // One normal component only: never beside or outside the chosen folder.
+                    let Some(path) = inside(&dir, name) else {
+                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", "the name is not a plain file name")]);
+                        return;
+                    };
+                    if let Err(e) = crate::editing::write_atomically(&path.to_string_lossy(), bytes) {
                         app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e.to_string())]);
                         return;
                     }
@@ -985,6 +1021,107 @@ impl PdfCraftApp {
                 let _ = crate::editing::download(&format!("{stem}.xfdf"), &bytes);
             }
             Err(e) => self.notify_error(e),
+        }
+    }
+}
+
+/// The multi-file sinks (Split, Extract, Export, the accessibility report, Export certificate)
+/// take names from the document (an embedded file's `/UF`, a signer's CN) and join them onto
+/// the folder the user chose. Every file must land directly inside that folder.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod sink_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::PdfCraftApp;
+
+    const FIXTURE: &[u8] = b"%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R >> endobj
+trailer << /Root 1 0 R >>
+%%EOF";
+
+    /// A fresh root folder holding the `chosen` folder the user picks.
+    fn folders(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("pdfcraft-sink-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let chosen = root.join("chosen");
+        std::fs::create_dir_all(&chosen).unwrap();
+        (root, chosen)
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn written_files_never_leave_the_chosen_folder() {
+        let (root, chosen) = folders("files");
+        std::fs::write(root.join("escaped.txt"), "USER DATA").unwrap();
+        let mut app = PdfCraftApp::new();
+        app.export_dir_override = Some(chosen.to_string_lossy().into_owned());
+        let absolute = root.join("elsewhere").join("owned.txt").to_string_lossy().into_owned();
+        let b = |s: &str| Arc::new(s.as_bytes().to_vec());
+        app.write_files(&[("../escaped.txt".into(), b("1")), (absolute, b("2")), ("..".into(), b("3")), ("plain.txt".into(), b("4"))], "t");
+        assert_eq!(std::fs::read_to_string(root.join("escaped.txt")).unwrap(), "USER DATA", "a file beside the folder is not replaced");
+        assert_eq!(names(&root), ["chosen", "escaped.txt"], "nothing lands beside the chosen folder");
+        let written = names(&chosen);
+        assert_eq!(written.len(), 4, "{written:?}");
+        for expected in [".._escaped.txt", "document", "plain.txt"] {
+            assert!(written.iter().any(|n| n == expected), "{expected} in {written:?}");
+        }
+        assert_eq!(std::fs::read_to_string(chosen.join(".._escaped.txt")).unwrap(), "1");
+    }
+
+    #[test]
+    fn exported_text_never_leaves_the_chosen_folder() {
+        let (root, chosen) = folders("export");
+        let mut app = PdfCraftApp::new();
+        app.open_bytes("../notes.pdf", None, FIXTURE.to_vec()).unwrap();
+        app.export_dir_override = Some(chosen.to_string_lossy().into_owned());
+        app.start_export(crate::export_ui::ExportKind::Text);
+        assert_eq!(names(&root), ["chosen"], "nothing lands beside the chosen folder");
+        assert_eq!(names(&chosen), [".._notes.txt"]);
+    }
+
+    #[test]
+    fn safe_file_names_are_one_component_with_the_extension_kept() {
+        use super::{inside, safe_file_name};
+        assert_eq!(safe_file_name("report (page 1).pdf"), "report (page 1).pdf");
+        assert_eq!(safe_file_name("../escaped (page 1).pdf"), ".._escaped (page 1).pdf");
+        assert_eq!(safe_file_name("../evilcert.cer"), ".._evilcert.cer");
+        assert_eq!(safe_file_name("a/b\\c:d Accessibility Report.html"), "a_b_c_d Accessibility Report.html");
+        assert_eq!(safe_file_name("/etc/passwd"), "_etc_passwd");
+        assert_eq!(safe_file_name("C:\\Users\\x\\owned.txt"), "C__Users_x_owned.txt");
+        assert_eq!(safe_file_name("nul.txt"), "_nul.txt");
+        // Nothing usable left: a stable name, the extension kept when there is one.
+        assert_eq!(safe_file_name(".."), "document");
+        assert_eq!(safe_file_name("...pdf"), "document.pdf");
+        assert_eq!(safe_file_name(""), "document");
+        assert_eq!(safe_file_name(".hidden"), ".hidden");
+        // The extension is a short alphanumeric suffix; anything else is part of the stem.
+        assert_eq!(safe_file_name("archive.tar.gz"), "archive.tar.gz");
+        assert_eq!(safe_file_name("odd.ext/../x"), "odd.ext_.._x");
+        for name in ["../a.pdf", "C:\\x.txt", "..", "a/b.html", "/abs", "x/", "résumé.pdf"] {
+            let once = safe_file_name(name);
+            assert_eq!(Path::new(&once).components().count(), 1, "{once:?}");
+            assert_eq!(safe_file_name(&once), once, "stable");
+            assert!(inside(Path::new("chosen"), &once).is_some(), "{once:?}");
+        }
+        // The sink's own check, should a name ever reach it uncleaned.
+        let dir = Path::new("chosen");
+        assert_eq!(inside(dir, "plain.txt"), Some(dir.join("plain.txt")));
+        for name in ["../escaped.txt", "sub/x.txt", "..", ".", "", "/abs.txt"] {
+            assert_eq!(inside(dir, name), None, "{name:?}");
+        }
+        // Drive-letter forms are paths on Windows only (elsewhere a colon or backslash is an
+        // ordinary character of a name).
+        for name in ["C:\\abs.txt", "C:rel.txt", "sub\\x.txt"] {
+            assert_eq!(inside(dir, name).is_none(), cfg!(windows), "{name:?}");
         }
     }
 }

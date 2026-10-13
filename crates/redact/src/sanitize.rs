@@ -13,9 +13,10 @@ use crate::{RedactError, Report, annots_of, page_streams};
 /// The categories of Acrobat's Remove Hidden Information panel that PdfCraft handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hidden {
-    /// Document information (`/Info`) and XMP metadata streams.
+    /// Document information (`/Info`) and XMP metadata streams, on any object.
     Metadata,
-    /// Embedded files and file attachment annotations.
+    /// Embedded files, file attachment annotations and associated files (`/AF`, wherever they
+    /// hang).
     Attachments,
     /// Comments and markup annotations (with their pop-ups).
     Comments,
@@ -29,7 +30,7 @@ pub enum Hidden {
     Bookmarks,
     /// Links, actions (open action, additional actions) and document JavaScript.
     LinksActionsScripts,
-    /// Private data of other applications (`/PieceInfo`).
+    /// Private data of other applications (`/PieceInfo`, on any object).
     PrivateData,
 }
 
@@ -112,6 +113,107 @@ fn outline_len(doc: &Document, first: Option<&Object>, depth: usize) -> usize {
         cur = d.get(b"Next").cloned();
     }
     n
+}
+
+/// Every indirect object reachable from the catalog, each once, with its current generation.
+/// Cycles are cut by the seen-set, which holds at most one entry per object number (no more
+/// than the cross-reference table already does); nesting inside one object is bounded by the
+/// parser.
+fn reachable(doc: &Document) -> Vec<ObjRef> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut stack: Vec<ObjRef> = doc.root().into_iter().collect();
+    while let Some(r) = stack.pop() {
+        if !seen.insert(r.num) {
+            continue;
+        }
+        let o = doc.get(r);
+        if matches!(*o, Object::Null) {
+            continue;
+        }
+        refs_in(&o, &mut |x| stack.push(x));
+        out.push(ObjRef::new(r.num, doc.generation(r.num)));
+    }
+    out
+}
+
+fn refs_in(o: &Object, f: &mut impl FnMut(ObjRef)) {
+    match o {
+        Object::Ref(r) => f(*r),
+        Object::Array(a) => a.iter().for_each(|x| refs_in(x, f)),
+        Object::Dict(d) => d.iter().for_each(|(_, v)| refs_in(v, f)),
+        Object::Stream(s) => s.dict.iter().for_each(|(_, v)| refs_in(v, f)),
+        _ => {}
+    }
+}
+
+/// How many dictionaries in `o` (its own, and the direct ones inside it) hold `key`; with
+/// `entries`, how many items the arrays under it hold instead (one per associated file).
+fn count_key(doc: &Document, o: &Object, key: &[u8], entries: bool, depth: usize) -> usize {
+    if depth > 64 {
+        return 0;
+    }
+    let in_dict = |d: &Dict| -> usize {
+        let own = match d.get(key) {
+            None => 0,
+            Some(v) if entries => doc.resolve(v).as_array().map_or(1, |a| a.len().max(1)),
+            Some(_) => 1,
+        };
+        d.iter().fold(own, |n, (_, v)| n.saturating_add(count_key(doc, v, key, entries, depth + 1)))
+    };
+    match o {
+        Object::Dict(d) => in_dict(d),
+        Object::Stream(s) => in_dict(&s.dict),
+        Object::Array(a) => a.iter().fold(0, |n, x| n.saturating_add(count_key(doc, x, key, entries, depth + 1))),
+        _ => 0,
+    }
+}
+
+/// `o` without `keys` in its dictionary or in any direct dictionary inside it (and without the
+/// /LastModified that goes with a removed /PieceInfo); `None` when it holds none of them.
+fn strip_keys(o: &Object, keys: &[&[u8]], depth: usize) -> Option<Object> {
+    if depth > 64 {
+        return None;
+    }
+    match o {
+        Object::Dict(d) => strip_dict(d, keys, depth).map(Object::Dict),
+        Object::Stream(s) => strip_dict(&s.dict, keys, depth).map(|dict| Object::Stream(pdfcraft_cos::Stream { dict, raw: s.raw.clone() })),
+        Object::Array(a) => {
+            let mut changed = false;
+            let mut items = Vec::with_capacity(a.len());
+            for x in a {
+                match strip_keys(x, keys, depth + 1) {
+                    Some(y) => {
+                        changed = true;
+                        items.push(y);
+                    }
+                    None => items.push(x.clone()),
+                }
+            }
+            changed.then_some(Object::Array(items))
+        }
+        _ => None,
+    }
+}
+
+fn strip_dict(d: &Dict, keys: &[&[u8]], depth: usize) -> Option<Dict> {
+    let piece_goes = keys.contains(&&b"PieceInfo"[..]) && d.contains(b"PieceInfo");
+    let mut out = Dict::new();
+    let mut changed = false;
+    for (k, v) in d.iter() {
+        if keys.contains(&k.as_slice()) || (piece_goes && k == b"LastModified") {
+            changed = true;
+            continue;
+        }
+        match strip_keys(v, keys, depth + 1) {
+            Some(y) => {
+                changed = true;
+                out.set(k.clone(), y);
+            }
+            None => out.set(k.clone(), v.clone()),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// A comment as the comments list sees it, less file attachments (removed with Attachments) and
@@ -232,6 +334,15 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
     let annots: Vec<Dict> = pages.iter().flat_map(|p| annots_of(doc, &p.dict)).filter_map(|a| doc.resolve(&a).as_dict().cloned()).collect();
     let count_sub = |s: &[u8]| annots.iter().filter(|a| a.name(b"Subtype") == Some(s)).count();
     let names = sub(doc, &cat, b"Names").unwrap_or_default();
+    // XMP, associated files and private data can sit on any dictionary (an XObject, a structure
+    // element, an annotation…): count them wherever they are reachable from the catalog.
+    let (mut xmp, mut af, mut piece) = (0usize, 0usize, 0usize);
+    for r in reachable(doc) {
+        let o = doc.get(r);
+        xmp = xmp.saturating_add(count_key(doc, &o, b"Metadata", false, 0));
+        af = af.saturating_add(count_key(doc, &o, b"AF", true, 0));
+        piece = piece.saturating_add(count_key(doc, &o, b"PieceInfo", false, 0));
+    }
     let mut doc2 = doc.clone();
     HIDDEN
         .into_iter()
@@ -239,10 +350,12 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
             let n = match h {
                 Hidden::Metadata => {
                     let info = doc.trailer().get(b"Info").and_then(|i| doc.resolve(i).as_dict().map(|d| d.len())).unwrap_or(0);
-                    let xmp = usize::from(cat.contains(b"Metadata")) + pages.iter().filter(|p| p.dict.contains(b"Metadata")).count();
-                    info + xmp
+                    info.saturating_add(xmp)
                 }
-                Hidden::Attachments => sub(doc, &names, b"EmbeddedFiles").map_or(0, |t| name_tree_len(doc, &t, 0)) + count_sub(b"FileAttachment"),
+                Hidden::Attachments => sub(doc, &names, b"EmbeddedFiles")
+                    .map_or(0, |t| name_tree_len(doc, &t, 0))
+                    .saturating_add(count_sub(b"FileAttachment"))
+                    .saturating_add(af),
                 Hidden::Comments => annots.iter().filter(|a| is_comment(a.name(b"Subtype").unwrap_or(b""))).count(),
                 Hidden::FormFields => pdfcraft_forms::fields(doc).len(),
                 Hidden::HiddenText => content_pass(&mut doc2, true, false, false).unwrap_or(0),
@@ -259,7 +372,7 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
                         + annots.iter().filter(|a| a.contains(b"AA") || (a.name(b"Subtype") == Some(b"Widget") && a.contains(b"A"))).count()
                         + sub(doc, &names, b"JavaScript").map_or(0, |t| name_tree_len(doc, &t, 0))
                 }
-                Hidden::PrivateData => usize::from(cat.contains(b"PieceInfo")) + pages.iter().filter(|p| p.dict.contains(b"PieceInfo")).count(),
+                Hidden::PrivateData => piece,
             };
             (h, n)
         })
@@ -360,20 +473,12 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
             }
             kept.push(a);
         }
-        let private = which.contains(&Hidden::PrivateData);
-        let metadata = which.contains(&Hidden::Metadata);
         let actions = which.contains(&Hidden::LinksActionsScripts);
         doc.update_dict(p.obj, |d| {
             if kept.is_empty() {
                 d.remove(b"Annots");
             } else {
                 d.set(b"Annots".to_vec(), Object::Array(kept));
-            }
-            if private {
-                d.remove(b"PieceInfo");
-            }
-            if metadata {
-                d.remove(b"Metadata");
             }
             if actions {
                 d.remove(b"AA");
@@ -386,14 +491,12 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
     for &h in which {
         match h {
             Hidden::Metadata => {
-                cat.remove(b"Metadata");
                 doc.trailer_mut().remove(b"Info");
             }
             Hidden::Attachments => {
                 if let Some(n) = names.as_mut() {
                     n.remove(b"EmbeddedFiles");
                 }
-                cat.remove(b"AF");
             }
             Hidden::Bookmarks => {
                 cat.remove(b"Outlines");
@@ -409,9 +512,6 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
                 if let Some(n) = names.as_mut() {
                     n.remove(b"JavaScript");
                 }
-            }
-            Hidden::PrivateData => {
-                cat.remove(b"PieceInfo");
             }
             Hidden::HiddenLayers if !off.is_empty() => {
                 // The off layers leave the configuration (their content is gone already).
@@ -444,6 +544,21 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
     doc.set(root, Object::Dict(cat));
     // What was removed is deleted, so no other referrer keeps it in the saved file.
     crate::retire(doc, &retired)?;
+    // XMP (ISO 32000-2 §14.3.2), associated files (§14.13) and private data (§14.5) may sit on
+    // any dictionary, the catalog and pages included: strip them from every object still
+    // reachable from the catalog rather than from a fixed list.
+    let keys: Vec<&[u8]> = [(Hidden::Metadata, &b"Metadata"[..]), (Hidden::Attachments, b"AF"), (Hidden::PrivateData, b"PieceInfo")]
+        .into_iter()
+        .filter(|(h, _)| which.contains(h))
+        .map(|(_, k)| k)
+        .collect();
+    if !keys.is_empty() {
+        for r in reachable(doc) {
+            if let Some(stripped) = strip_keys(&doc.get(r), &keys, 0) {
+                doc.set(r, stripped);
+            }
+        }
+    }
     if done.is_empty() {
         return Err(RedactError::NothingToApply);
     }

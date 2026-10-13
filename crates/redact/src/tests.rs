@@ -1544,3 +1544,80 @@ fn hidden_and_noview_form_fields_are_removed_with_the_rest() {
         assert_eq!(scan(&saved).into_iter().find(|c| c.0 == Hidden::FormFields), Some((Hidden::FormFields, 0)));
     }
 }
+
+/// Hidden information below the page dictionary: XMP on an image and a form XObject, /PieceInfo
+/// and an associated file on the form, associated files on the page, a structure element and a
+/// kept annotation, with the catalog, page and /Info copies as controls.
+fn below_page_fixture() -> Document {
+    let xmp = |mark: &str| stream("/Type /Metadata /Subtype /XML", mark.as_bytes());
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Metadata 8 0 R /AF [9 0 R] /StructTreeRoot 14 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R /Fm1 6 0 R >> >> /Metadata 10 0 R /PieceInfo << /App << /Private (MARK_PAGE_PIECEINFO) >> >> /AF [11 0 R] /Annots [12 0 R] >>".to_vec(),
+        stream("", b"q 50 0 0 50 20 20 cm /Im1 Do Q /Fm1 Do"),
+        stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Metadata 7 0 R", &[0]),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Metadata 13 0 R /PieceInfo << /App << /Private 16 0 R >> >> /AF [17 0 R]", b""),
+        xmp("MARK_IMG_XMP"),
+        xmp("MARK_CAT_XMP"),
+        b"<< /Type /Filespec /F (cat.txt) /EF << /F 18 0 R >> >>".to_vec(),
+        xmp("MARK_PAGE_XMP"),
+        b"<< /Type /Filespec /F (page.txt) /EF << /F 19 0 R >> >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Square /Rect [10 10 50 50] /AF [20 0 R] >>".to_vec(),
+        xmp("MARK_FORM_XMP"),
+        b"<< /Type /StructTreeRoot /K 15 0 R >>".to_vec(),
+        b"<< /S /Document /P 14 0 R /AF [21 0 R] >>".to_vec(),
+        stream("", b"MARK_FORM_PIECEINFO"),
+        b"<< /Type /Filespec /F (xobj.txt) /EF << /F 22 0 R >> >>".to_vec(),
+        stream("", b"MARK_CAT_AF"),
+        stream("", b"MARK_PAGE_AF"),
+        b"<< /Type /Filespec /F (annot.txt) /EF << /F 23 0 R >> >>".to_vec(),
+        b"<< /Type /Filespec /F (struct.txt) /EF << /F 24 0 R >> >>".to_vec(),
+        stream("", b"MARK_XOBJ_AF"),
+        stream("", b"MARK_ANNOT_AF"),
+        stream("", b"MARK_STRUCT_AF"),
+    ]);
+    let info = doc.add(Object::Dict({
+        let mut d = Dict::new();
+        d.set(b"Title".to_vec(), pdfcraft_cos::PdfString::text("MARK_INFO_TITLE"));
+        d
+    }));
+    doc.trailer_mut().set(b"Info".to_vec(), Object::Ref(info));
+    doc
+}
+
+/// Metadata, Attachments and Private data looked at the trailer, the catalog and the page
+/// dictionaries only, so XMP on XObjects, /PieceInfo on forms and associated files below the
+/// catalog stayed in the saved file, and a document whose only attachments were /AF entries was
+/// reported as having none.
+#[test]
+fn metadata_private_data_and_associated_files_below_the_page_are_removed() {
+    use crate::sanitize::{Hidden, remove_hidden, sanitize, scan};
+    const XMP: [&[u8]; 5] = [b"MARK_IMG_XMP", b"MARK_FORM_XMP", b"MARK_CAT_XMP", b"MARK_PAGE_XMP", b"MARK_INFO_TITLE"];
+    const AF: [&[u8]; 5] = [b"MARK_CAT_AF", b"MARK_PAGE_AF", b"MARK_XOBJ_AF", b"MARK_ANNOT_AF", b"MARK_STRUCT_AF"];
+    const PIECE: [&[u8]; 2] = [b"MARK_FORM_PIECEINFO", b"MARK_PAGE_PIECEINFO"];
+    let check = |doc: &Document, gone: &[&[u8]], kept: &[&[u8]], what: &str| {
+        for m in gone {
+            assert!(!saved_contains(doc, m), "{} survived {what}", String::from_utf8_lossy(m));
+        }
+        for m in kept {
+            assert!(saved_contains(doc, m), "{} was removed by {what}", String::from_utf8_lossy(m));
+        }
+    };
+    let mut doc = below_page_fixture();
+    remove_hidden(&mut doc, &[Hidden::Metadata]).unwrap();
+    check(&doc, &XMP, &[AF[0], PIECE[0]], "Metadata");
+    let mut doc = below_page_fixture();
+    remove_hidden(&mut doc, &[Hidden::Attachments]).unwrap();
+    check(&doc, &AF, &[XMP[0], PIECE[0]], "Attachments");
+    let mut doc = below_page_fixture();
+    remove_hidden(&mut doc, &[Hidden::PrivateData]).unwrap();
+    check(&doc, &PIECE, &[XMP[0], AF[0]], "Private data");
+    let mut doc = below_page_fixture();
+    sanitize(&mut doc).unwrap();
+    check(&doc, &[XMP.as_slice(), &AF, &PIECE].concat(), &[], "Sanitize");
+    // The scan counts the same locations, so the dialog offers the category.
+    let counts: std::collections::HashMap<Hidden, usize> = scan(&below_page_fixture()).into_iter().collect();
+    assert_eq!(counts[&Hidden::Metadata], 1 + 4, "the Info entry and four XMP streams");
+    assert_eq!(counts[&Hidden::Attachments], 5, "five associated files");
+    assert_eq!(counts[&Hidden::PrivateData], 2, "the page's and the form's");
+}

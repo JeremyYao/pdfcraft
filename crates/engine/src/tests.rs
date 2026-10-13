@@ -2421,6 +2421,48 @@ fn comment_summary_includes_replies_to_replies() {
     assert!(text.contains("        NESTED_REPLY"), "the nested reply is indented under its parent: {text}");
 }
 
+/// `/NM` values come from the document and need not be unique. When replies at each level share
+/// one name, the summary used to re-select the same replies at every recursion level, writing
+/// 2^(levels+1)-2 reply lines and growing without bound until the process was OOM-killed. Each
+/// reply must now appear once, so the summary is bounded by the number of replies.
+#[test]
+fn comment_summary_bounds_replies_that_reuse_names() {
+    fn ann(name: &str, irt: Option<&str>, contents: &str) -> pdfcraft_render::Annotation {
+        pdfcraft_render::Annotation {
+            page: 0,
+            subtype: "Text".into(),
+            author: Some("A".into()),
+            contents: Some(contents.into()),
+            modified: None,
+            name: Some(name.into()),
+            in_reply_to: irt.map(str::to_string),
+            rect: [0.0; 4],
+            color: None,
+            index: 0,
+            state: None,
+            quads: Vec::new(),
+            locked: false,
+            intent: None,
+            fill_sign: false,
+        }
+    }
+    // A top comment, then `levels` levels of two replies each. The two replies of a level share one
+    // `/NM`, and the next level replies to that shared name: a finite tree, but one on which the
+    // old recursion did 2^(levels+1)-2 visits.
+    let levels = 16;
+    let mut all = vec![ann("T", None, "top")];
+    for k in 0..levels {
+        let name = format!("N{k}");
+        let parent = if k == 0 { "T".to_string() } else { format!("N{}", k - 1) };
+        all.push(ann(&name, Some(&parent), "r"));
+        all.push(ann(&name, Some(&parent), "r"));
+    }
+    let text = comment_summary("doc.pdf", &all, SummarySort::Page);
+    let reply_lines = text.matches("Subject: Reply").count();
+    // Each of the 2*levels reply annotations appears exactly once.
+    assert_eq!(reply_lines, 2 * levels, "every reply is summarized once, whatever names repeat");
+}
+
 #[test]
 fn reading_colors_set_and_invalidated() {
     let (mut s, id) = session_with(1);

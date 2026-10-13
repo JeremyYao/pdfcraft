@@ -5656,8 +5656,8 @@ milestone = "M8"
 status = "shipped"
 commands = ["redact.apply"]
 tools = ["redact_apply"]
-evidence = ["crates/ui-egui/tests/ui_group/redact.rs::marking_applying_and_clearing", "crates/engine/src/tests.rs::redaction_marks_apply_for_good_and_undo", "crates/automation/tests/automation.rs::redacting_through_tools", "crates/engine/src/tests.rs::redaction_is_refused_when_the_page_still_shows_text_under_a_mark", "crates/redact/src/tests.rs::redacted_xobjects_do_not_survive_through_inherited_or_shared_resources"]
-notes = "confirmation; one undo step; next save is a full rewrite. Refused, with nothing changed, when the page still shows text under a mark afterwards: text whose font is set through an ExtGState or taken by a form from its caller, some predefined CMaps and rotated Type 3 fonts are not removed yet, so those documents cannot be redacted. Removed images and forms are unlinked from page-tree resources (own, inherited or shared), not yet from a form's own resources, annotation appearances or patterns"
+evidence = ["crates/ui-egui/tests/ui_group/redact.rs::marking_applying_and_clearing", "crates/engine/src/tests.rs::redaction_marks_apply_for_good_and_undo", "crates/automation/tests/automation.rs::redacting_through_tools", "crates/engine/src/tests.rs::redaction_is_refused_when_the_page_still_shows_text_under_a_mark", "crates/redact/src/tests.rs::redacted_xobjects_do_not_survive_through_inherited_or_shared_resources", "crates/redact/src/tests.rs::the_original_of_a_bare_form_does_not_survive_through_its_copys_resources"]
+notes = "confirmation; one undo step; next save is a full rewrite. Refused, with nothing changed, when the page still shows text under a mark afterwards: text whose font is set through an ExtGState or taken by a form from its caller, some predefined CMaps and rotated Type 3 fonts are not removed yet, so those documents cannot be redacted. Removed images and forms are unlinked from page-tree resources (own, inherited or shared) and from the rewritten copies of forms without resources of their own, not yet from a form's own resources, annotation appearances or patterns"
 
 [[feature]]
 id = "protect.redact-glyph-removal"
@@ -6068,8 +6068,8 @@ milestone = "M9"
 status = "shipped"
 commands = ["sign.certify"]
 tools = ["sign_document"]
-evidence = ["crates/sign/tests/pdf.rs::later_changes_are_classified_under_the_signature_permissions"]
-notes = "DocMDP P=1/2/3 enforced when validating"
+evidence = ["crates/sign/tests/pdf.rs::later_changes_are_classified_under_the_signature_permissions", "crates/sign/tests/pdf.rs::an_object_body_after_the_signed_revision_that_no_entry_locates_is_a_change", "crates/sign/tests/pdf.rs::objects_freed_after_signing_are_classified_by_what_they_were", "crates/sign/tests/pdf.rs::trailer_changes_after_signing_are_changes"]
+notes = "DocMDP P=1/2/3 enforced when validating. A later revision is also a change when the page renderer could read it differently from the validator (cross-reference entries set aside or read differently elsewhere, an object body no entry locates, a trailer that repoints /Root, changes /Encrypt or replaces /ID) and when it frees a signed object (judged by what the object was: a freed comment is a comment). Not yet: signature discovery starts from the current catalog, so a repointed /Root without an /AcroForm lists no signature rather than an invalid one; FieldMDP locks"
 
 [[feature]]
 id = "sign.field-mdp"

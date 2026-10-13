@@ -756,14 +756,15 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
                 if imprint != t.imprint {
                     info.details.push(Detail::plain("The signature's timestamp token does not cover the signature value."));
                 } else {
-                    // Only a token from a trusted authority (valid when it stamped) is trusted
-                    // time; otherwise its time is reported but validation uses the signer's
-                    // own claimed time, as without a timestamp.
+                    // Only a token from a trusted authority (valid when it stamped, and issued
+                    // for timestamping: a certificate trusted for signing is not thereby a time
+                    // authority) is trusted time; otherwise its time is reported but validation
+                    // uses the signer's own claimed time, as without a timestamp.
                     let mut pool = crate::timestamp::token_certs(raw);
                     pool.extend(trust.certs.iter().cloned());
-                    let trusted_tsa = t
-                        .signer_certificate()
-                        .is_some_and(|c| c.valid_at(t.gen_time) && build_chain(&c, &pool, Some(t.gen_time)).iter().any(|x| trust.trusts(x)));
+                    let trusted_tsa = t.signer_certificate().is_some_and(|c| {
+                        c.valid_at(t.gen_time) && c.may_timestamp() && build_chain(&c, &pool, Some(t.gen_time)).iter().any(|x| trust.trusts(x))
+                    });
                     if trusted_tsa {
                         info.timestamp_time = Some(t.gen_time);
                     } else {
@@ -1062,7 +1063,11 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
         // A trusted authority whose certificate was not valid at the time it stamped proves
         // nothing either (its detail is already recorded above): never upgrade that to Valid.
         let in_validity = token.signer_certificate().is_some_and(|c| c.valid_at(token.gen_time));
-        let trusted_tsa = token.signer_certificate().is_some_and(|c| build_chain(&c, &pool, Some(token.gen_time)).iter().any(|x| trust.trusts(x)));
+        // Trusted as a time authority: chained to the trust store and issued for timestamping.
+        // Without the purpose, the certificate is as good as absent from the list.
+        let trusted_tsa = token
+            .signer_certificate()
+            .is_some_and(|c| c.may_timestamp() && build_chain(&c, &pool, Some(token.gen_time)).iter().any(|x| trust.trusts(x)));
         if trusted_tsa && in_validity {
             info.status = Status::Valid;
             info.details.push(Detail::plain("The timestamp token is valid and its authority is trusted."));

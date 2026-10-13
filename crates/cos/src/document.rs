@@ -592,14 +592,23 @@ impl Document {
         self.entries.get(&num).cloned()
     }
 
-    /// Cross-reference entries this reader did not take at face value, as (byte offset of the
-    /// section, object number): an in-use entry at offset 0, a second and different entry for
-    /// one object in the same section, a reserved cross-reference stream entry type, or a
-    /// hybrid /XRefStm entry that disagrees with the table. The reader sets such an entry aside
-    /// and keeps what it already had for the object. Another reader, the page renderer among
-    /// them, may follow it instead, so the two can then show different objects for one number.
-    /// Code that compares revisions (signature validation) must not call such an object
-    /// unchanged.
+    /// Cross-reference entries this reader did not take at face value, or that another reader
+    /// reads differently, as (byte offset of the section, object number):
+    /// - an in-use entry at offset 0, a second and different entry for one object in the same
+    ///   section, a reserved cross-reference stream entry type, or a hybrid /XRefStm entry that
+    ///   disagrees with the table: set aside, the reader keeps what it already had;
+    /// - a classic entry whose offset does not fit 32 bits: set aside as well (a reader that
+    ///   parses the fixed 10-digit field into a 32-bit number gives up on the whole table);
+    /// - a classic entry not in the fixed 20-byte form, a cross-reference stream row whose type
+    ///   field is not one byte wide, or a row the stream's data does not hold: kept, but a reader
+    ///   that counts bytes reads another entry there;
+    /// - an entry a hybrid file's cross-reference stream reaches through its own /Prev chain
+    ///   that differs from what this reader resolved (the table's /Prev is the chain, §7.5.8.4;
+    ///   a reader that follows the stream's instead resolves the object differently).
+    ///
+    /// The page renderer is such another reader, so the two can show different objects for one
+    /// number. Code that compares revisions (signature validation) must not call such an object
+    /// unchanged. At most 1024 are kept per section.
     pub fn xref_oddities(&self) -> &[(u64, u32)] {
         &self.xref_oddities
     }
@@ -999,6 +1008,9 @@ impl Document {
         let mut trailer: Option<Dict> = None;
         let mut revisions = Vec::new();
         let mut oddities = Vec::new();
+        // What each hybrid section's cross-reference stream reaches through its own /Prev where
+        // the table leaves the object free or out: compared with the final resolution below.
+        let mut hybrid_prev: Vec<(u64, Vec<(u32, XrefEntry)>)> = Vec::new();
         let mut visited = HashSet::new();
         let mut next = Some(first);
         while let Some(off) = next.take() {
@@ -1032,16 +1044,29 @@ impl Document {
             if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
                 let mut stm = BTreeMap::new();
                 match self.read_section(x as usize, &mut stm, &mut odd) {
-                    Ok(_) => {
+                    Ok((stm_dict, _)) => {
                         for (num, e) in stm {
                             match sect.get(&num) {
                                 None | Some(XrefEntry::Free { .. }) => {
                                     sect.insert(num, e);
                                 }
                                 // The table already places the object somewhere else.
-                                Some(old) if *old != e => odd.push(num),
+                                Some(old) if *old != e => note(&mut odd, num),
                                 Some(_) => {}
                             }
+                        }
+                        // The chain continues with the table's /Prev. A reader that follows
+                        // the stream's own /Prev instead takes what it reaches for every
+                        // object the table and the stream leave free or out.
+                        if let Some(p) = stm_dict.int(b"Prev").filter(|p| *p >= 0) {
+                            let in_use = |e: &XrefEntry| !matches!(e, XrefEntry::Free { .. });
+                            let reached: Vec<(u32, XrefEntry)> = self
+                                .hybrid_prev_entries(p as u64)
+                                .into_iter()
+                                .filter(|(num, e)| in_use(e) && !sect.get(num).is_some_and(in_use))
+                                .take(ODDITIES_PER_SECTION)
+                                .collect();
+                            hybrid_prev.push((off, reached));
                         }
                     }
                     Err(e) => log.push(format!("hybrid /XRefStm at {x} unreadable: {e}")),
@@ -1056,6 +1081,9 @@ impl Document {
                 trailer = Some(sect_trailer);
             }
         }
+        for (off, reached) in hybrid_prev {
+            oddities.extend(reached.into_iter().filter(|(num, e)| entries.get(num) != Some(e)).map(|(num, _)| (off, num)));
+        }
         revisions.reverse();
         let mut trailer = trailer.ok_or(CosError::Syntax { offset: 0, detail: "no trailer".into() })?;
         for k in [&b"Prev"[..], b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"] {
@@ -1064,8 +1092,31 @@ impl Document {
         Ok((entries, trailer, revisions, oddities))
     }
 
+    /// The entries the cross-reference stream of a hybrid file reaches through its own /Prev
+    /// chain (newest first; an older section only fills what a newer one left out). This reader
+    /// follows the table's /Prev instead (§7.5.8.4): what is read here only tells what another
+    /// reader would resolve. A loop or an unreadable section ends the walk.
+    fn hybrid_prev_entries(&self, start: u64) -> BTreeMap<u32, XrefEntry> {
+        let mut out = BTreeMap::new();
+        let mut visited = HashSet::new();
+        let mut next = Some(start);
+        while let Some(off) = next.take() {
+            if !visited.insert(off) || visited.len() > 10_000 {
+                break;
+            }
+            let (mut sect, mut odd) = (BTreeMap::new(), Vec::new());
+            let Ok((dict, _)) = self.read_section(off as usize, &mut sect, &mut odd) else { break };
+            for (num, e) in sect {
+                out.entry(num).or_insert(e);
+            }
+            next = dict.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
+        }
+        out
+    }
+
     /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
-    /// collects the object numbers whose entry here is set aside ([`Self::xref_oddities`]).
+    /// collects the object numbers whose entry here is set aside or read differently by another
+    /// reader ([`Self::xref_oddities`]).
     fn read_section(&self, off: usize, entries: &mut BTreeMap<u32, XrefEntry>, odd: &mut Vec<u32>) -> Result<(Dict, bool), CosError> {
         let data = &self.data;
         let mut lx = Lexer::new(data, off);
@@ -1098,16 +1149,32 @@ impl Document {
                         (b"f", _) => XrefEntry::Free { next_generation: generation },
                         _ => return Err(CosError::Syntax { offset: lx.pos, detail: "bad xref entry".into() }),
                     };
+                    // An entry is 20 bytes (§7.5.4): a 10-digit offset, a 5-digit generation,
+                    // the keyword and a 2-byte end. This reader takes the tokens as they come; a
+                    // reader that counts bytes reads something else from any other form.
+                    let fixed_form = o.len() == 10
+                        && g.len() == 5
+                        && matches!((data.get(lx.pos), data.get(lx.pos + 1)), (Some(b' '), Some(b'\n' | b'\r')) | (Some(b'\r'), Some(b'\n')));
+                    if !fixed_form {
+                        note(odd, num);
+                    }
                     // Offset 0 "in use" entries are a known producer bug: ignore them. (Object 0
                     // is never a real object, so its entry cannot mislead anyone.)
                     if matches!(entry, XrefEntry::InFile { offset: 0, .. }) {
                         if num != 0 {
-                            odd.push(num);
+                            note(odd, num);
                         }
                         continue;
                     }
+                    // The 10-digit field holds offsets a 32-bit reader cannot: that reader gives
+                    // up on the whole table where this one would keep an entry no object can be
+                    // at. Set aside, so the two never quietly resolve the file differently.
+                    if matches!(entry, XrefEntry::InFile { offset, .. } if offset > u64::from(u32::MAX)) {
+                        note(odd, num);
+                        continue;
+                    }
                     if *entries.entry(num).or_insert(entry) != entry {
-                        odd.push(num);
+                        note(odd, num);
                     }
                 }
             }
@@ -1147,35 +1214,45 @@ impl Document {
             r[from..from + len].iter().fold(0u64, |acc, b| acc << 8 | *b as u64)
         };
         let mut rows = raw.chunks_exact(row);
+        // A reader that takes the type as one byte whatever /W says reads other rows here.
+        let odd_type_width = w[0] != 1;
         for pair in index.chunks(2) {
             let [start, count] = pair else { break };
             if !valid_xref_range(*start, *count) {
                 return Err(CosError::Syntax { offset: off, detail: "invalid xref object range".into() });
             }
             for i in 0..*count {
-                let Some(r) = rows.next() else { break };
+                let num = (*start + i) as u32;
+                // A row /Index declares but the data does not hold: another reader may refuse
+                // the whole section for it.
+                let Some(r) = rows.next() else {
+                    note(odd, num);
+                    break;
+                };
+                if odd_type_width {
+                    note(odd, num);
+                }
                 let t = field(r, 0, w[0], 1);
                 let a = field(r, w[0], w[1], 0);
                 let b = field(r, w[0] + w[1], w[2], 0);
-                let num = (*start + i) as u32;
                 let entry = match t {
                     0 => XrefEntry::Free { next_generation: b.min(u16::MAX as u64) as u16 },
                     1 => XrefEntry::InFile { offset: a, generation: b.min(u16::MAX as u64) as u16 },
                     2 => XrefEntry::InStream { stream: a.min(u32::MAX as u64) as u32, index: b.min(u32::MAX as u64) as u32 },
                     // Reserved types are treated as null references (§7.5.8.3).
                     _ => {
-                        odd.push(num);
+                        note(odd, num);
                         continue;
                     }
                 };
                 if matches!(entry, XrefEntry::InFile { offset: 0, .. }) {
                     if num != 0 {
-                        odd.push(num);
+                        note(odd, num);
                     }
                     continue;
                 }
                 if *entries.entry(num).or_insert(entry) != entry {
-                    odd.push(num);
+                    note(odd, num);
                 }
             }
         }
@@ -1302,6 +1379,17 @@ fn valid_xref_range(start: i64, count: i64) -> bool {
 /// The most indirect objects a document can have (the classic implementation limit, ISO
 /// 32000-1 Annex C): it bounds how much data a cross-reference stream can hold.
 const MAX_XREF_OBJECTS: usize = 8_388_607;
+
+/// How many entries one section can add to [`Document::xref_oddities`]: one is enough to tell
+/// that the section is read differently elsewhere, and a section can declare millions.
+const ODDITIES_PER_SECTION: usize = 1024;
+
+/// Record `num` among a section's oddities, up to [`ODDITIES_PER_SECTION`].
+fn note(odd: &mut Vec<u32>, num: u32) {
+    if odd.len() < ODDITIES_PER_SECTION {
+        odd.push(num);
+    }
+}
 
 #[cfg(test)]
 mod tests {

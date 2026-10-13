@@ -117,26 +117,7 @@ impl<'a> Scope<'a> {
 
     /// Is this optional-content reference (an OCG or OCMD) hidden?
     fn layer_hidden(&self, doc: &Document, o: &Object) -> bool {
-        if self.hidden_layers.is_empty() {
-            return false;
-        }
-        if let Some(r) = o.as_ref()
-            && self.hidden_layers.contains(&r)
-        {
-            return true;
-        }
-        // A membership dictionary (default policy AnyOn): hidden when all its groups are.
-        let d = doc.resolve(o);
-        let Some(d) = d.as_dict() else { return false };
-        if d.name(b"Type") != Some(b"OCMD") {
-            return false;
-        }
-        let groups: Vec<ObjRef> = match d.get(b"OCGs").map(|g| (*doc.resolve(g)).clone()) {
-            Some(Object::Array(a)) => a.iter().filter_map(Object::as_ref).collect(),
-            Some(_) => d.get(b"OCGs").and_then(Object::as_ref).into_iter().collect(),
-            None => Vec::new(),
-        };
-        !groups.is_empty() && groups.iter().all(|g| self.hidden_layers.contains(g))
+        layer_hidden(doc, &self.hidden_layers, o)
     }
 
     fn hits(&self, b: [f64; 4]) -> bool {
@@ -167,6 +148,30 @@ impl<'a> Scope<'a> {
 
 fn res_dict(doc: &Document, res: &Dict, key: &[u8]) -> Dict {
     res.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default()
+}
+
+/// Is this optional-content reference (an OCG or OCMD) one of the `hidden` layers?
+fn layer_hidden(doc: &Document, hidden: &[ObjRef], o: &Object) -> bool {
+    if hidden.is_empty() {
+        return false;
+    }
+    if let Some(r) = o.as_ref()
+        && hidden.contains(&r)
+    {
+        return true;
+    }
+    // A membership dictionary (default policy AnyOn): hidden when all its groups are.
+    let d = doc.resolve(o);
+    let Some(d) = d.as_dict() else { return false };
+    if d.name(b"Type") != Some(b"OCMD") {
+        return false;
+    }
+    let groups: Vec<ObjRef> = match d.get(b"OCGs").map(|g| (*doc.resolve(g)).clone()) {
+        Some(Object::Array(a)) => a.iter().filter_map(Object::as_ref).collect(),
+        Some(_) => d.get(b"OCGs").and_then(Object::as_ref).into_iter().collect(),
+        None => Vec::new(),
+    };
+    !groups.is_empty() && groups.iter().all(|g| hidden.contains(g))
 }
 
 /// Does this font write vertically? Only a Type0 (composite) font can: its `/Encoding` is a
@@ -416,11 +421,19 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
     out.unreadable |= parsed.unterminated_inline_image;
     if !scope.hidden_layers.is_empty() {
         let props = res_dict(doc, resources, b"Properties");
-        let (kept, removed) = strip_hidden_layers(doc, scope, parsed.ops, &props);
+        let (kept, removed, dropped) = strip_hidden_layers(doc, scope, parsed.ops, &props);
         parsed.ops = kept;
         if removed > 0 {
             scope.layer_blocks += removed;
             forced_change = true;
+        }
+        // The XObjects the removed blocks drew: unlinked by the caller unless a surviving `Do`
+        // still draws them, so their bytes do not stay reachable in the saved file.
+        for name in dropped {
+            if let Some(r) = xobjects.get(&name).and_then(Object::as_ref) {
+                out.doomed.push(r);
+            }
+            out.replaced.push(name);
         }
     }
     let mut pieces: Vec<Vec<Op>> = streams.iter().map(|_| Vec::new()).collect();
@@ -861,8 +874,9 @@ fn xobject(
             dict.remove(b"Length");
             // Rebuild the copy's /Resources whenever inner content gained or lost an XObject, so a
             // `Do` the copy no longer makes stops keeping the original image or form reachable.
+            let mut res = res;
+            let mut rebuilt = false;
             if !inner.xobjects.is_empty() || !inner.replaced.is_empty() {
-                let mut res = res.clone();
                 let mut xo = res_dict(doc, &res, b"XObject");
                 if let Some(d) = &new_data {
                     prune(&mut xo, &inner.replaced, std::slice::from_ref(d));
@@ -871,7 +885,22 @@ fn xobject(
                     xo.set(n.clone(), Object::Ref(*r));
                 }
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
-                dict.set(b"Resources".to_vec(), Object::Dict(res));
+                rebuilt = true;
+            }
+            // Likewise the property lists of the hidden layers whose blocks went.
+            if let Some(d) = &new_data
+                && !scope.hidden_layers.is_empty()
+            {
+                let mut pr = res_dict(doc, &res, b"Properties");
+                let before = pr.len();
+                prune_properties(doc, &scope.hidden_layers, &mut pr, std::slice::from_ref(d));
+                if pr.len() != before {
+                    res.set(b"Properties".to_vec(), Object::Dict(pr));
+                    rebuilt = true;
+                }
+            }
+            if rebuilt {
+                dict.set(b"Resources".to_vec(), Object::Dict(res.clone()));
             }
             let (changed, empty) = tags::touched(doc, &res, &data, new_data.as_deref().unwrap_or(&data));
             let stream = match new_data {
@@ -893,12 +922,14 @@ fn xobject(
 }
 
 /// Remove marked-content blocks of hidden layers (`/OC /name BDC … EMC`, nested blocks
-/// included). Returns the remaining operators and how many blocks went.
-fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &Dict) -> (Vec<Op>, usize) {
+/// included). Returns the remaining operators, how many blocks went, and the XObject names of
+/// the `Do` operators that went with them.
+fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &Dict) -> (Vec<Op>, usize, Vec<Vec<u8>>) {
     let mut out = Vec::with_capacity(ops.len());
     // For each open marked-content block: does it hide its contents?
     let mut stack: Vec<bool> = Vec::new();
     let mut removed = 0;
+    let mut dropped: Vec<Vec<u8>> = Vec::new();
     for op in ops {
         let hidden_now = stack.last().copied().unwrap_or(false);
         match op.op.as_slice() {
@@ -927,9 +958,36 @@ fn strip_hidden_layers(doc: &Document, scope: &Scope<'_>, ops: Vec<Op>, props: &
             _ => {
                 if !hidden_now {
                     out.push(op);
+                } else if op.is("Do")
+                    && let Some(n) = op.name(0)
+                    && !dropped.iter().any(|d| d == n)
+                {
+                    dropped.push(n.to_vec());
                 }
             }
         }
     }
-    (out, removed)
+    (out, removed, dropped)
+}
+
+/// Drop the `/Properties` entries that name a hidden layer (an off OCG, or an OCMD all of whose
+/// groups are off) once no surviving `BDC` in `content` names them, so the group dictionary and
+/// its name leave the file with the content it hid. Entries a surviving `BDC` still names are
+/// kept (a block that was not hidden can name the same property list).
+pub(crate) fn prune_properties(doc: &Document, hidden_layers: &[ObjRef], props: &mut Dict, content: &[Vec<u8>]) {
+    if hidden_layers.is_empty() {
+        return;
+    }
+    let hidden: Vec<Vec<u8>> = props.iter().filter(|(_, v)| layer_hidden(doc, hidden_layers, v)).map(|(n, _)| n.to_vec()).collect();
+    if hidden.is_empty() {
+        return;
+    }
+    let joined = Pieces::join(content);
+    let ops = joined.parse().ops;
+    let still_named = |n: &[u8]| ops.iter().any(|op| op.is("BDC") && op.operands.get(1).and_then(Object::as_name) == Some(n));
+    for n in hidden {
+        if !still_named(&n) {
+            props.remove(&n);
+        }
+    }
 }

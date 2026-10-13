@@ -1351,3 +1351,70 @@ fn annotations_written_directly_in_annots_are_removed_under_a_mark() {
         .collect();
     assert_eq!(kept, ["Square"], "only the far square stays");
 }
+
+// ── Audit run 4, medium findings (hidden information / sanitize) ─────────────────────────────
+
+/// An off layer stored as a marked-content block (`/OC /L1 BDC … EMC`) that draws an image and a
+/// form XObject: the block goes, but nothing unlinked the XObjects it alone drew, so the full
+/// rewrite on save wrote their bytes (and the layer's name) into the sanitized file.
+fn off_layer_block_fixture() -> Document {
+    pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] /Order [6 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /ImOC 7 0 R /ImB 8 0 R /FmB 9 0 R >> /Properties << /L1 6 0 R >> >> >>".to_vec(),
+        stream(
+            "",
+            b"BT /F1 12 Tf 20 20 Td (PUBLIC) Tj ET q 50 0 0 50 20 100 cm /ImOC Do Q /OC /L1 BDC BT /F1 12 Tf 20 60 Td (LAYERBLOCKTEXT) Tj ET q 50 0 0 50 100 100 cm /ImB Do Q /FmB Do EMC",
+        ),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        b"<< /Type /OCG /Name (SECRETLAYERNAME) >>".to_vec(),
+        stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /OC 6 0 R", b"LAYEROCIMAGEBYTE"),
+        stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"LAYERBLOCKIMAGEB"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 5 0 R >> >>", b"BT /F1 10 Tf 20 230 Td (LAYERBLOCKFORMTEXT) Tj ET"),
+    ])
+}
+
+#[test]
+fn off_layer_blocks_take_the_images_and_forms_they_draw_with_them() {
+    use crate::sanitize::{Hidden, remove_hidden, sanitize};
+    for all in [false, true] {
+        let mut doc = off_layer_block_fixture();
+        let done = if all { sanitize(&mut doc).unwrap() } else { remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap() };
+        assert!(done.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{done:?}");
+        let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"PUBLIC"), "the visible text stays (sanitize: {all})");
+        for secret in [&b"LAYERBLOCKTEXT"[..], b"LAYEROCIMAGEBYTE", b"LAYERBLOCKIMAGEB", b"LAYERBLOCKFORMTEXT", b"SECRETLAYERNAME"] {
+            assert!(!has(secret), "{} survived the save (sanitize: {all})", String::from_utf8_lossy(secret));
+        }
+        let saved = Document::open(Arc::new(bytes)).unwrap();
+        for name in [&b"ImOC"[..], b"ImB", b"FmB"] {
+            assert_eq!(named_image(&saved, 0, name), None, "/{} is still named by the page (sanitize: {all})", String::from_utf8_lossy(name));
+        }
+    }
+}
+
+/// The same block inside a form XObject, drawing an image through the form's own resources.
+#[test]
+fn off_layer_blocks_inside_a_form_take_their_images_with_them() {
+    use crate::sanitize::{Hidden, remove_hidden};
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [5 0 R] /D << /OFF [5 0 R] >> >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /Fm 6 0 R >> >> >>".to_vec(),
+        stream("", b"/Fm Do"),
+        b"<< /Type /OCG /Name (SECRETLAYERNAME) >>".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /XObject << /ImB 7 0 R /ImKeep 8 0 R >> /Properties << /L1 5 0 R >> >>",
+            b"q 50 0 0 50 20 20 cm /ImKeep Do Q /OC /L1 BDC q 50 0 0 50 100 100 cm /ImB Do Q EMC",
+        ),
+        stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"LAYERBLOCKIMAGEB"),
+        stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"PUBIMGKEEPSURVIV"),
+    ]);
+    remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    assert!(has(b"PUBIMGKEEPSURVIV"), "the image drawn outside the block stays");
+    assert!(!has(b"LAYERBLOCKIMAGEB"), "the image the off layer's block drew inside the form survived the save");
+    assert!(!has(b"SECRETLAYERNAME"), "the off layer's name survived the save");
+}

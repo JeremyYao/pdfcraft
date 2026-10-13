@@ -185,22 +185,32 @@ fn content_pass(doc: &mut Document, text: bool, layers: bool, write: bool) -> Re
         }
         if changed || !out.xobjects.is_empty() || !out.replaced.is_empty() {
             let mut res = resources;
+            let page_content: Vec<Vec<u8>> = new_list
+                .iter()
+                .map(|o| match &*doc.resolve(o) {
+                    Object::Stream(s) => s.decoded().unwrap_or_default(),
+                    _ => Vec::new(),
+                })
+                .collect();
             if !out.xobjects.is_empty() || !out.replaced.is_empty() {
                 let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
                 // A full save keeps whatever is still referenced: unlink the originals this page no
                 // longer draws so the removed form or image bytes cannot survive in the saved file.
-                let page_content: Vec<Vec<u8>> = new_list
-                    .iter()
-                    .map(|o| match &*doc.resolve(o) {
-                        Object::Stream(s) => s.decoded().unwrap_or_default(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
                 crate::interp::prune(&mut xo, &out.replaced, &page_content);
                 for (n, r) in &out.xobjects {
                     xo.set(n.clone(), Object::Ref(*r));
                 }
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
+            }
+            if layers {
+                // The off layers' property lists go with their blocks, so the group dictionaries
+                // (and their names) stop being reachable through the page.
+                let mut pr = res.get(b"Properties").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
+                let before = pr.len();
+                crate::interp::prune_properties(doc, &off, &mut pr, &page_content);
+                if pr.len() != before {
+                    res.set(b"Properties".to_vec(), Object::Dict(pr));
+                }
             }
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));

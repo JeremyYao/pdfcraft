@@ -2100,3 +2100,183 @@ fn defining_an_object_the_signed_page_already_named_is_a_change() {
         assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")), "{certify:?}: {:?}", s.modification);
     }
 }
+
+/// A form with an unsigned signature field (object 6, with `lock` in its dictionary) and a text
+/// field "Amount" (object 7): what a signature permits to change afterwards is judged by what
+/// changed, not by a dictionary's /Subtype or /FT.
+fn fixture_with_text_field(lock: &str) -> Vec<u8> {
+    let sig = format!("<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 {lock} >>");
+    build(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R] /DA (/F1 12 Tf 0 g) /DR << /Font << /F1 5 0 R >> >> >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R 7 0 R] >>",
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        sig.as_bytes(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Amount) /V (100) /DA (/F1 12 Tf 0 g) /Rect [10 200 120 220] /P 3 0 R /F 4 >>",
+    ])
+}
+
+/// A widget over the page text, with `extra` entries, added to the page's /Annots and, when
+/// `register`, to the AcroForm's /Fields.
+fn add_widget(doc: &mut Document, extra: Vec<(&str, Object)>, register: bool) -> pdfcraft_cos::ObjRef {
+    let page = pdfcraft_cos::ObjRef { num: 3, generation: 0 };
+    let mut w = pdfcraft_cos::Dict::new();
+    w.set(b"Type".to_vec(), Object::name("Annot"));
+    w.set(b"Subtype".to_vec(), Object::name("Widget"));
+    w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(235), Object::Int(290), Object::Int(275)]));
+    w.set(b"F".to_vec(), Object::Int(4));
+    w.set(b"P".to_vec(), Object::Ref(page));
+    for (k, v) in extra {
+        w.set(k.as_bytes().to_vec(), v);
+    }
+    let w = doc.add(Object::Dict(w));
+    doc.update_dict(page, |p| {
+        if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
+            a.push(Object::Ref(w));
+        }
+    })
+    .unwrap();
+    if register {
+        register_field(doc, w);
+    }
+    w
+}
+
+/// A form XObject painting a white box with other text: what an appearance put over the page
+/// after signing can show.
+fn covering_appearance(doc: &mut Document) -> Object {
+    let mut d = pdfcraft_cos::Dict::new();
+    d.set(b"Type".to_vec(), Object::name("XObject"));
+    d.set(b"Subtype".to_vec(), Object::name("Form"));
+    d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(280), Object::Int(40)]));
+    let s = pdfcraft_cos::Stream::from_raw(d, b"1 1 1 rg 0 0 280 40 re f 0 g 20 10 120 12 re f".to_vec());
+    let ap = doc.add(Object::Stream(s));
+    let mut n = pdfcraft_cos::Dict::new();
+    n.set(b"N".to_vec(), Object::Ref(ap));
+    Object::Dict(n)
+}
+
+fn js_action() -> Object {
+    let mut js = pdfcraft_cos::Dict::new();
+    js.set(b"S".to_vec(), Object::name("JavaScript"));
+    js.set(b"JS".to_vec(), PdfString::text("app.alert('added after certification');"));
+    let mut aa = pdfcraft_cos::Dict::new();
+    aa.set(b"Fo".to_vec(), Object::Dict(js));
+    Object::Dict(aa)
+}
+
+/// After certifying, a new field or widget is annotation creation (permitted only where
+/// comments are), and a change to an existing field's actions, position or flags is no form
+/// fill at all; only its value, and what is regenerated from the value, is.
+#[test]
+fn changes_to_fields_after_signing_are_judged_by_what_changed() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
+    let sig_field = pdfcraft_cos::ObjRef { num: 6, generation: 0 };
+    let amount = pdfcraft_cos::ObjRef { num: 7, generation: 0 };
+    type Attack = (&'static str, &'static str, Box<dyn Fn(&mut Document)>);
+    let attacks: Vec<Attack> = vec![
+        (
+            "a new text field",
+            "comments",
+            Box::new(move |doc| {
+                add_widget(doc, vec![("FT", Object::name("Tx")), ("T", PdfString::text("Injected").into())], true);
+            }),
+        ),
+        (
+            "a new widget with an appearance over the text",
+            "comments",
+            Box::new(move |doc| {
+                let ap = covering_appearance(doc);
+                add_widget(doc, vec![("AP", ap)], false);
+            }),
+        ),
+        (
+            "an action on the signature widget",
+            "other changes",
+            Box::new(move |doc| {
+                doc.update_dict(sig_field, |d| d.set(b"AA".to_vec(), js_action())).unwrap();
+            }),
+        ),
+        (
+            "an action on the text field",
+            "other changes",
+            Box::new(move |doc| {
+                doc.update_dict(amount, |d| d.set(b"AA".to_vec(), js_action())).unwrap();
+            }),
+        ),
+        (
+            "the text field moved and hidden",
+            "other changes",
+            Box::new(move |doc| {
+                doc.update_dict(amount, |d| {
+                    d.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(235), Object::Int(290), Object::Int(275)]));
+                    d.set(b"F".to_vec(), Object::Int(0));
+                })
+                .unwrap();
+            }),
+        ),
+    ];
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture_with_text_field("")), &id, &SignOptions { certify, ..opts() }).unwrap();
+        assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
+        for (name, kind, attack) in &attacks {
+            let s = check(&edit_after(&signed, attack));
+            let permitted = *kind == "comments" && matches!(certify, None | Some(3));
+            if permitted {
+                assert_eq!(s.status, Status::Valid, "{certify:?}, {name}: {:?} {:?}", s.modification, s.details);
+                assert!(matches!(&s.modification, Modification::Allowed(k) if k.contains(kind)), "{certify:?}, {name}: {:?}", s.modification);
+            } else {
+                assert_eq!(s.status, Status::Invalid, "{certify:?}, {name}: {:?} {:?}", s.modification, s.details);
+                assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(kind)), "{certify:?}, {name}: {:?}", s.modification);
+            }
+        }
+        // The control: a value filled in is form fill, permitted from P=2 up.
+        let s = check(&edit_after(&signed, |doc| doc.update_dict(amount, |d| d.set(b"V".to_vec(), PdfString::text("250"))).unwrap()));
+        match certify {
+            Some(1) => assert_eq!(s.status, Status::Invalid, "{:?}", s.details),
+            _ => {
+                assert_eq!(s.status, Status::Valid, "{certify:?}: {:?} {:?}", s.modification, s.details);
+                assert_eq!(s.modification, Modification::Allowed(vec![kind::FORM_FILL]), "{certify:?}");
+            }
+        }
+    }
+}
+
+/// An unsigned signature field added after certifying is a new annotation, not a signature,
+/// whatever its appearance shows; under P=1 the one signature change permitted is a document
+/// timestamp.
+#[test]
+fn an_unsigned_signature_field_added_after_certifying_is_not_a_signature() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify, ..opts() }).unwrap();
+        let edited = edit_after(&signed, |doc| {
+            let ap = covering_appearance(doc);
+            add_widget(doc, vec![("FT", Object::name("Sig")), ("T", PdfString::text("Witness").into()), ("AP", ap)], true);
+        });
+        let s = check(&edited);
+        match certify {
+            None | Some(3) => {
+                assert_eq!(s.status, Status::Valid, "{certify:?}: {:?} {:?}", s.modification, s.details);
+                assert!(matches!(&s.modification, Modification::Allowed(k) if k.contains(&"comments")), "{certify:?}: {:?}", s.modification);
+            }
+            _ => {
+                assert_eq!(s.status, Status::Invalid, "{certify:?}: {:?} {:?}", s.modification, s.details);
+                assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"comments")), "{certify:?}: {:?}", s.modification);
+            }
+        }
+    }
+    // A document timestamp after a P=1 certification: still valid.
+    let certified = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify: Some(1), ..opts() }).unwrap();
+    let tsa = TestTsa { id: tsa_id(), time: Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 } };
+    let stamped = pdfcraft_sign::timestamp_document(&open(&certified), &tsa, "D:20261006120000Z").unwrap();
+    let s = check(&stamped);
+    assert_eq!(s.certify, Some(1));
+    assert_eq!(s.status, Status::Valid, "{:?} {:?}", s.modification, s.details);
+    assert!(matches!(&s.modification, Modification::Allowed(k) if k.contains(&"signature")), "{:?}", s.modification);
+}

@@ -1362,7 +1362,13 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             _ => kind::OTHER,
         };
         let ok = match (what, p) {
-            (kind::SIGNATURE | kind::SECURITY_STORE, _) => true,
+            // Validation data may always be added (ISO 32000-2 12.8.2.2.2).
+            (kind::SECURITY_STORE, _) => true,
+            // "No changes" permits one signature change: a document timestamp.
+            (kind::SIGNATURE, Some(1)) => {
+                new.as_dict().is_some_and(|d| is_doc_timestamp_change(doc, &old, d, before.as_deref().and_then(Object::as_dict)))
+            }
+            (kind::SIGNATURE, _) => true,
             (kind::FORM_FILL, Some(2 | 3) | None) => true,
             (kind::COMMENTS, Some(3) | None) => true,
             // Every save updates /Info (ModDate), signing included.
@@ -1498,24 +1504,68 @@ fn dss_parts(doc: &Document, old: &Document) -> HashSet<u32> {
     parts
 }
 
-/// What adding `added` annotations amounts to: signing (signature widgets only), form fill
-/// (other widgets) or comments.
+/// What adding `added` annotations or fields amounts to: signing, when every one is a signature
+/// field that is signed; otherwise new annotations. No permission covers creating a field, and
+/// an unsigned signature field is an appearance over the page like any other annotation.
 fn added_annots(doc: &Document, added: &[ObjRef]) -> &'static str {
-    let kinds: Vec<(bool, bool)> = added
-        .iter()
-        .map(|r| {
-            let o = doc.get(*r);
-            let d = o.as_dict();
-            (d.is_some_and(|d| d.name(b"Subtype") == Some(b"Widget")), d.is_some_and(|d| d.name(b"FT") == Some(b"Sig")))
-        })
-        .collect();
-    if !kinds.is_empty() && kinds.iter().all(|(w, s)| *w && *s) {
-        kind::SIGNATURE
-    } else if !kinds.is_empty() && kinds.iter().all(|(w, _)| *w) {
-        kind::FORM_FILL
-    } else {
-        kind::COMMENTS
+    let signed_field = |r: &ObjRef| {
+        doc.get(*r)
+            .as_dict()
+            .is_some_and(|d| (d.name(b"Subtype") == Some(b"Widget") || d.contains(b"T")) && d.name(b"FT") == Some(b"Sig") && holds_signature(doc, d))
+    };
+    if !added.is_empty() && added.iter().all(signed_field) { kind::SIGNATURE } else { kind::COMMENTS }
+}
+
+/// Whether a field's /V is a signature dictionary (one with a byte range), not a label alone.
+fn holds_signature(doc: &Document, d: &Dict) -> bool {
+    d.get(b"V").map(|v| doc.resolve(v)).is_some_and(|v| v.as_dict().is_some_and(|s| s.contains(b"ByteRange")))
+}
+
+/// The entries a filler changes: the value, and what is regenerated from it. A field or widget
+/// that differs in anything else (actions, position, flags, type, name, parent, kids) was not
+/// filled in but changed, which no permission covers.
+const FILLED: &[&[u8]] = &[b"V", b"AS", b"AP", b"M", b"I", b"RV"];
+
+/// What a changed field or widget amounts to: `signing` for a signature field. New: signing
+/// when signed, else a new annotation. Existing: filled, or changed in something else.
+fn field_change_kind(doc: &Document, d: &Dict, before: Option<&Dict>, signing: bool) -> &'static str {
+    match before {
+        None if signing && holds_signature(doc, d) => kind::SIGNATURE,
+        None => kind::COMMENTS,
+        Some(b) if without(d, FILLED) == without(b, FILLED) => {
+            if signing {
+                kind::SIGNATURE
+            } else {
+                kind::FORM_FILL
+            }
+        }
+        Some(_) => kind::OTHER,
     }
+}
+
+/// Whether a signature change is a document timestamp (ISO 32000-2 §12.8.2.2): the timestamp
+/// dictionary itself, a field whose value is one, or a page, form or catalog that only gained
+/// such fields. The one signature change a P=1 certification permits.
+fn is_doc_timestamp_change(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> bool {
+    let stamped = |d: &Dict| d.get(b"V").map(|v| doc.resolve(v)).is_some_and(|v| v.as_dict().is_some_and(is_doc_timestamp));
+    if is_doc_timestamp(d) || stamped(d) {
+        return true;
+    }
+    let only_stamps = |now: Option<&Object>, was: Option<&Object>| {
+        let was = refs(old, was);
+        let added: Vec<ObjRef> = refs(doc, now).into_iter().filter(|r| !was.contains(r)).collect();
+        !added.is_empty() && added.iter().all(|r| doc.get(*r).as_dict().is_some_and(stamped))
+    };
+    for key in [&b"Annots"[..], b"Fields"] {
+        if d.contains(key) {
+            return only_stamps(d.get(key), before.and_then(|b| b.get(key)));
+        }
+    }
+    if d.name(b"Type") == Some(b"Catalog") {
+        let (now, was) = (acroform(doc).unwrap_or_default(), acroform(old).unwrap_or_default());
+        return only_stamps(now.get(b"Fields"), was.get(b"Fields"));
+    }
+    false
 }
 
 fn refs(doc: &Document, o: Option<&Object>) -> Vec<ObjRef> {
@@ -1544,14 +1594,34 @@ fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dic
     }
     let old_fields = refs(old, before.get(b"Fields"));
     let added: Vec<ObjRef> = refs(doc, now.get(b"Fields")).into_iter().filter(|r| !old_fields.contains(r)).collect();
-    if added.is_empty() || added_annots(doc, &added) == kind::SIGNATURE { kind::SIGNATURE } else { kind::FORM_FILL }
+    if added.is_empty() || added_annots(doc, &added) == kind::SIGNATURE { kind::SIGNATURE } else { kind::COMMENTS }
 }
 
 /// Dictionary entries in a stable order, without `keys`.
 fn without(x: &Dict, keys: &[&[u8]]) -> Vec<(Vec<u8>, Object)> {
-    let mut v: Vec<(Vec<u8>, Object)> = x.iter().filter(|(k, _)| !keys.contains(&k.as_slice())).map(|(k, o)| (k.to_vec(), o.clone())).collect();
+    let mut v: Vec<(Vec<u8>, Object)> = x.iter().filter(|(k, _)| !keys.contains(&k.as_slice())).map(|(k, o)| (k.to_vec(), canonical(o, 0))).collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
     v
+}
+
+/// `o` with every string marked literal, so two revisions compare by what they say and not by
+/// how a writer spelt it (an encrypted update writes its strings as hex, for one).
+fn canonical(o: &Object, depth: u8) -> Object {
+    if depth > 32 {
+        return o.clone();
+    }
+    match o {
+        Object::String(s) => Object::String(pdfcraft_cos::PdfString { bytes: s.bytes.clone(), hex: false }),
+        Object::Array(a) => Object::Array(a.iter().map(|x| canonical(x, depth + 1)).collect()),
+        Object::Dict(d) => {
+            let mut out = Dict::new();
+            for (k, v) in d.iter() {
+                out.set(k.clone(), canonical(v, depth + 1));
+            }
+            Object::Dict(out)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Whether a dictionary was a signature object: a signature or timestamp value, a signature
@@ -1616,19 +1686,19 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
         _ => {}
     }
     match d.name(b"Subtype") {
-        Some(b"Widget") => return if d.name(b"FT") == Some(b"Sig") && signature_ok { kind::SIGNATURE } else { kind::FORM_FILL },
+        Some(b"Widget") => return field_change_kind(doc, d, before, d.name(b"FT") == Some(b"Sig") && signature_ok),
         Some(b"Link") => return kind::LINKS,
         Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return kind::COMMENTS,
         _ => {}
     }
     if d.name(b"FT") == Some(b"Sig") && signature_ok {
-        return kind::SIGNATURE;
+        return field_change_kind(doc, d, before, true);
     }
     if d.contains(b"Fields") {
         return acroform_kind(doc, old, d, before);
     }
     if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") {
-        return kind::FORM_FILL;
+        return field_change_kind(doc, d, before, false);
     }
     if before.is_none() {
         // New objects referenced by changed ones (fonts, appearance resources).

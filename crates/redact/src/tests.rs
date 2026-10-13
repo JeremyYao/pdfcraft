@@ -1287,3 +1287,25 @@ fn vertical_writing_from_the_cmap_program_or_the_cmap_named_v_fails_closed() {
     );
     assert_eq!(apply(&mut doc, None).unwrap().glyphs, 2, "the horizontal control is redacted");
 }
+
+/// The font and size may come from an ExtGState's /Font entry (`gs`) instead of `Tf`, or a form
+/// XObject may show text with the font and size its caller selected. The interpreter used to
+/// learn them from `Tf` in the current scope only, so such text stayed at size 0 at the line's
+/// start, matched no mark further along the line, and survived apply and its verify pass.
+#[test]
+fn text_set_through_an_extgstate_font_or_inherited_by_a_form_is_redacted() {
+    // "AB1234CD" from x = 10 at 10 pt: 1234 spans x 20–40, away from the line's start.
+    let mut doc = one_page(b"BT /GS1 gs 10 100 Td (AB1234CD) Tj ET", "/ExtGState << /GS1 << /Type /ExtGState /Font [5 0 R 10] >> >>", vec![]);
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.glyphs, 4, "ExtGState font: {r:?}");
+    let c = content(&doc, 0);
+    assert!(c.contains("[(AB) -2000 (CD)] TJ") && !c.contains("1234"), "{c}");
+
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", b"BT 10 100 Td (AB1234CD) Tj ET");
+    let mut doc = one_page(b"BT /F1 10 Tf ET /Fm Do", "/XObject << /Fm 7 0 R >>", vec![form]);
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.glyphs, r.forms_rewritten), (4, 1), "inherited font: {r:?}");
+    assert!(!any_has(&saved_streams(&doc), b"1234"), "the form's text survived the save");
+}

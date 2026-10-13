@@ -362,13 +362,23 @@ struct Glyph {
     hit: bool,
 }
 
-/// Process a scope's content streams (state flows from one stream to the next).
+/// The metrics of the font `font_dict`, cached in the scope under `key` (a `/Font` resource name,
+/// or an ExtGState's name prefixed so the two cannot collide); the fallback when there is none.
+fn font_metrics(scope: &mut Scope<'_>, doc: &Document, key: &[u8], font_dict: Option<&Dict>, fallback: &Rc<Metrics>) -> Rc<Metrics> {
+    if let Some(f) = scope.fonts.get(key) {
+        return f.clone();
+    }
+    let m = font_dict.map(|d| Rc::new(Metrics::from_dict(doc, d))).unwrap_or_else(|| fallback.clone());
+    scope.fonts.insert(key.to_vec(), m.clone());
+    m
+}
+
+/// Process a page's content streams (state flows from one stream to the next) from the initial
+/// graphics state.
 pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], resources: &Dict, ctm: Matrix) -> Output {
-    let mut out = Output::default();
-    let fallback = Rc::new(Metrics::fallback());
-    let mut gs = Gs {
+    let gs = Gs {
         ctm,
-        font: fallback.clone(),
+        font: Rc::new(Metrics::fallback()),
         vertical: false,
         size: 0.0,
         char_spacing: 0.0,
@@ -378,9 +388,19 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         leading: 0.0,
         rise: 0.0,
     };
+    process_with(doc, scope, streams, resources, gs)
+}
+
+/// Process a scope's content streams starting from `gs`: a form XObject inherits its caller's
+/// graphics state, text state included (ISO 32000-2 §8.10.1), so text it shows without a `Tf` of
+/// its own is in the caller's font and size.
+fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], resources: &Dict, mut gs: Gs) -> Output {
+    let mut out = Output::default();
+    let fallback = Rc::new(Metrics::fallback());
     let mut stack: Vec<Gs> = Vec::new();
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
     let fonts_res = res_dict(doc, resources, b"Font");
+    let ext_res = res_dict(doc, resources, b"ExtGState");
     let mut xobjects = res_dict(doc, resources, b"XObject");
     // The current path: its operators, its bounding box in user space, and whether it clips.
     let mut path: Vec<Op> = Vec::new();
@@ -513,14 +533,26 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     if let Some(name) = op.name(0) {
                         let font_dict = fonts_res.get(name).and_then(|f| doc.resolve(f).as_dict().cloned());
                         gs.vertical = font_dict.as_ref().is_some_and(|d| is_vertical(doc, d));
-                        gs.font = match scope.fonts.get(name) {
-                            Some(f) => f.clone(),
-                            None => {
-                                let m = font_dict.as_ref().map(|d| Rc::new(Metrics::from_dict(doc, d))).unwrap_or_else(|| fallback.clone());
-                                scope.fonts.insert(name.to_vec(), m.clone());
-                                m
-                            }
-                        };
+                        gs.font = font_metrics(scope, doc, name, font_dict.as_ref(), &fallback);
+                    }
+                }
+                b"gs" => {
+                    // An ExtGState's /Font entry, `[font size]`, selects the font and size as
+                    // `Tf` does (§8.4.5, Table 57); a viewer honours it, so must the layout here.
+                    if let Some(name) = op.name(0)
+                        && let Some(g) = ext_res.get(name).map(|g| doc.resolve(g))
+                        && let Some(pair) = g.as_dict().and_then(|g| g.get(b"Font")).map(|f| doc.resolve(f))
+                        && let Some(pair) = pair.as_array()
+                    {
+                        if let Some(size) = pair.get(1).and_then(|s| doc.resolve(s).as_f64()) {
+                            gs.size = size;
+                        }
+                        if let Some(f) = pair.first() {
+                            let font_dict = doc.resolve(f).as_dict().cloned();
+                            gs.vertical = font_dict.as_ref().is_some_and(|d| is_vertical(doc, d));
+                            let key = [b"gs:".as_slice(), name].concat();
+                            gs.font = font_metrics(scope, doc, &key, font_dict.as_ref(), &fallback);
+                        }
                     }
                 }
                 b"Tc" => gs.char_spacing = op.num(0).unwrap_or(0.0),
@@ -808,7 +840,9 @@ fn xobject(
             let res = own.clone().unwrap_or_else(|| resources.clone());
             let saved_fonts = std::mem::take(&mut scope.fonts);
             scope.depth += 1;
-            let inner = process(doc, scope, std::slice::from_ref(&data), &res, fctm);
+            // The form inherits the caller's graphics state (its font and size included) under
+            // its own matrix.
+            let inner = process_with(doc, scope, std::slice::from_ref(&data), &res, Gs { ctm: fctm, ..gs.clone() });
             scope.depth -= 1;
             scope.fonts = saved_fonts;
             out.residue += inner.residue;

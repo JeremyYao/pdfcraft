@@ -1115,3 +1115,130 @@ fn content_after_an_inline_image_without_white_space_before_ei_is_redacted_or_re
     assert_eq!(apply(&mut doc, None), Err(RedactError::Unreadable(1)));
     assert!(content(&doc, 0).contains("(AB1234CD) Tj"), "nothing was changed");
 }
+
+/// Twenty 16-byte gray rows, `secret` as the last one, each tagged with a PNG `None` predictor
+/// byte when `tagged`; and the page that draws the 16×20 image at [20 50 180 250] with the
+/// bottom row (y 50–60) marked.
+fn rows_image(tagged: bool, secret: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for j in 0..20 {
+        if tagged {
+            data.push(0);
+        }
+        if j == 19 {
+            data.extend_from_slice(secret);
+        } else {
+            data.extend_from_slice(format!("publicrow{j:02}.....").as_bytes());
+        }
+    }
+    data
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    Stream::flate(Dict::new(), data).raw.to_vec()
+}
+
+/// The decoded streams of a full-rewrite save.
+fn saved_streams(doc: &Document) -> Vec<Vec<u8>> {
+    let saved = Document::open(Arc::new(write_full(doc, &SaveOptions::default()).unwrap())).unwrap();
+    saved
+        .scan_objects()
+        .filter_map(|(_, o)| match &*o {
+            Object::Stream(s) => s.decoded().ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn any_has(streams: &[Vec<u8>], needle: &[u8]) -> bool {
+    streams.iter().any(|d| d.windows(needle.len()).any(|w| w == needle))
+}
+
+/// `/Filter` and `/DecodeParms` may be indirect references (ISO 32000-2 §7.3.8.2), and a viewer
+/// resolves them: the content it shows, and the user marks, is the decoded one. Read as an empty
+/// chain, the still-compressed bytes were "redacted" (nothing found), verified clean, and saved;
+/// an image's predicted bytes were cleared at the wrong offsets.
+#[test]
+fn indirect_filter_and_decode_parms_are_resolved_before_redacting() {
+    // Content long enough that zlib really compresses it rather than storing it.
+    let mut text = b"BT /F1 10 Tf 10 100 Td (AB1234CD) Tj ET ".to_vec();
+    text.extend(std::iter::repeat_n(b"BT /F1 10 Tf 10 200 Td (KEEP) Tj ET ", 12).flatten());
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 8 0 R >> >> >>"
+            .to_vec(),
+        stream("/Filter 7 0 R", &zlib(&text)),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        b"/FlateDecode".to_vec(),
+        stream(
+            "/Type /XObject /Subtype /Image /Width 16 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DecodeParms 9 0 R",
+            &zlib(&rows_image(true, b"COLORSECRETROW19")),
+        ),
+        b"<< /Predictor 15 /Columns 16 >>".to_vec(),
+    ]);
+    // The image is drawn by a second content stream so the text stream above stays as written.
+    let draw = doc.add(Object::Stream(Stream::from_raw(Dict::new(), b"q 160 0 0 200 20 50 cm /Im1 Do Q".to_vec())));
+    doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"Contents".to_vec(), Object::Array(vec![Object::Ref(ObjRef::new(4, 0)), Object::Ref(draw)])))
+        .unwrap();
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0], [0.0, 50.0, 300.0, 60.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.glyphs, r.images_cleared, r.images_removed), (4, 1, 0), "{r:?}");
+    let streams = saved_streams(&doc);
+    assert!(!any_has(&streams, b"1234"), "the marked text survived the save");
+    assert!(!any_has(&streams, b"COLORSECRETROW19"), "the marked image row survived the save");
+    assert!(any_has(&streams, b"(KEEP)") && any_has(&streams, b"publicrow18"), "the rest stays");
+}
+
+/// What the user marks is the viewer's decode of a stream. A stream cos cannot decode cleanly
+/// and completely (a /Predictor or /Colors out of range, a zlib header with the preset-dictionary
+/// bit, an image carrying the inline-image /DP key) used to pass as an empty or differently laid
+/// out decode, so apply reported success with the marked content still in the file. It fails
+/// closed instead: the page is unreadable, the image is removed whole.
+#[test]
+fn streams_cos_cannot_decode_cleanly_fail_closed() {
+    let content = b"BT /F1 10 Tf 10 100 Td (AB1234CD) Tj ET";
+    let mut tagged = vec![0u8];
+    tagged.extend_from_slice(content);
+    let mut fdict = vec![0x78, 0xBB, 0, 0, 0, 1, 1, content.len() as u8, 0, !(content.len() as u8), 0xFF];
+    fdict.extend_from_slice(content);
+    fdict.extend_from_slice(&[0, 0, 0, 0]);
+    let cases: [(&str, String, Vec<u8>); 3] = [
+        ("predictor 16", format!("/Filter /FlateDecode /DecodeParms << /Predictor 16 /Columns {} >>", content.len()), zlib(&tagged)),
+        ("colors 256", format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 256 /Columns {} >>", content.len()), zlib(&tagged)),
+        ("preset-dictionary zlib header", "/Filter /FlateDecode".into(), fdict),
+    ];
+    for (what, dict, data) in cases {
+        let mut doc = one_page(b"", "", vec![]);
+        let bad = doc.add(Object::Stream(Stream::from_raw(
+            pdfcraft_cos::Lexer::new(format!("<< {dict} >>").as_bytes(), 0).object().unwrap().as_dict().cloned().unwrap(),
+            data,
+        )));
+        doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"Contents".to_vec(), Object::Ref(bad))).unwrap();
+        mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+        assert_eq!(apply(&mut doc, None), Err(RedactError::Unreadable(1)), "{what}");
+    }
+    // The control: a clean PNG-predicted stream decodes and is redacted.
+    let mut doc = one_page(b"", "", vec![]);
+    let dict = format!("<< /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns {} >> >>", content.len());
+    let good = doc.add(Object::Stream(Stream::from_raw(
+        pdfcraft_cos::Lexer::new(dict.as_bytes(), 0).object().unwrap().as_dict().cloned().unwrap(),
+        zlib(&tagged),
+    )));
+    doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"Contents".to_vec(), Object::Ref(good))).unwrap();
+    mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
+    assert_eq!(apply(&mut doc, None).unwrap().glyphs, 4, "control");
+    assert!(!any_has(&saved_streams(&doc), b"1234"));
+
+    // An image carrying /DP: the viewer unpredicts it, cos would not. Removed whole.
+    let image = stream(
+        "/Type /XObject /Subtype /Image /Width 16 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /DP << /Predictor 15 /Columns 16 >>",
+        &zlib(&rows_image(true, b"COLORSECRETROW19")),
+    );
+    let mut doc = one_page(b"q 160 0 0 200 20 50 cm /Im1 Do Q", "/XObject << /Im1 7 0 R >>", vec![image]);
+    mark(&mut doc, 0, &[[0.0, 50.0, 300.0, 60.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert!(!any_has(&saved_streams(&doc), b"COLORSECRETROW19"), "the marked image row survived the save: {r:?}");
+    assert_eq!((r.images_removed, r.images_cleared), (1, 0), "{r:?}");
+}

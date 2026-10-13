@@ -5,7 +5,7 @@
 
 use pdfcraft_filters::{Filter, Params};
 
-use crate::{Bytes, CosError};
+use crate::{Bytes, CosError, Document};
 
 /// An indirect reference: object number and generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -172,7 +172,9 @@ impl Stream {
         Self { dict, raw: pdfcraft_filters::encode_flate(data).into() }
     }
 
-    /// The filter chain declared in the dictionary.
+    /// The filter chain declared in the dictionary, as written: an indirect `/Filter` or
+    /// `/DecodeParms`, or indirect elements of their arrays, are not followed (there is no
+    /// document here) and count as absent. See [`Stream::filters_in`] to resolve them.
     pub fn filters(&self) -> Vec<(Filter, Params)> {
         let names: Vec<&[u8]> = match self.dict.get(b"Filter") {
             Some(Object::Name(n)) => vec![n],
@@ -202,6 +204,72 @@ impl Stream {
                 (Filter::from_name(n), params)
             })
             .collect()
+    }
+
+    /// The filter chain resolved through `doc`: `/Filter` and `/DecodeParms` may be indirect
+    /// references, and so may the elements of their arrays and the parameter values
+    /// (ISO 32000-2 §7.3.8.2, §7.4). An error when an entry does not resolve to a name or a
+    /// dictionary, or when the dictionary carries `/F` (the data then lives in another file and
+    /// the bytes between `stream` and `endstream` are to be ignored, Table 5) or `/DP` (an
+    /// inline-image key, Table 92, that a viewer may read before `/DecodeParms`): the stored bytes
+    /// are then not the data the document shows.
+    pub fn filters_in(&self, doc: &Document) -> Result<Vec<(Filter, Params)>, CosError> {
+        let unresolved = |what: &str| CosError::Filter(format!("the stream's {what} does not resolve to a filter name or parameter dictionary"));
+        if self.dict.contains(b"F") || self.dict.contains(b"DP") {
+            return Err(CosError::Filter("the stream dictionary carries /F or /DP, so its stored bytes are not the data it shows".into()));
+        }
+        let names: Vec<Name> = match self.dict.get(b"Filter").map(|f| doc.resolve(f)).as_deref() {
+            None | Some(Object::Null) => Vec::new(),
+            Some(Object::Name(n)) => vec![n.clone()],
+            Some(Object::Array(a)) => a
+                .iter()
+                .map(|f| doc.resolve(f).as_name().map(<[u8]>::to_vec).ok_or_else(|| unresolved("/Filter element")))
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(unresolved("/Filter")),
+        };
+        let parms: Vec<Option<Dict>> = match self.dict.get(b"DecodeParms").map(|p| doc.resolve(p)).as_deref() {
+            None | Some(Object::Null) => Vec::new(),
+            Some(Object::Dict(d)) => vec![Some(d.clone())],
+            Some(Object::Array(a)) => a
+                .iter()
+                .map(|p| match &*doc.resolve(p) {
+                    Object::Dict(d) => Ok(Some(d.clone())),
+                    Object::Null => Ok(None),
+                    _ => Err(unresolved("/DecodeParms element")),
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(unresolved("/DecodeParms")),
+        };
+        Ok(names
+            .into_iter()
+            .enumerate()
+            // `/Crypt` is applied by the security handler when the object is loaded (§7.4.10).
+            .filter(|(_, n)| n != b"Crypt")
+            .map(|(i, n)| {
+                let p = parms.get(i).and_then(Option::as_ref);
+                let get = |k: &[u8], d: i64| p.and_then(|p| p.get(k)).and_then(|v| doc.resolve(v).as_int()).unwrap_or(d);
+                let params = Params {
+                    predictor: get(b"Predictor", 1),
+                    colors: get(b"Colors", 1),
+                    bits_per_component: get(b"BitsPerComponent", 8),
+                    columns: get(b"Columns", 1),
+                    early_change: get(b"EarlyChange", 1),
+                };
+                (Filter::from_name(&n), params)
+            })
+            .collect())
+    }
+
+    /// Decoded data with the chain resolved through `doc` ([`Stream::filters_in`]) and any
+    /// corruption an error: the whole stream decoded with the parameters the document declares,
+    /// or nothing. For consumers that must not act on bytes a viewer would read differently
+    /// (redaction, sanitising).
+    pub fn decoded_strict_in(&self, doc: &Document) -> Result<Vec<u8>, CosError> {
+        let chain = self.filters_in(doc)?;
+        if chain.is_empty() {
+            return self.raw_within(MAX_DECODED);
+        }
+        pdfcraft_filters::decode(&chain, &self.raw, MAX_DECODED).map_err(|e| CosError::Filter(e.to_string()))
     }
 
     /// Decoded data, tolerating truncated or corrupt encodings the way viewers do (the data
@@ -496,5 +564,54 @@ mod tests {
             assert!(matches!(stream.decoded_first_filter_strict(inner.len() - 1), Err(CosError::Filter(_))));
             assert!(matches!(Stream::from_raw(dict, corrupt.to_vec()).decoded_first_filter_strict(usize::MAX), Err(CosError::Filter(_))));
         }
+    }
+
+    /// An indirect /Filter or /DecodeParms, and indirect elements of their arrays, resolve
+    /// through the document; what does not resolve, a dictionary carrying /F or /DP, and any
+    /// corruption are errors, where the document-less decode returns the stored bytes as they are.
+    #[test]
+    fn filters_in_resolves_references_and_refuses_what_it_cannot() {
+        let mut doc = Document::new_empty();
+        let data = "0 0 m 100 100 l S\n".repeat(64).into_bytes();
+        let z = Stream::flate(Dict::new(), &data).raw.to_vec();
+        let name = doc.add(Object::name("FlateDecode"));
+        let mut dict = Dict::new();
+        dict.set(b"Filter".to_vec(), Object::Ref(name));
+        let stream = Stream::from_raw(dict, z.clone());
+        assert_eq!(stream.decoded().unwrap(), z, "without the document the chain is empty");
+        assert_eq!(stream.decoded_strict_in(&doc).unwrap(), data);
+        // The filter as an array element and the parameters as a dictionary, both by reference.
+        let p = Params { predictor: 12, columns: 18, ..Params::default() };
+        let predicted = pdfcraft_filters::encode(&Filter::Flate, &p, &data).unwrap();
+        let mut parms = Dict::new();
+        parms.set(b"Predictor".to_vec(), 12);
+        parms.set(b"Columns".to_vec(), 18);
+        let parms = doc.add(Object::Dict(parms));
+        let mut dict = Dict::new();
+        dict.set(b"Filter".to_vec(), Object::Array(vec![Object::Ref(name)]));
+        dict.set(b"DecodeParms".to_vec(), Object::Array(vec![Object::Ref(parms)]));
+        let stream = Stream::from_raw(dict, predicted);
+        assert_eq!(stream.filters_in(&doc).unwrap(), vec![(Filter::Flate, p)]);
+        assert_eq!(stream.decoded_strict_in(&doc).unwrap(), data);
+        // Entries that do not resolve, the /F and /DP keys, and a stream cut short.
+        let refused = [
+            (&b"Filter"[..], Object::Int(1)),
+            (&b"DecodeParms"[..], Object::Int(1)),
+            (&b"F"[..], Object::name("ASCIIHexDecode")),
+            (&b"DP"[..], Object::Dict(Dict::new())),
+        ];
+        for (key, value) in refused {
+            let mut dict = Dict::new();
+            dict.set(b"Filter".to_vec(), Object::Ref(name));
+            dict.set(key.to_vec(), value);
+            let stream = Stream::from_raw(dict, z.clone());
+            assert!(matches!(stream.decoded_strict_in(&doc), Err(CosError::Filter(_))), "{}", String::from_utf8_lossy(key));
+            assert!(stream.decoded().is_ok(), "the tolerant decode still answers");
+        }
+        let mut dict = Dict::new();
+        dict.set(b"Filter".to_vec(), Object::Ref(name));
+        let mut cut = z.clone();
+        cut.truncate(z.len() / 2);
+        assert!(matches!(Stream::from_raw(dict, cut).decoded_strict_in(&doc), Err(CosError::Filter(_))));
     }
 }

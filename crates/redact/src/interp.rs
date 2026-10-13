@@ -231,7 +231,7 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
         if depth >= MAX_DEPTH {
             return None;
         }
-        let Ok(data) = s.decoded() else { return None };
+        let Ok(data) = s.decoded_strict_in(doc) else { return None };
         match content_draws(doc, std::slice::from_ref(&data), xo, name, depth + 1, seen) {
             Some(false) => {}
             other => return other,
@@ -783,7 +783,9 @@ fn xobject(
                 out.doomed.push(r);
                 return Some(None);
             }
-            let data = match s.decoded() {
+            // Strict, with the chain resolved through the document: a form that does not decode
+            // as a viewer shows it is removed rather than rewritten from other bytes.
+            let data = match s.decoded_strict_in(doc) {
                 Ok(d) => d,
                 Err(_) if scope.mode == Mode::Apply => {
                     scope.report.forms_removed += 1;

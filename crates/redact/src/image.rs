@@ -9,7 +9,7 @@
 //! mask that can't be cleared.
 
 use pdfcraft_content::{Matrix, overlaps};
-use pdfcraft_cos::{Dict, Document, Object, Stream};
+use pdfcraft_cos::{Dict, Document, Filter, Object, Stream};
 
 /// Most pixels an image may have to be cleared in place (larger ones are removed).
 const MAX_PIXELS: u64 = 64 << 20;
@@ -65,7 +65,7 @@ fn components(doc: &Document, s: &Stream) -> Option<usize> {
                 }
             }
             // A profile the renderer cannot decode is drawn as DeviceGray.
-            if n != 1 && icc.decoded_strict().is_err() {
+            if n != 1 && icc.decoded_strict_in(doc).is_err() {
                 return None;
             }
             Some(n)
@@ -131,19 +131,11 @@ fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]
 /// with the copy's dictionary (`/Length` and the decode parameters removed) and the new samples,
 /// `Some(None)` when no pixel centre is covered, `None` when the image can't be cleared.
 fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<(Dict, Vec<u8>)>> {
-    let supported = |n: &[u8]| {
-        matches!(
-            n,
-            b"FlateDecode" | b"Fl" | b"LZWDecode" | b"LZW" | b"ASCII85Decode" | b"A85" | b"ASCIIHexDecode" | b"AHx" | b"RunLengthDecode" | b"RL"
-        )
-    };
-    let ok = match s.dict.get(b"Filter") {
-        None => true,
-        Some(Object::Name(n)) => supported(n),
-        Some(Object::Array(a)) => a.iter().all(|f| f.as_name().is_some_and(supported)),
-        _ => false,
-    };
-    if !ok || SHORT_KEYS.iter().any(|k| s.dict.contains(k)) {
+    // The chain as the document declares it (indirect entries resolved); only codecs that can be
+    // decoded and re-encoded here.
+    let chain = s.filters_in(doc).ok()?;
+    let supported = |f: &Filter| matches!(f, Filter::Flate | Filter::Lzw | Filter::AsciiHex | Filter::Ascii85 | Filter::RunLength);
+    if !chain.iter().all(|(f, _)| supported(f)) || SHORT_KEYS.iter().any(|k| s.dict.contains(k)) {
         return None;
     }
     let (w, h) = (s.dict.int(b"Width")?, s.dict.int(b"Height")?);
@@ -156,7 +148,9 @@ fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return None;
     }
-    let mut data = s.decoded().ok()?;
+    // Strict: samples a viewer would decode differently (a corrupt or partial stream) are not
+    // cleared in place at offsets of their own.
+    let mut data = s.decoded_strict_in(doc).ok()?;
     let row = w.checked_mul(ncomp)?.checked_mul(bpc)?.div_ceil(8);
     let need = row.checked_mul(h)?;
     if data.len() < need {

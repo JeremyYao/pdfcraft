@@ -389,11 +389,12 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     by_page.dedup();
     report.pages = by_page.len();
     localize_resources(doc, &by_page)?;
-    let mut doomed_fields: Vec<String> = Vec::new();
+    // The fields (by object: several fields can share one name) that own a widget under a mark.
+    let mut doomed_fields: Vec<ObjRef> = Vec::new();
     // The original image and form XObjects the rewrite drops or replaces, on any page.
     let mut doomed_xobjects: Vec<ObjRef> = Vec::new();
-    let widget_owner: Vec<(ObjRef, String)> =
-        pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
+    let widget_owner: Vec<(ObjRef, ObjRef)> =
+        pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.obj)).collect::<Vec<_>>()).collect();
 
     for &pi in &by_page {
         let page = pdfcraft_model::pages(doc).swap_remove(pi);
@@ -487,10 +488,10 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| pdfcraft_content::overlaps(*x, b, 0.0))) {
                 removed.push(r);
                 if subtype == b"Widget" {
-                    if let Some((_, name)) = widget_owner.iter().find(|(w, _)| *w == r)
-                        && !doomed_fields.contains(name)
+                    if let Some((_, field)) = widget_owner.iter().find(|(w, _)| *w == r)
+                        && !doomed_fields.contains(field)
                     {
-                        doomed_fields.push(name.clone());
+                        doomed_fields.push(*field);
                     }
                 } else {
                     report.annotations += 1;
@@ -518,10 +519,12 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         })?;
     }
 
-    // 3. Form fields with a widget under a mark (all their widgets go).
-    for name in &doomed_fields {
-        if pdfcraft_forms::fields(doc).iter().any(|f| &f.name == name) {
-            pdfcraft_forms::delete_field(doc, name)?;
+    // 3. Form fields with a widget under a mark (all their widgets go). Each is deleted by its
+    // object: deleting by name would take the first field of that name, which with two
+    // same-named fields leaves the marked one, and its value, in the file.
+    for field in &doomed_fields {
+        if pdfcraft_forms::fields(doc).iter().any(|f| f.obj == *field) {
+            pdfcraft_forms::delete_field_object(doc, *field)?;
             report.fields += 1;
         }
     }

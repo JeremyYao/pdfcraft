@@ -979,3 +979,58 @@ fn a_partly_redacted_images_soft_mask_and_stencil_mask_are_cleared_too() {
         assert!(has(b"colorpublicrow01") && has(public), "{mask_key}: the uncovered rows must stay");
     }
 }
+
+/// Two field dictionaries can share one fully qualified name (merged or repeated forms). The
+/// field whose widget is under the mark is the one to delete, by object: deleting the first
+/// field of that name leaves the marked value in the saved file (and removes an unmarked field).
+#[test]
+fn redacting_one_of_two_same_named_fields_deletes_that_field_by_object() {
+    let make = || {
+        pdf(vec![
+            b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R 6 0 R] >> >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [5 0 R 6 0 R] >>".to_vec(),
+            stream("", b""),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (acct) /V (V034-KEEP-CCC) /Rect [50 200 250 220] /P 3 0 R >>".to_vec(),
+            b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (acct) /V (V034-GONE-DDD) /Rect [50 100 250 120] /P 3 0 R >>".to_vec(),
+        ])
+    };
+    // Every object of the full-rewrite save, serialized, and every stream decoded (a full save
+    // packs dictionaries into object streams, so the file bytes alone show nothing).
+    let saved = |doc: &Document| -> (Document, Vec<Vec<u8>>) {
+        let saved = Document::open(Arc::new(write_full(doc, &SaveOptions::default()).unwrap())).unwrap();
+        let mut texts = Vec::new();
+        for (_, object) in saved.scan_objects() {
+            let mut bytes = Vec::new();
+            pdfcraft_cos::serialize(&object, &mut bytes);
+            texts.push(bytes);
+            if let Object::Stream(s) = &*object {
+                texts.push(s.decoded().unwrap());
+            }
+        }
+        (saved, texts)
+    };
+    let has = |texts: &[Vec<u8>], needle: &[u8]| texts.iter().any(|t| t.windows(needle.len()).any(|w| w == needle));
+
+    // Only the second field of the name is marked: it goes, the first keeps its value.
+    let mut doc = make();
+    assert_eq!(pdfcraft_forms::fields(&doc).len(), 2, "both same-named fields are listed");
+    mark(&mut doc, 0, &[[45.0, 95.0, 255.0, 125.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.fields, 1, "{r:?}");
+    let (saved_doc, texts) = saved(&doc);
+    assert!(!has(&texts, b"V034-GONE-DDD"), "the marked field's value survived the save");
+    assert!(has(&texts, b"V034-KEEP-CCC"), "the unmarked field was deleted instead");
+    let left = pdfcraft_forms::fields(&saved_doc);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].value, ["V034-KEEP-CCC"]);
+
+    // Both marked: both go.
+    let mut doc = make();
+    mark(&mut doc, 0, &[[45.0, 95.0, 255.0, 125.0], [45.0, 195.0, 255.0, 225.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.fields, 2, "{r:?}");
+    let (saved_doc, texts) = saved(&doc);
+    assert!(!has(&texts, b"V034-GONE-DDD") && !has(&texts, b"V034-KEEP-CCC"), "a marked value survived the save");
+    assert!(pdfcraft_forms::fields(&saved_doc).is_empty());
+}

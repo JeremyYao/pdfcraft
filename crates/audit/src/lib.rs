@@ -7,7 +7,10 @@
 //! A rectangle counts as a cover only when it was painted strictly *after* the text it
 //! overlaps, and only when it is dark enough against the text's color to make the text
 //! unreadable (WCAG contrast below 3.0). Page backgrounds, table shading and highlight
-//! marks are therefore not flagged.
+//! marks are therefore not flagged. It hides a line when it spans most of the line's height
+//! over at least a glyph's width: a box over one word of a sentence counts, an underline, a
+//! strikethrough or a table rule does not. A finding reports the whole text of every line the
+//! cover touches, not only the hidden glyphs.
 //!
 //! Detection limits (documented, not hidden): only `re` rectangles closed by a fill operator
 //! are considered — arbitrary filled paths, shadings and patterns are not; a rectangle drawn
@@ -76,8 +79,11 @@ pub enum AuditError {
     Edit(#[from] pdfcraft_edit::EditError),
 }
 
-/// Fraction of a text line's area that must lie under a cover to count as hidden.
-const COVER_FRACTION: f64 = 0.4;
+/// Fraction of a text line's height a cover must span to hide glyphs rather than underline or
+/// strike them through.
+const COVER_HEIGHT: f64 = 0.5;
+/// A glyph's width as a fraction of the line's height: the least width a cover must overlap.
+const GLYPH_WIDTH: f64 = 0.25;
 /// WCAG contrast ratio below which the text is unreadable against the cover.
 const COVER_CONTRAST: f64 = 3.0;
 
@@ -122,27 +128,27 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
 }
 
 /// A filled rectangle is a faux-redaction cover for a text line iff it was painted strictly
-/// after the line, overlaps it substantially, and is dark enough against the line's color to
-/// make the text unreadable. Light covers (table shading, highlights) over dark text fail the
-/// contrast check and are not flagged.
+/// after the line, hides glyphs of it, and is dark enough against the line's color to make the
+/// text unreadable. Light covers (table shading, highlights) over dark text fail the contrast
+/// check and are not flagged.
 fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
     rect.pos > line.paint_pos() && covers(&rect.rect, &line.rect) && contrast(line.color, rect.rgb) < COVER_CONTRAST
 }
 
-/// Does `cover` hide a substantial part of `line`?
+/// Does `cover` hide glyphs of `line`? It must span most of the line's height (an underline, a
+/// strikethrough or a table rule does not) over at least a glyph's width (a quarter of the
+/// line's height, or all of a shorter line), so a box over one word of a long line counts, and
+/// so does each of several boxes that together black out the line. The line's whole text is
+/// reported for it: lines are not split into glyphs here. Any NaN compares false: no cover.
 fn covers(cover: &[f64; 4], line: &[f64; 4]) -> bool {
-    let ix0 = cover[0].max(line[0]);
-    let iy0 = cover[1].max(line[1]);
-    let ix1 = cover[2].min(line[2]);
-    let iy1 = cover[3].min(line[3]);
-    if ix1 <= ix0 || iy1 <= iy0 {
+    let w = cover[2].min(line[2]) - cover[0].max(line[0]);
+    let h = cover[3].min(line[3]) - cover[1].max(line[1]);
+    let line_w = line[2] - line[0];
+    let line_h = line[3] - line[1];
+    if !(w > 0.0 && h > 0.0 && line_w > 0.0 && line_h > 0.0) {
         return false;
     }
-    let line_area = (line[2] - line[0]).max(0.0) * (line[3] - line[1]).max(0.0);
-    if line_area <= 0.0 {
-        return false;
-    }
-    (ix1 - ix0) * (iy1 - iy0) / line_area >= COVER_FRACTION
+    h >= line_h * COVER_HEIGHT && w >= (line_h * GLYPH_WIDTH).min(line_w)
 }
 
 /// WCAG 2.x relative luminance of an sRGB triple.

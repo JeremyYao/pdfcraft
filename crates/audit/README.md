@@ -15,6 +15,10 @@ It reports two kinds of finding:
 
 A properly applied redaction removes the text, so it never flags. Page backgrounds, table
 shading and highlights don't either: they're painted before the text, or light against it.
+A cover hides a line when it spans most of the line's height over at least a glyph's width, so
+a box over one word of a sentence counts (and each of several boxes that together black out a
+line), while an underline, a strikethrough or a table rule does not. The finding's
+`covered_text` is the whole text of every line the cover touches, not only the hidden glyphs.
 
 Limits, by design and documented rather than hidden:
 

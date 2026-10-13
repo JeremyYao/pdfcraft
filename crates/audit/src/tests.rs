@@ -127,6 +127,59 @@ fn identity_matrix_between_rectangle_and_fill_still_covers_text() {
     }
 }
 
+/// A 12 pt sentence at 72,700 that runs most of the way across the page (about 408 pt wide).
+const SENTENCE: &[u8] = b"BT /F1 12 Tf 72 700 Td (The witness John Q Example lives at 12 Elm Street in Springfield and saw it) Tj ET\n";
+
+#[test]
+fn cover_over_one_word_of_a_long_line_is_found() {
+    // The commonest redaction shape: a black box over a name inside a sentence. It spans the
+    // line's full height but under a quarter of its width.
+    let mut content = SENTENCE.to_vec();
+    content.extend_from_slice(b"0 g\n137 696 94 16 re f\n");
+    let findings = audit_redactions(&open(one_page(&content, ""))).expect("audit must run");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, FindingKind::CoveredText);
+    assert_eq!(findings[0].rect, [137.0, 696.0, 231.0, 712.0]);
+    assert!(findings[0].covered_text.contains("John Q Example"), "{:?}", findings[0].covered_text);
+}
+
+#[test]
+fn adjacent_covers_over_a_line_are_each_found() {
+    // Four boxes that together black out the whole line: each one is a cover on its own.
+    let mut content = SENTENCE.to_vec();
+    content.extend_from_slice(b"0 g\n72 696 125 16 re f\n197 696 125 16 re f\n322 696 125 16 re f\n447 696 125 16 re f\n");
+    let findings = audit_redactions(&open(one_page(&content, ""))).expect("audit must run");
+    assert_eq!(findings.len(), 4, "{findings:?}");
+    assert!(findings.iter().all(|f| f.kind == FindingKind::CoveredText), "{findings:?}");
+}
+
+#[test]
+fn redact_mark_over_part_of_a_line_is_found() {
+    let mut b = Builder::new();
+    b.add("<< /Type /Catalog /Pages 2 0 R >>");
+    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>");
+    b.add_stream(SENTENCE);
+    b.add(FONT);
+    b.add("<< /Type /Annot /Subtype /Redact /Rect [137 696 231 712] /C [1 0 0] >>");
+    let findings = audit_redactions(&open(b.build())).expect("audit must run");
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].kind, FindingKind::UnappliedMark);
+    assert!(findings[0].covered_text.contains("John Q Example"), "{:?}", findings[0].covered_text);
+}
+
+#[test]
+fn rules_painted_after_text_are_not_covers() {
+    // A strikethrough through the line and a table border crossing it hide no glyph: too thin
+    // in the one case, too narrow in the other.
+    for rule in [&b"0 g\n72 703 400 1 re f\n"[..], b"0 g\n250 600 0.5 200 re f\n"] {
+        let mut content = SENTENCE.to_vec();
+        content.extend_from_slice(rule);
+        let findings = audit_redactions(&open(one_page(&content, ""))).expect("audit must run");
+        assert!(findings.is_empty(), "{:?}: {findings:?}", String::from_utf8_lossy(rule));
+    }
+}
+
 #[test]
 fn clean_document_has_no_findings() {
     let content = b"BT /F1 24 Tf 100 700 Td (nothing hidden here) Tj ET\n";

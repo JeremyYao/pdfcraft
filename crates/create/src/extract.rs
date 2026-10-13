@@ -325,6 +325,17 @@ impl Space {
 }
 
 fn space(doc: &Document, cs: Option<&Object>) -> Result<Space, String> {
+    space_at(doc, cs, 0)
+}
+
+/// `depth` is how many `/Indexed` bases have been followed to reach `cs`. A base is never itself
+/// Indexed (ISO 32000-2 §8.6.6.3), so one level is all a valid colour space needs; the bound is
+/// what stops a base that refers back to its own array (or to another Indexed space that does)
+/// from recursing until the stack overflows, which aborts the process.
+fn space_at(doc: &Document, cs: Option<&Object>, depth: usize) -> Result<Space, String> {
+    if depth > 1 {
+        return Err("nested indexed colour spaces aren't valid".into());
+    }
     let Some(cs) = cs else { return Err("the image has no colour space".into()) };
     let cs = doc.resolve(cs);
     let unsupported = |n: &[u8]| Err(format!("{} images can't be exported yet", String::from_utf8_lossy(n)));
@@ -348,10 +359,8 @@ fn space(doc: &Document, cs: Option<&Object>) -> Result<Space, String> {
             Some(b"CalGray") => Ok(Space::Gray),
             Some(b"CalRGB") => Ok(Space::Rgb),
             Some(b"Indexed" | b"I") => {
-                let base = space(doc, a.get(1))?;
-                if matches!(base, Space::Indexed(..)) {
-                    return Err("nested indexed colour spaces aren't valid".into());
-                }
+                // An Indexed base is refused by `space_at` itself, one level down.
+                let base = space_at(doc, a.get(1), depth.saturating_add(1))?;
                 let table = match a.get(3).map(|t| doc.resolve(t)).as_deref() {
                     Some(Object::String(s)) => s.bytes.clone(),
                     Some(Object::Stream(t)) => t.decoded().map_err(|e| e.to_string())?,

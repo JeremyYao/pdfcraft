@@ -261,11 +261,7 @@ fn space_audit_of_a_deep_form_chain_does_not_overflow_the_stack() {
             d.set(b"Subtype".to_vec(), Object::name("Form"));
             d.set(b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]));
             if let Some(next) = inner {
-                let mut xo = Dict::new();
-                xo.set(b"F".to_vec(), Object::Ref(next));
-                let mut res = Dict::new();
-                res.set(b"XObject".to_vec(), Object::Dict(xo));
-                d.set(b"Resources".to_vec(), Object::Dict(res));
+                d.set(b"Resources".to_vec(), Object::Dict(resources(xobjects(&[("F", next)]))));
             }
             inner = Some(doc.add(Object::Stream(Stream::from_raw(d, b"/F Do".to_vec()))));
         }

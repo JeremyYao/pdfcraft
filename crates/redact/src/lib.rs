@@ -557,7 +557,9 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             let subtype = d.name(b"Subtype").unwrap_or(b"");
             if subtype == b"Redact" {
                 if r.is_some_and(|r| page_marks.iter().any(|m| m.obj == r)) {
+                    // Removed like any other annotation, so its pop-up goes with it.
                     removed_at.push(i);
+                    removed.extend(r);
                 }
                 continue;
             }

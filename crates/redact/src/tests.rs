@@ -1785,3 +1785,36 @@ fn structure_elements_above_the_owner_lose_their_replacement_text() {
     assert!(saved_contains(&doc, b"QSIBLINGKEPT") && saved_contains(&doc, b"QSIBLINGTITLE"), "the untouched sibling keeps its text");
     assert_eq!(r.tags, 3, "the owner, its parent and its grandparent changed: {r:?}");
 }
+
+/// An applied mark leaves the page with its pop-up. A pop-up left listed would keep the mark,
+/// and the note a reviewer wrote on it, reachable through /Parent in the saved file.
+#[test]
+fn an_applied_marks_popup_goes_with_the_mark() {
+    let mut doc = one_page(b"BT /F1 10 Tf 10 200 Td (VISIBLE77) Tj ET", "", vec![]);
+    mark(&mut doc, 0, &[[5.0, 190.0, 125.0, 215.0]], "");
+    let the_mark = marks(&doc)[0].obj;
+    let page = pdfcraft_model::pages(&doc).swap_remove(0).obj;
+    let mut popup = Dict::new();
+    popup.set(b"Type".to_vec(), Object::name("Annot"));
+    popup.set(b"Subtype".to_vec(), Object::name("Popup"));
+    popup.set(b"Rect".to_vec(), Object::Array(vec![200.into(), 20.into(), 280.into(), 80.into()]));
+    popup.set(b"Parent".to_vec(), Object::Ref(the_mark));
+    let popup = doc.add(Object::Dict(popup));
+    doc.update_dict(the_mark, |d| {
+        d.set(b"Popup".to_vec(), Object::Ref(popup));
+        d.set(b"Contents".to_vec(), pdfcraft_cos::PdfString::text("MARKNOTESECRET"));
+    })
+    .unwrap();
+    doc.update_dict(page, |d| {
+        let mut annots = d.get(b"Annots").and_then(Object::as_array).cloned().unwrap_or_default();
+        annots.push(Object::Ref(popup));
+        d.set(b"Annots".to_vec(), Object::Array(annots));
+    })
+    .unwrap();
+
+    apply(&mut doc, None).unwrap();
+    let p = pdfcraft_model::pages(&doc).swap_remove(0);
+    assert!(annots_of(&doc, &p.dict).is_empty(), "the mark and its pop-up left the page");
+    assert!(!saved_contains(&doc, b"MARKNOTESECRET"), "the mark's note survived the save");
+    assert!(!saved_contains(&doc, b"VISIBLE77"));
+}

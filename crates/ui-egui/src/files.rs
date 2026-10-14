@@ -208,14 +208,24 @@ pub(crate) fn safe_file_name(name: &str) -> String {
 }
 
 /// `dir/name` when `name` is one normal path component (see [`safe_file_name`]), so the file
-/// lands directly inside `dir`; `None` for anything else. The sinks refuse such a name rather
-/// than write beside or outside the chosen folder.
+/// lands directly inside `dir`; `None` for anything else. [`write_inside`] refuses such a name
+/// rather than write beside or outside the chosen folder.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn inside(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+fn inside(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     let mut components = std::path::Path::new(name).components();
     let one = matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None));
     let path = dir.join(name);
     (one && path.parent() == Some(dir)).then_some(path)
+}
+
+/// Write `bytes` atomically as the file `name` directly inside the chosen folder `dir`. `name` is
+/// one the caller already made safe with [`safe_file_name`] (and shows in its own messages); a
+/// name that is still not one plain component is refused ([`inside`]), never written beside or
+/// outside `dir`. The error is the reason, for the caller to report next to the name.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn write_inside(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = inside(dir, name).ok_or_else(|| "the name is not a plain file name".to_string())?;
+    crate::editing::write_atomically(&path.to_string_lossy(), bytes).map_err(|e| e.to_string())
 }
 
 /// A safe native Save suggestion for a PDF-supplied attachment name, and the name an attachment
@@ -698,13 +708,8 @@ impl PdfCraftApp {
         {
             let write = move |app: &mut Self, dir: std::path::PathBuf| {
                 for (name, bytes) in &named {
-                    // One normal component only: never beside or outside the chosen folder.
-                    let Some(path) = inside(&dir, name) else {
-                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", "the name is not a plain file name")]);
-                        return;
-                    };
-                    if let Err(e) = crate::editing::write_atomically(&path.to_string_lossy(), bytes) {
-                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e.to_string())]);
+                    if let Err(e) = write_inside(&dir, name, bytes) {
+                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e)]);
                         return;
                     }
                 }

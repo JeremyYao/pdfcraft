@@ -52,6 +52,32 @@ struct Gs {
     rise: f64,
 }
 
+impl Gs {
+    /// Make `font` the current font, as `Tf` and an ExtGState's `/Font` do.
+    fn select(&mut self, font: CachedFont) {
+        self.font = font.metrics;
+        self.vertical = font.vertical;
+    }
+}
+
+/// The resource category whose name selected a font. The two are separate name spaces (one name
+/// can be a font in one and a graphics state in the other), so a scope's font cache keys on both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FontSource {
+    /// A `/Font` resource, selected by `Tf`.
+    Resource,
+    /// An `/ExtGState` resource whose `/Font` entry selects the font, set by `gs`.
+    ExtGState,
+}
+
+/// A font as a scope caches it.
+#[derive(Clone)]
+struct CachedFont {
+    metrics: Rc<Metrics>,
+    /// The font writes vertically (see [`is_vertical`]).
+    vertical: bool,
+}
+
 /// What processing a scope produced.
 #[derive(Default)]
 pub(crate) struct Output {
@@ -101,7 +127,8 @@ pub(crate) struct Scope<'a> {
     pub hidden_layers: Vec<ObjRef>,
     /// Content removed from hidden layers (blocks and XObjects).
     pub layer_blocks: usize,
-    fonts: HashMap<Vec<u8>, Rc<Metrics>>,
+    /// The fonts this scope has selected, by the resource that named each.
+    fonts: HashMap<(FontSource, Vec<u8>), CachedFont>,
     used_names: Vec<Vec<u8>>,
     depth: usize,
 }
@@ -480,15 +507,23 @@ struct Glyph {
     hit: bool,
 }
 
-/// The metrics of the font `font_dict`, cached in the scope under `key` (a `/Font` resource name,
-/// or an ExtGState's name prefixed so the two cannot collide); the fallback when there is none.
-fn font_metrics(scope: &mut Scope<'_>, doc: &Document, key: &[u8], font_dict: Option<&Dict>, fallback: &Rc<Metrics>) -> Rc<Metrics> {
-    if let Some(f) = scope.fonts.get(key) {
-        return f.clone();
-    }
-    let m = font_dict.map(|d| Rc::new(Metrics::from_dict(doc, d))).unwrap_or_else(|| fallback.clone());
-    scope.fonts.insert(key.to_vec(), m.clone());
-    m
+/// The font `font_dict` as the layout needs it, cached in the scope under the resource that
+/// selected it (`source` and `name`), so its metrics are read and its writing mode worked out
+/// once per scope; the fallback, written horizontally, when there is no dictionary. Within a
+/// scope a resource name stands for one font dictionary, so the cached answer is the answer.
+fn cached_font(
+    scope: &mut Scope<'_>,
+    doc: &Document,
+    source: FontSource,
+    name: &[u8],
+    font_dict: Option<&Dict>,
+    fallback: &Rc<Metrics>,
+) -> CachedFont {
+    let font = scope.fonts.entry((source, name.to_vec())).or_insert_with(|| CachedFont {
+        metrics: font_dict.map(|d| Rc::new(Metrics::from_dict(doc, d))).unwrap_or_else(|| fallback.clone()),
+        vertical: font_dict.is_some_and(|d| is_vertical(doc, d)),
+    });
+    font.clone()
 }
 
 /// Process a page's content streams (state flows from one stream to the next) from the initial
@@ -662,8 +697,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     gs.size = op.num(1).unwrap_or(gs.size);
                     if let Some(name) = op.name(0) {
                         let font_dict = fonts_res.get(name).and_then(|f| doc.resolve(f).as_dict().cloned());
-                        gs.vertical = font_dict.as_ref().is_some_and(|d| is_vertical(doc, d));
-                        gs.font = font_metrics(scope, doc, name, font_dict.as_ref(), &fallback);
+                        gs.select(cached_font(scope, doc, FontSource::Resource, name, font_dict.as_ref(), &fallback));
                     }
                 }
                 b"gs" => {
@@ -679,9 +713,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                         }
                         if let Some(f) = pair.first() {
                             let font_dict = doc.resolve(f).as_dict().cloned();
-                            gs.vertical = font_dict.as_ref().is_some_and(|d| is_vertical(doc, d));
-                            let key = [b"gs:".as_slice(), name].concat();
-                            gs.font = font_metrics(scope, doc, &key, font_dict.as_ref(), &fallback);
+                            gs.select(cached_font(scope, doc, FontSource::ExtGState, name, font_dict.as_ref(), &fallback));
                         }
                     }
                 }

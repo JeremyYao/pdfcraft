@@ -1708,8 +1708,7 @@ fn is_doc_timestamp_change(doc: &Document, old: &Document, d: &Dict, before: Opt
         return true;
     }
     let only_stamps = |now: Option<&Object>, was: Option<&Object>| {
-        let was = refs(old, was);
-        let added: Vec<ObjRef> = refs(doc, now).into_iter().filter(|r| !was.contains(r)).collect();
+        let added = added_refs(doc, old, now, was);
         !added.is_empty() && added.iter().all(|r| doc.get(*r).as_dict().is_some_and(stamped))
     };
     for key in [&b"Annots"[..], b"Fields"] {
@@ -1726,6 +1725,13 @@ fn is_doc_timestamp_change(doc: &Document, old: &Document, d: &Dict, before: Opt
 
 fn refs(doc: &Document, o: Option<&Object>) -> Vec<ObjRef> {
     o.map(|o| doc.resolve(o)).and_then(|a| a.as_array().map(|a| a.iter().filter_map(Object::as_ref).collect())).unwrap_or_default()
+}
+
+/// The references a later revision added to an array: those `now` holds (read in `doc`) that
+/// `was`, the same array in the signed revision `old`, did not.
+fn added_refs(doc: &Document, old: &Document, now: Option<&Object>, was: Option<&Object>) -> Vec<ObjRef> {
+    let was = refs(old, was);
+    refs(doc, now).into_iter().filter(|r| !was.contains(r)).collect()
 }
 
 /// The interactive form dictionary of a document, resolved.
@@ -1748,8 +1754,7 @@ fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dic
     if strip(now) != strip(before) {
         return kind::FORM_FILL;
     }
-    let old_fields = refs(old, before.get(b"Fields"));
-    let added: Vec<ObjRef> = refs(doc, now.get(b"Fields")).into_iter().filter(|r| !old_fields.contains(r)).collect();
+    let added = added_refs(doc, old, now.get(b"Fields"), before.get(b"Fields"));
     if added.is_empty() || added_annots(doc, &added) == kind::SIGNATURE { kind::SIGNATURE } else { kind::COMMENTS }
 }
 
@@ -1793,11 +1798,7 @@ fn is_signature_dict(d: &Dict) -> bool {
 fn page_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
     match before {
         Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => kind::PAGE_CONTENT,
-        Some(b) => {
-            let was = refs(old, b.get(b"Annots"));
-            let added: Vec<ObjRef> = refs(doc, d.get(b"Annots")).into_iter().filter(|r| !was.contains(r)).collect();
-            added_annots(doc, &added)
-        }
+        Some(b) => added_annots(doc, &added_refs(doc, old, d.get(b"Annots"), b.get(b"Annots"))),
         None => kind::PAGE_CONTENT,
     }
 }
@@ -1830,11 +1831,7 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
         Some(b"Page") => {
             return match before {
                 Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => kind::PAGE_CONTENT,
-                Some(b) => {
-                    let was = refs(old, b.get(b"Annots"));
-                    let added: Vec<ObjRef> = refs(doc, d.get(b"Annots")).into_iter().filter(|r| !was.contains(r)).collect();
-                    added_annots(doc, &added)
-                }
+                Some(b) => added_annots(doc, &added_refs(doc, old, d.get(b"Annots"), b.get(b"Annots"))),
                 None => kind::COMMENTS,
             };
         }

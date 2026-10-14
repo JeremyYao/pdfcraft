@@ -318,10 +318,10 @@ impl Document {
         let parsed = doc.read_xref_chain(&mut log);
         let mut authenticated = false;
         let ok = match parsed {
-            Ok(XrefChain { entries, trailer, revisions, oddities, lenient, superseded }) => {
+            Ok(XrefChain { entries, trailer, revisions, oddities, trailer_lenient, superseded }) => {
                 doc.entries = Arc::new(entries);
                 doc.trailer = trailer;
-                doc.trailer_lenient = lenient;
+                doc.trailer_lenient = trailer_lenient;
                 doc.revisions = Arc::new(revisions);
                 doc.xref_oddities = Arc::new(oddities);
                 doc.superseded = Arc::new(superseded);
@@ -1069,7 +1069,9 @@ impl Document {
             _ => return Err(CosError::Syntax { offset: sx, detail: "bad startxref value".into() }),
         };
         let mut entries = BTreeMap::new();
-        let mut superseded = BTreeSet::new();
+        // One for the whole walk: its oddities are taken after each section, its superseded
+        // entries stay (those of a section that failed to read included).
+        let mut notes = SectionNotes::default();
         let mut trailer: Option<Dict> = None;
         let mut trailer_lenient = false;
         let mut revisions = Vec::new();
@@ -1086,15 +1088,13 @@ impl Document {
             }
             // This section's own entries; older sections only fill what newer ones left out.
             let mut sect = BTreeMap::new();
-            // Object numbers whose entry in this section was set aside ([`Self::xref_oddities`]).
-            let mut odd = Vec::new();
-            let (sect_trailer, is_stream, lenient) = match self.read_section(off as usize, &mut sect, &mut odd, &mut superseded) {
-                Ok(v) => v,
+            let section = match self.read_section(off as usize, &mut sect, &mut notes) {
+                Ok(section) => section,
                 Err(e) if self.header_offset > 0 => {
                     log.push(format!("xref at {off} unreadable ({e}); retrying relative to the header"));
                     sect.clear();
-                    odd.clear();
-                    self.read_section(off as usize + self.header_offset, &mut sect, &mut odd, &mut superseded)?
+                    notes.odd.clear();
+                    self.read_section(off as usize + self.header_offset, &mut sect, &mut notes)?
                 }
                 Err(e) => {
                     if revisions.is_empty() {
@@ -1104,13 +1104,13 @@ impl Document {
                     break;
                 }
             };
-            revisions.push(Revision { xref_offset: off, is_stream });
+            revisions.push(Revision { xref_offset: off, is_stream: section.is_stream });
             // Hybrid files (§7.5.8.4): the /XRefStm entries supplement the table and replace the
             // free entries it gives objects only a cross-reference stream can locate.
-            if let Some(x) = sect_trailer.int(b"XRefStm").filter(|x| *x >= 0) {
+            if let Some(x) = section.trailer.int(b"XRefStm").filter(|x| *x >= 0) {
                 let mut stm = BTreeMap::new();
-                match self.read_section(x as usize, &mut stm, &mut odd, &mut superseded) {
-                    Ok((stm_dict, _, _)) => {
+                match self.read_section(x as usize, &mut stm, &mut notes) {
+                    Ok(stream) => {
                         for (num, e) in stm {
                             match sect.get(&num) {
                                 None | Some(XrefEntry::Free { .. }) => {
@@ -1118,8 +1118,8 @@ impl Document {
                                 }
                                 // The table already places the object somewhere else.
                                 Some(old) if *old != e => {
-                                    note(&mut odd, num);
-                                    supersede(&mut superseded, num, &e);
+                                    notes.odd(num);
+                                    notes.supersede(num, &e);
                                 }
                                 Some(_) => {}
                             }
@@ -1127,7 +1127,7 @@ impl Document {
                         // The chain continues with the table's /Prev. A reader that follows
                         // the stream's own /Prev instead takes what it reaches for every
                         // object the table and the stream leave free or out.
-                        if let Some(p) = stm_dict.int(b"Prev").filter(|p| *p >= 0) {
+                        if let Some(p) = stream.trailer.int(b"Prev").filter(|p| *p >= 0) {
                             let in_use = |e: &XrefEntry| !matches!(e, XrefEntry::Free { .. });
                             let reached: Vec<(u32, XrefEntry)> = self
                                 .hybrid_prev_entries(p as u64)
@@ -1141,16 +1141,16 @@ impl Document {
                     Err(e) => log.push(format!("hybrid /XRefStm at {x} unreadable: {e}")),
                 }
             }
-            oddities.extend(odd.into_iter().map(|num| (off, num)));
+            oddities.extend(notes.odd.drain(..).map(|num| (off, num)));
             for (num, e) in sect {
                 if *entries.entry(num).or_insert(e) != e {
-                    supersede(&mut superseded, num, &e);
+                    notes.supersede(num, &e);
                 }
             }
-            next = sect_trailer.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
+            next = section.trailer.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
             if trailer.is_none() {
-                trailer = Some(sect_trailer);
-                trailer_lenient = lenient;
+                trailer = Some(section.trailer);
+                trailer_lenient = section.lenient;
             }
         }
         for (off, reached) in hybrid_prev {
@@ -1161,7 +1161,7 @@ impl Document {
         for k in [&b"Prev"[..], b"XRefStm", b"Type", b"W", b"Index", b"Filter", b"DecodeParms", b"Length"] {
             trailer.remove(k);
         }
-        Ok(XrefChain { entries, trailer, revisions, oddities, lenient: trailer_lenient, superseded })
+        Ok(XrefChain { entries, trailer, revisions, oddities, trailer_lenient, superseded: notes.superseded })
     }
 
     /// The entries the cross-reference stream of a hybrid file reaches through its own /Prev
@@ -1176,27 +1176,22 @@ impl Document {
             if !visited.insert(off) || visited.len() > 10_000 {
                 break;
             }
-            let (mut sect, mut odd, mut dup) = (BTreeMap::new(), Vec::new(), BTreeSet::new());
-            let Ok((dict, _, _)) = self.read_section(off as usize, &mut sect, &mut odd, &mut dup) else { break };
+            // This reader takes no entries from these sections, so what they note is dropped.
+            let (mut sect, mut unused) = (BTreeMap::new(), SectionNotes::default());
+            let Ok(section) = self.read_section(off as usize, &mut sect, &mut unused) else { break };
             for (num, e) in sect {
                 out.entry(num).or_insert(e);
             }
-            next = dict.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
+            next = section.trailer.int(b"Prev").filter(|p| *p >= 0).map(|p| p as u64);
         }
         out
     }
 
-    /// Read one section at `off`, adding entries not already known (newer sections win). `odd`
+    /// Read one section at `off`, adding entries not already known (newer sections win). `notes`
     /// collects the object numbers whose entry here is set aside or read differently by another
-    /// reader ([`Self::xref_oddities`]); `superseded` the in-file entries a row gives a number
-    /// that already has one.
-    fn read_section(
-        &self,
-        off: usize,
-        entries: &mut BTreeMap<u32, XrefEntry>,
-        odd: &mut Vec<u32>,
-        superseded: &mut BTreeSet<(u32, u64)>,
-    ) -> Result<(Dict, bool, bool), CosError> {
+    /// reader ([`Self::xref_oddities`]), and the in-file entries a row gives a number that
+    /// already has one.
+    fn read_section(&self, off: usize, entries: &mut BTreeMap<u32, XrefEntry>, notes: &mut SectionNotes) -> Result<Section, CosError> {
         let data = &self.data;
         let mut lx = Lexer::new(data, off);
         if lx.eat_keyword(b"xref") {
@@ -1204,8 +1199,8 @@ impl Document {
                 lx.skip_ws();
                 if lx.eat_keyword(b"trailer") {
                     let t = lx.object()?;
-                    let d = t.as_dict().cloned().ok_or(CosError::Syntax { offset: lx.pos, detail: "trailer is not a dictionary".into() })?;
-                    return Ok((d, false, lx.skipped > 0));
+                    let trailer = t.as_dict().cloned().ok_or(CosError::Syntax { offset: lx.pos, detail: "trailer is not a dictionary".into() })?;
+                    return Ok(Section { trailer, is_stream: false, lenient: lx.skipped > 0 });
                 }
                 let (Ok(Object::Int(start)), Ok(Object::Int(count))) = (lx.object(), lx.object()) else {
                     return Err(CosError::Syntax { offset: lx.pos, detail: "bad xref subsection header".into() });
@@ -1235,13 +1230,13 @@ impl Document {
                         && g.len() == 5
                         && matches!((data.get(lx.pos), data.get(lx.pos + 1)), (Some(b' '), Some(b'\n' | b'\r')) | (Some(b'\r'), Some(b'\n')));
                     if !fixed_form {
-                        note(odd, num);
+                        notes.odd(num);
                     }
                     // Offset 0 "in use" entries are a known producer bug: ignore them. (Object 0
                     // is never a real object, so its entry cannot mislead anyone.)
                     if matches!(entry, XrefEntry::InFile { offset: 0, .. }) {
                         if num != 0 {
-                            note(odd, num);
+                            notes.odd(num);
                         }
                         continue;
                     }
@@ -1249,12 +1244,12 @@ impl Document {
                     // up on the whole table where this one would keep an entry no object can be
                     // at. Set aside, so the two never quietly resolve the file differently.
                     if matches!(entry, XrefEntry::InFile { offset, .. } if offset > u64::from(u32::MAX)) {
-                        note(odd, num);
+                        notes.odd(num);
                         continue;
                     }
                     if *entries.entry(num).or_insert(entry) != entry {
-                        note(odd, num);
-                        supersede(superseded, num, &entry);
+                        notes.odd(num);
+                        notes.supersede(num, &entry);
                     }
                 }
             }
@@ -1306,11 +1301,11 @@ impl Document {
                 // A row /Index declares but the data does not hold: another reader may refuse
                 // the whole section for it.
                 let Some(r) = rows.next() else {
-                    note(odd, num);
+                    notes.odd(num);
                     break;
                 };
                 if odd_type_width {
-                    note(odd, num);
+                    notes.odd(num);
                 }
                 let t = field(r, 0, w[0], 1);
                 let a = field(r, w[0], w[1], 0);
@@ -1321,23 +1316,23 @@ impl Document {
                     2 => XrefEntry::InStream { stream: a.min(u32::MAX as u64) as u32, index: b.min(u32::MAX as u64) as u32 },
                     // Reserved types are treated as null references (§7.5.8.3).
                     _ => {
-                        note(odd, num);
+                        notes.odd(num);
                         continue;
                     }
                 };
                 if matches!(entry, XrefEntry::InFile { offset: 0, .. }) {
                     if num != 0 {
-                        note(odd, num);
+                        notes.odd(num);
                     }
                     continue;
                 }
                 if *entries.entry(num).or_insert(entry) != entry {
-                    note(odd, num);
-                    supersede(superseded, num, &entry);
+                    notes.odd(num);
+                    notes.supersede(num, &entry);
                 }
             }
         }
-        Ok((s.dict.clone(), true, lenient))
+        Ok(Section { trailer: s.dict.clone(), is_stream: true, lenient })
     }
 
     /// Rebuild the cross-reference index by scanning for `N G obj` headers (§7.5.4 recovery).
@@ -1474,22 +1469,45 @@ fn scan_headers(data: &[u8], from: usize, mut f: impl FnMut(usize, u32, u16)) {
     }
 }
 
-/// Record `num` among a section's oddities, up to [`ODDITIES_PER_SECTION`].
-fn note(odd: &mut Vec<u32>, num: u32) {
-    if odd.len() < ODDITIES_PER_SECTION {
-        odd.push(num);
-    }
+/// What one cross-reference section says of itself, besides its entries.
+struct Section {
+    /// Its trailer dictionary (for a cross-reference stream, the stream's own dictionary).
+    trailer: Dict,
+    /// The section is a cross-reference stream, not a table.
+    is_stream: bool,
+    /// The trailer was read leniently (tokens skipped as garbage).
+    lenient: bool,
 }
 
-/// Record the in-file entry `e` for `num` as one a newer section overrides: the body it
-/// locates is listed, though not current. Capped at [`MAX_XREF_OBJECTS`] entries, the most a
-/// document can have: past that a file is spending its sections on redefinitions, and a body
-/// only such a row lists counts as unlisted, which is the safe side.
-fn supersede(superseded: &mut BTreeSet<(u32, u64)>, num: u32, e: &XrefEntry) {
-    if let XrefEntry::InFile { offset, .. } = e
-        && superseded.len() < MAX_XREF_OBJECTS
-    {
-        superseded.insert((num, *offset));
+/// What reading sections records besides their entries. The two lists live differently: `odd`
+/// belongs to the section being read, `superseded` to the whole chain.
+#[derive(Default)]
+struct SectionNotes {
+    /// Object numbers whose entry in this section is set aside, or kept but read differently
+    /// by another reader ([`Document::xref_oddities`]).
+    odd: Vec<u32>,
+    /// In-file entries a row gives a number that already has one, as (object number, offset).
+    superseded: BTreeSet<(u32, u64)>,
+}
+
+impl SectionNotes {
+    /// Record `num` among the section's oddities, up to [`ODDITIES_PER_SECTION`].
+    fn odd(&mut self, num: u32) {
+        if self.odd.len() < ODDITIES_PER_SECTION {
+            self.odd.push(num);
+        }
+    }
+
+    /// Record the in-file `entry` for `num` as one a newer section overrides: the body it
+    /// locates is listed, though not current. Capped at [`MAX_XREF_OBJECTS`] entries, the most a
+    /// document can have: past that a file is spending its sections on redefinitions, and a body
+    /// only such a row lists counts as unlisted, which is the safe side.
+    fn supersede(&mut self, num: u32, entry: &XrefEntry) {
+        if let XrefEntry::InFile { offset, .. } = entry
+            && self.superseded.len() < MAX_XREF_OBJECTS
+        {
+            self.superseded.insert((num, *offset));
+        }
     }
 }
 
@@ -1499,7 +1517,7 @@ struct XrefChain {
     trailer: Dict,
     revisions: Vec<Revision>,
     oddities: Vec<(u64, u32)>,
-    lenient: bool,
+    trailer_lenient: bool,
     superseded: BTreeSet<(u32, u64)>,
 }
 

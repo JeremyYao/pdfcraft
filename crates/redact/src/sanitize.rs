@@ -149,24 +149,41 @@ fn refs_in(o: &Object, f: &mut impl FnMut(ObjRef)) {
     }
 }
 
-/// How many dictionaries in `o` (its own, and the direct ones inside it) hold `key`; with
-/// `entries`, how many items the arrays under it hold instead (one per associated file).
-fn count_key(doc: &Document, o: &Object, key: &[u8], entries: bool, depth: usize) -> usize {
+/// What one occurrence of a key counts for (see [`count_key`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Count {
+    /// One per dictionary that holds the key.
+    Dicts,
+    /// One per item of the array under the key (one per associated file); a value that is not an
+    /// array, or an empty one, counts as one.
+    Entries,
+}
+
+/// The keys that may sit on any dictionary (the catalog, a page, an XObject, a structure element,
+/// an annotation…) and are counted and stripped wherever they are: the category each belongs to,
+/// and what an occurrence counts for. XMP metadata (ISO 32000-2 §14.3.2), associated files
+/// (§14.13) and the private data of other applications (§14.5).
+const ANYWHERE: [(Hidden, &[u8], Count); 3] =
+    [(Hidden::Metadata, b"Metadata", Count::Dicts), (Hidden::Attachments, b"AF", Count::Entries), (Hidden::PrivateData, b"PieceInfo", Count::Dicts)];
+
+/// How many times `o` (its own dictionary, and the direct ones inside it) holds `key`, each
+/// occurrence counted as `count` says.
+fn count_key(doc: &Document, o: &Object, key: &[u8], count: Count, depth: usize) -> usize {
     if depth > 64 {
         return 0;
     }
     let in_dict = |d: &Dict| -> usize {
-        let own = match d.get(key) {
-            None => 0,
-            Some(v) if entries => doc.resolve(v).as_array().map_or(1, |a| a.len().max(1)),
-            Some(_) => 1,
+        let own = match (d.get(key), count) {
+            (None, _) => 0,
+            (Some(v), Count::Entries) => doc.resolve(v).as_array().map_or(1, |a| a.len().max(1)),
+            (Some(_), Count::Dicts) => 1,
         };
-        d.iter().fold(own, |n, (_, v)| n.saturating_add(count_key(doc, v, key, entries, depth + 1)))
+        d.iter().fold(own, |n, (_, v)| n.saturating_add(count_key(doc, v, key, count, depth + 1)))
     };
     match o {
         Object::Dict(d) => in_dict(d),
         Object::Stream(s) => in_dict(&s.dict),
-        Object::Array(a) => a.iter().fold(0, |n, x| n.saturating_add(count_key(doc, x, key, entries, depth + 1))),
+        Object::Array(a) => a.iter().fold(0, |n, x| n.saturating_add(count_key(doc, x, key, count, depth + 1))),
         _ => 0,
     }
 }
@@ -370,28 +387,27 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
     let names = sub(doc, &cat, b"Names").unwrap_or_default();
     // XMP, associated files and private data can sit on any dictionary (an XObject, a structure
     // element, an annotation…): count them wherever they are reachable from the catalog.
-    let (mut xmp, mut af, mut piece) = (0usize, 0usize, 0usize);
+    let mut anywhere = [0usize; ANYWHERE.len()];
     for r in reachable(doc) {
         let o = doc.get(r);
-        xmp = xmp.saturating_add(count_key(doc, &o, b"Metadata", false, 0));
-        af = af.saturating_add(count_key(doc, &o, b"AF", true, 0));
-        piece = piece.saturating_add(count_key(doc, &o, b"PieceInfo", false, 0));
+        for (n, (_, key, count)) in anywhere.iter_mut().zip(ANYWHERE) {
+            *n = n.saturating_add(count_key(doc, &o, key, count, 0));
+        }
     }
+    // What a category has under those keys (nothing, for most).
+    let found_anywhere =
+        |h: Hidden| ANYWHERE.iter().zip(anywhere).filter(|((category, ..), _)| *category == h).fold(0usize, |sum, (_, n)| sum.saturating_add(n));
     let mut doc2 = doc.clone();
     HIDDEN
         .into_iter()
         .map(|h| {
             let n = match h {
-                Hidden::Metadata => {
-                    let info = doc.trailer().get(b"Info").and_then(|i| doc.resolve(i).as_dict().map(|d| d.len())).unwrap_or(0);
-                    info.saturating_add(xmp)
-                }
+                Hidden::Metadata => doc.trailer().get(b"Info").and_then(|i| doc.resolve(i).as_dict().map(|d| d.len())).unwrap_or(0),
                 Hidden::Attachments => sub(doc, &names, b"EmbeddedFiles")
                     .map_or(0, |t| name_tree_len(doc, &t, 0))
                     .saturating_add(count_sub(b"FileAttachment"))
                     .saturating_add(annots.iter().filter(|a| is_multimedia(a.name(b"Subtype").unwrap_or(b""))).count())
-                    .saturating_add(sub(doc, &names, b"Renditions").map_or(0, |t| name_tree_len(doc, &t, 0)))
-                    .saturating_add(af),
+                    .saturating_add(sub(doc, &names, b"Renditions").map_or(0, |t| name_tree_len(doc, &t, 0))),
                 Hidden::Comments => annots.iter().filter(|a| is_comment(a.name(b"Subtype").unwrap_or(b""))).count(),
                 Hidden::FormFields => pdfcraft_forms::fields(doc).len(),
                 Hidden::HiddenText => content_pass(&mut doc2, true, false, false).unwrap_or(0),
@@ -410,9 +426,11 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
                         + sub(doc, &names, b"JavaScript").map_or(0, |t| name_tree_len(doc, &t, 0))
                         + sub(doc, &names, b"AlternatePresentations").map_or(0, |t| name_tree_len(doc, &t, 0))
                 }
-                Hidden::PrivateData => piece,
+                // All of it sits under an `ANYWHERE` key.
+                Hidden::PrivateData => 0,
             };
-            (h, n)
+            // Plus what the category has under the keys that may sit on any dictionary.
+            (h, n.saturating_add(found_anywhere(h)))
         })
         .collect()
 }
@@ -604,14 +622,10 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
     doc.set(root, Object::Dict(cat));
     // What was removed is deleted, so no other referrer keeps it in the saved file.
     crate::retire(doc, &retired)?;
-    // XMP (ISO 32000-2 §14.3.2), associated files (§14.13) and private data (§14.5) may sit on
-    // any dictionary, the catalog and pages included: strip them from every object still
-    // reachable from the catalog rather than from a fixed list.
-    let keys: Vec<&[u8]> = [(Hidden::Metadata, &b"Metadata"[..]), (Hidden::Attachments, b"AF"), (Hidden::PrivateData, b"PieceInfo")]
-        .into_iter()
-        .filter(|(h, _)| which.contains(h))
-        .map(|(_, k)| k)
-        .collect();
+    // XMP, associated files and private data may sit on any dictionary, the catalog and pages
+    // included: strip them from every object still reachable from the catalog rather than from a
+    // fixed list.
+    let keys: Vec<&[u8]> = ANYWHERE.into_iter().filter(|(h, ..)| which.contains(h)).map(|(_, key, _)| key).collect();
     if !keys.is_empty() {
         for r in reachable(doc) {
             if let Some(stripped) = strip_keys(&doc.get(r), &keys, 0) {

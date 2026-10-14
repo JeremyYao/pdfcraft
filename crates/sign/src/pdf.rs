@@ -676,14 +676,20 @@ pub fn validate(doc: &Document, bytes: &[u8], trust: &TrustStore, field: &str) -
 }
 
 /// Whether the byte-range gap `[l0, o1)` is the `/Contents` token of `holder`, the object that
-/// carries the signature dictionary (its /V object, or the field when /V is direct): the object's
-/// header lies in the file before the gap, nothing ends the object between the two, and the
-/// last token before the gap is the `/Contents` key. A dictionary that borrows another
-/// signature's range verifies over bytes that are not its own, under a reason, a date and a
-/// field name of its author's: it is not a signature at all, whatever the borrowed range says.
+/// carries the signature dictionary (its /V object, or the field when /V is direct): the gap is
+/// one `<…>` hexadecimal string, the object's header lies in the file before it, nothing ends
+/// the object between the two, and the last token before the gap is the `/Contents` key. A
+/// dictionary that borrows another signature's range verifies over bytes that are not its own,
+/// under a reason, a date and a field name of its author's: it is not a signature at all,
+/// whatever the borrowed range says.
 fn gap_is_own_contents(doc: &Document, bytes: &[u8], holder: Option<ObjRef>, l0: usize, o1: usize) -> bool {
     use pdfcraft_cos::XrefEntry;
     let Some(holder) = holder else { return false };
+    // The gap is one hexadecimal string, from its `<` to its `>`.
+    let Some(gap) = bytes.get(l0..o1) else { return false };
+    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
+        return false;
+    }
     // Only an object in the file at a known place can hold a byte range (never one in an object
     // stream, nor one the reader had to search for).
     let Some(XrefEntry::InFile { offset, .. }) = doc.xref_entry(holder.num) else { return false };
@@ -703,7 +709,7 @@ fn gap_is_own_contents(doc: &Document, bytes: &[u8], holder: Option<ObjRef>, l0:
     };
     let Some(start) = [offset, offset.saturating_add(header)].into_iter().find(|at| starts_here(*at)) else { return false };
     let Some(head) = bytes.get(start..l0) else { return false };
-    head.trim_ascii_end().ends_with(b"/Contents") && !head.windows(6).any(|w| w == b"endobj") && o1 <= bytes.len()
+    head.trim_ascii_end().ends_with(b"/Contents") && !head.windows(6).any(|w| w == b"endobj")
 }
 
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
@@ -760,7 +766,7 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         return invalid(info, Detail::plain("The signature's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, field.holder(), l0, o1) {
+    if !gap_is_own_contents(doc, bytes, field.holder(), l0, o1) {
         return invalid(info, Detail::plain("The signature's byte range does not exclude exactly its contents."));
     }
     let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, Detail::plain("The signature contents are not hexadecimal.")) };
@@ -1060,7 +1066,7 @@ fn validate_doc_timestamp(
         return invalid(info, Detail::plain("The timestamp's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, holder, l0, o1) {
+    if !gap_is_own_contents(doc, bytes, holder, l0, o1) {
         return invalid(info, Detail::plain("The timestamp's byte range does not exclude exactly its contents."));
     }
     let Some(contents) = unhex(&gap[1..gap.len() - 1]) else {

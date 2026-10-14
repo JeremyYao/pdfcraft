@@ -285,38 +285,17 @@ pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], copies: &[Obj
     let index: HashMap<ObjRef, usize> = pdfcraft_model::pages(doc).iter().enumerate().map(|(i, p)| (p.obj, i)).collect();
     for (node, users) in holders {
         let Some(res) = doc.get(node).as_dict().and_then(|d| d.get(b"Resources")).and_then(|r| doc.resolve(r).as_dict().cloned()) else { continue };
-        let mut xo = res_dict(doc, &res, b"XObject");
-        let names: Vec<Vec<u8>> = xo.iter().filter(|(_, v)| v.as_ref().is_some_and(|r| doomed.contains(&r))).map(|(n, _)| n.to_vec()).collect();
-        if names.is_empty() {
-            continue;
-        }
-        let mut contents = Vec::with_capacity(users.len());
-        for user in &users {
-            let page = doc.get(*user).as_dict().cloned().unwrap_or_default();
-            // A page whose content cannot be read may still draw the name: fail closed.
-            contents.push(page_streams(doc, &page, index.get(user).copied().unwrap_or(0))?.1);
-        }
-        let mut pruned = false;
-        for n in names {
-            let mut drawn = Some(false);
-            for content in &contents {
-                drawn = content_draws(doc, content, &xo, &n, 0, &mut HashSet::new());
-                if drawn != Some(false) {
-                    break;
-                }
-            }
-            match drawn {
-                Some(true) => {}
-                Some(false) => {
-                    xo.remove(&n);
-                    pruned = true;
-                }
-                None => return Err(RedactError::Residue(1)),
-            }
-        }
-        if pruned {
-            let mut res = res;
-            res.set(b"XObject".to_vec(), Object::Dict(xo));
+        let contents = || {
+            users
+                .iter()
+                .map(|user| {
+                    let page = doc.get(*user).as_dict().cloned().unwrap_or_default();
+                    // A page whose content cannot be read may still draw the name: fail closed.
+                    Ok(page_streams(doc, &page, index.get(user).copied().unwrap_or(0))?.1)
+                })
+                .collect()
+        };
+        if let Some(res) = without_doomed(doc, &res, &doomed, contents)? {
             doc.update_dict(node, |d| d.set(b"Resources".to_vec(), Object::Dict(res)))?;
         }
     }
@@ -324,33 +303,57 @@ pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], copies: &[Obj
         let obj = doc.get(*copy);
         let Object::Stream(s) = &*obj else { continue };
         let Some(res) = s.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()) else { continue };
-        let mut xo = res_dict(doc, &res, b"XObject");
-        let names: Vec<Vec<u8>> = xo.iter().filter(|(_, v)| v.as_ref().is_some_and(|r| doomed.contains(&r))).map(|(n, _)| n.to_vec()).collect();
-        if names.is_empty() {
-            continue;
-        }
         // A copy whose content cannot be read may still draw the name: fail closed.
-        let content = s.decoded().map_err(|_| RedactError::Residue(1))?;
-        let mut pruned = false;
-        for n in names {
-            match content_draws(doc, std::slice::from_ref(&content), &xo, &n, 0, &mut HashSet::new()) {
-                Some(true) => {}
-                Some(false) => {
-                    xo.remove(&n);
-                    pruned = true;
-                }
-                None => return Err(RedactError::Residue(1)),
-            }
-        }
-        if pruned {
-            let mut res = res;
-            res.set(b"XObject".to_vec(), Object::Dict(xo));
+        let content = || Ok(vec![vec![s.decoded().map_err(|_| RedactError::Residue(1))?]]);
+        if let Some(res) = without_doomed(doc, &res, &doomed, content)? {
             let mut dict = s.dict.clone();
             dict.set(b"Resources".to_vec(), Object::Dict(res));
             doc.set(*copy, Object::Stream(Stream { dict, raw: s.raw.clone() }));
         }
     }
     Ok(())
+}
+
+/// The resource dictionary `res` without its /XObject entries for `doomed` objects, except those
+/// a scope drawing through `res` still draws; `None` when no entry goes. `contents` gives each
+/// such scope's content streams and is called only when `res` names a doomed object. Fails
+/// closed when a scope's use of a name cannot be told.
+fn without_doomed(
+    doc: &Document,
+    res: &Dict,
+    doomed: &HashSet<ObjRef>,
+    contents: impl FnOnce() -> Result<Vec<Vec<Vec<u8>>>, RedactError>,
+) -> Result<Option<Dict>, RedactError> {
+    let mut xo = res_dict(doc, res, b"XObject");
+    let names: Vec<Vec<u8>> = xo.iter().filter(|(_, v)| v.as_ref().is_some_and(|r| doomed.contains(&r))).map(|(n, _)| n.to_vec()).collect();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let contents = contents()?;
+    let mut pruned = false;
+    for n in names {
+        let mut drawn = Some(false);
+        for content in &contents {
+            drawn = content_draws(doc, content, &xo, &n, 0, &mut HashSet::new());
+            if drawn != Some(false) {
+                break;
+            }
+        }
+        match drawn {
+            Some(true) => {}
+            Some(false) => {
+                xo.remove(&n);
+                pruned = true;
+            }
+            None => return Err(RedactError::Residue(1)),
+        }
+    }
+    if !pruned {
+        return Ok(None);
+    }
+    let mut res = res.clone();
+    res.set(b"XObject".to_vec(), Object::Dict(xo));
+    Ok(Some(res))
 }
 
 /// The clip that hides everything inside each region: one even-odd clip per region (a big

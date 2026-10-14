@@ -44,14 +44,13 @@ pub fn fold_case(s: &str) -> String {
 }
 
 /// [`fold_case`] of one character.
-fn fold_char(c: char) -> impl Iterator<Item = char> {
-    let one = match c {
-        'I' | 'i' | '\u{130}' | '\u{131}' => Some('i'),
-        'Σ' | 'σ' | 'ς' => Some('σ'),
-        _ => None,
-    };
-    let rest = if one.is_none() { Some(c) } else { None };
-    one.into_iter().chain(rest.into_iter().flat_map(char::to_lowercase))
+fn fold_char(c: char) -> std::char::ToLowercase {
+    match c {
+        'I' | 'i' | '\u{130}' | '\u{131}' => 'i',
+        'Σ' | 'σ' | 'ς' => 'σ',
+        _ => c,
+    }
+    .to_lowercase()
 }
 
 /// What search sees for one page or query character, pushed onto `out`: compatibility
@@ -95,6 +94,23 @@ fn for_search(c: char, case_sensitive: bool, scratch: &mut Vec<char>, mut push: 
             fold_char(s).for_each(&mut push);
         }
     }
+}
+
+/// Is `c` a space that adds nothing to search text ending in `last`: a leading one, or one after
+/// another space? Leaving these out makes a run of white space read as one space.
+fn is_redundant_space(c: char, last: Option<&char>) -> bool {
+    c == ' ' && last.is_none_or(|k| *k == ' ')
+}
+
+/// The glyphs behind characters `range` of [`PageText::search_text`], given the glyph of each
+/// character: from the first glyph to the last one that produced a character in the range. A
+/// glyph between them that produced none (a soft hyphen) lies inside. `None` for an empty range,
+/// one past the end of the text, or one holding only inserted separators.
+fn glyph_range(owner: &[Option<usize>], range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let glyphs = owner.get(range)?;
+    let start = glyphs.iter().find_map(|g| *g)?;
+    let end = glyphs.iter().rev().find_map(|g| *g)?.checked_add(1)?;
+    (start < end).then_some(start..end)
 }
 
 /// Is `c` a combining mark (U+0300 to U+036F)? It continues the word of the letter before it.
@@ -330,7 +346,7 @@ impl PageText {
         for c in needle.chars() {
             for_search(c, case_sensitive, &mut scratch, |c| {
                 // Leading spaces and runs of spaces collapse; trailing ones are cut below.
-                if c != ' ' || needle_chars.last().is_some_and(|k| *k != ' ') {
+                if !is_redundant_space(c, needle_chars.last()) {
                     needle_chars.push(c);
                 }
             });
@@ -342,36 +358,24 @@ impl PageText {
         if needle.is_empty() {
             return Vec::new();
         }
-        // Flatten to chars with the glyph index each char came from. A glyph that produces no
-        // character (a soft hyphen) still falls inside a match that spans it, since a match is
-        // the range from its first to its last glyph.
-        let mut chars: Vec<(char, usize)> = Vec::new();
-        for (i, g) in self.glyphs.iter().enumerate() {
-            if i > 0 && (self.space_before[i] || self.line_of[i] != self.line_of[i - 1]) && chars.last().is_some_and(|c| c.0 != ' ') {
-                chars.push((' ', i));
-            }
-            for c in g.text.chars() {
-                for_search(c, case_sensitive, &mut scratch, |c| {
-                    // The query collapses a run of whitespace to one space, so collapse the page too.
-                    if c != ' ' || chars.last().is_some_and(|k| k.0 != ' ') {
-                        chars.push((c, i));
-                    }
-                });
-            }
-        }
-        let word = |k: Option<&(char, usize)>| k.is_some_and(|c| c.0.is_alphanumeric() || is_combining(c.0));
+        let (chars, owner) = self.search_text(case_sensitive);
+        let word = |k: Option<&char>| k.is_some_and(|c| c.is_alphanumeric() || is_combining(*c));
         let mut out = Vec::new();
         let mut i = 0;
         while i + needle.len() <= chars.len() {
-            let bounded = !whole_words || (!word(i.checked_sub(1).and_then(|p| chars.get(p))) && !word(chars.get(i + needle.len())));
-            if bounded && chars[i..i + needle.len()].iter().map(|c| c.0).eq(needle.iter().copied()) {
-                let start = chars[i].1;
-                let end = chars[i + needle.len() - 1].1 + 1;
-                out.push(start..end);
+            let end = i + needle.len();
+            let bounded = !whole_words || (!word(i.checked_sub(1).and_then(|p| chars.get(p))) && !word(chars.get(end)));
+            // The needle neither starts nor ends with a space, so a match never starts or ends on
+            // an inserted separator: its first and last characters each have a glyph.
+            if bounded
+                && chars.get(i..end) == Some(needle.as_slice())
+                && let Some(glyphs) = glyph_range(&owner, i..end)
+            {
+                out.push(glyphs);
                 if out.len() == limit {
                     break;
                 }
-                i += needle.len();
+                i = end;
             } else {
                 i += 1;
             }
@@ -385,39 +389,35 @@ impl PageText {
     ///
     /// [`find_opts`]: Self::find_opts
     pub fn find_with(&self, matcher: impl Fn(&[char]) -> Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+        let (chars, owner) = self.search_text(true);
+        matcher(&chars).into_iter().filter_map(|r| glyph_range(&owner, r)).collect()
+    }
+
+    /// The page text as search compares it, and the glyph each of its characters came from: every
+    /// glyph's characters normalised by [`for_search`], one space between words and between
+    /// lines, a run of white space as one space. The glyph is `None` for a separator inserted
+    /// between two glyphs: it is part of neither, so a match that starts or ends on it does not
+    /// take the neighbouring glyph. The two vectors have the same length.
+    fn search_text(&self, case_sensitive: bool) -> (Vec<char>, Vec<Option<usize>>) {
         let mut chars: Vec<char> = Vec::new();
-        // `None` is a word or line separator inserted between glyphs. It is not part of either
-        // glyph, so a match that starts or ends on it must not take the neighbouring glyph.
         let mut owner: Vec<Option<usize>> = Vec::new();
         let mut scratch = Vec::new();
         for (i, g) in self.glyphs.iter().enumerate() {
             let gap = self.space_before.get(i).copied().unwrap_or(false) || self.line_of.get(i) != self.line_of.get(i.saturating_sub(1));
-            if i > 0 && gap && chars.last().is_some_and(|c| *c != ' ') {
+            if i > 0 && gap && !is_redundant_space(' ', chars.last()) {
                 chars.push(' ');
                 owner.push(None);
             }
             for c in g.text.chars() {
-                for_search(c, true, &mut scratch, |c| {
-                    // A run of white space is one space, as in the phrase search.
-                    if c != ' ' || chars.last().is_some_and(|k| *k != ' ') {
+                for_search(c, case_sensitive, &mut scratch, |c| {
+                    if !is_redundant_space(c, chars.last()) {
                         chars.push(c);
                         owner.push(Some(i));
                     }
                 });
             }
         }
-        matcher(&chars)
-            .into_iter()
-            .filter_map(|r| {
-                if r.start >= r.end || r.end > chars.len() {
-                    return None;
-                }
-                let glyphs = owner.get(r.start..r.end)?;
-                let start = glyphs.iter().find_map(|g| *g)?;
-                let end = glyphs.iter().rev().find_map(|g| *g)?.checked_add(1)?;
-                (start < end).then_some(start..end)
-            })
-            .collect()
+        (chars, owner)
     }
 
     /// Index of the glyph nearest to a view-space point (for selection anchors).

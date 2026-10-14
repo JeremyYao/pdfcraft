@@ -534,15 +534,15 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
     out.unreadable |= parsed.unterminated_inline_image;
     let props = res_dict(doc, resources, b"Properties");
     if !scope.hidden_layers.is_empty() {
-        let (kept, removed, dropped) = strip_hidden_layers(doc, scope, parsed.ops, &props, &mut out);
-        parsed.ops = kept;
-        if removed > 0 {
-            scope.layer_blocks += removed;
+        let stripped = strip_hidden_layers(doc, scope, parsed.ops, &props, &mut out);
+        parsed.ops = stripped.ops;
+        if stripped.blocks > 0 {
+            scope.layer_blocks += stripped.blocks;
             forced_change = true;
         }
         // The XObjects the removed blocks drew: unlinked by the caller unless a surviving `Do`
         // still draws them, so their bytes do not stay reachable in the saved file.
-        for name in dropped {
+        for name in stripped.dropped {
             if let Some(r) = xobjects.get(&name).and_then(Object::as_ref) {
                 out.doomed.push(r);
             }
@@ -1073,19 +1073,34 @@ fn xobject(
     }
 }
 
+/// A marked-content block that is open while the hidden layers are stripped.
+struct Open {
+    /// Its contents go: it is a hidden layer's block, or lies inside one.
+    hidden: bool,
+    /// Where its `BDC` went in the kept operators (when it was kept and not cleaned yet).
+    bdc: Option<usize>,
+}
+
+/// What [`strip_hidden_layers`] left of a scope's operators, and what it took.
+struct Stripped {
+    /// The remaining operators.
+    ops: Vec<Op>,
+    /// How many hidden blocks went (one nested in another counts with it).
+    blocks: usize,
+    /// The XObject names of the `Do` operators that went with them, each once.
+    dropped: Vec<Vec<u8>>,
+}
+
 /// Remove marked-content blocks of hidden layers (`/OC /name BDC … EMC`, nested blocks
-/// included). Returns the remaining operators, how many blocks went, and the XObject names of
-/// the `Do` operators that went with them. A kept sequence around a removed block loses the
-/// text that stood for its content (`clean_property_list`).
-fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, props: &Dict, out: &mut Output) -> (Vec<Op>, usize, Vec<Vec<u8>>) {
+/// included). A kept sequence around a removed block loses the text that stood for its content
+/// (`clean_property_list`).
+fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, props: &Dict, out: &mut Output) -> Stripped {
     let mut kept = Vec::with_capacity(ops.len());
-    // For each open marked-content block: does it hide its contents, and where its `BDC` went in
-    // `kept` (when it was kept and not cleaned yet).
-    let mut stack: Vec<(bool, Option<usize>)> = Vec::new();
-    let mut removed = 0;
+    let mut stack: Vec<Open> = Vec::new();
+    let mut blocks = 0;
     let mut dropped: Vec<Vec<u8>> = Vec::new();
     for op in ops {
-        let hidden_now = stack.last().is_some_and(|s| s.0);
+        let hidden_now = stack.last().is_some_and(|open| open.hidden);
         match op.op.as_slice() {
             b"BDC" | b"BMC" => {
                 let this = op.is("BDC")
@@ -1096,10 +1111,10 @@ fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, prop
                         None => false,
                     };
                 if this && !hidden_now {
-                    removed += 1;
+                    blocks += 1;
                     if scope.mode == Mode::Apply {
-                        for slot in stack.iter_mut() {
-                            let Some(i) = slot.1.take() else { continue };
+                        for open in stack.iter_mut() {
+                            let Some(i) = open.bdc.take() else { continue };
                             if let Some(bdc) = kept.get_mut(i) {
                                 clean_property_list(doc, scope, bdc, props, out);
                             }
@@ -1107,14 +1122,14 @@ fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, prop
                     }
                 }
                 let keep = !(hidden_now || this);
-                stack.push((hidden_now || this, (keep && op.is("BDC")).then_some(kept.len())));
+                stack.push(Open { hidden: hidden_now || this, bdc: (keep && op.is("BDC")).then_some(kept.len()) });
                 if keep {
                     kept.push(op);
                 }
             }
             b"EMC" => {
-                let was = stack.pop().is_some_and(|s| s.0);
-                if !was {
+                let was_hidden = stack.pop().is_some_and(|open| open.hidden);
+                if !was_hidden {
                     kept.push(op);
                 }
             }
@@ -1130,7 +1145,7 @@ fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, prop
             }
         }
     }
-    (kept, removed, dropped)
+    Stripped { ops: kept, blocks, dropped }
 }
 
 /// Drop the `/Properties` entries that name a hidden layer (an off OCG, or an OCMD all of whose

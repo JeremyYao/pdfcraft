@@ -274,27 +274,23 @@ impl OcspResponse {
         // else the certificate the response carries, found the same way. Only the first may skip
         // the delegation checks: a carried certificate is vouched for by nothing but those
         // checks, whatever subject it copies, so the way it was found decides, never its name.
-        let (responder, is_issuer): (&Certificate, bool) = match &self.responder_id {
-            ResponderId::ByName(name) if *name == issuer.subject.raw => (issuer, true),
-            ResponderId::ByName(name) => match self.responder_cert.as_ref().filter(|c| *name == c.subject.raw) {
-                Some(c) => (c, false),
-                None => return RevocationStatus::Unknown,
-            },
-            ResponderId::ByKey(hash) if *hash == DigestAlg::Sha1.digest(&[&issuer.public_key.key_bits()]) => (issuer, true),
-            ResponderId::ByKey(hash) => match self.responder_cert.as_ref().filter(|c| *hash == DigestAlg::Sha1.digest(&[&c.public_key.key_bits()])) {
-                Some(c) => (c, false),
-                None => return RevocationStatus::Unknown,
-            },
+        let named = |c: &Certificate| match &self.responder_id {
+            ResponderId::ByName(name) => *name == c.subject.raw,
+            ResponderId::ByKey(hash) => *hash == DigestAlg::Sha1.digest(&[&c.public_key.key_bits()]),
         };
-        // A delegated responder must carry the OCSP-signing EKU and be issued by the issuer.
-        if !is_issuer {
-            if responder.issuer.raw != issuer.subject.raw || !responder.signed_by(&issuer.public_key) {
+        let responder = if named(issuer) {
+            issuer
+        } else {
+            let Some(delegate) = self.responder_cert.as_ref().filter(|c| named(c)) else { return RevocationStatus::Unknown };
+            // A delegated responder must carry the OCSP-signing EKU and be issued by the issuer.
+            if delegate.issuer.raw != issuer.subject.raw || !delegate.signed_by(&issuer.public_key) {
                 return RevocationStatus::Unknown;
             }
-            if !responder.extended_key_usage.as_ref().is_some_and(|e| e.iter().any(|o| o == EKU_OCSP_SIGNING)) {
+            if !delegate.extended_key_usage.as_ref().is_some_and(|e| e.iter().any(|o| o == EKU_OCSP_SIGNING)) {
                 return RevocationStatus::Unknown;
             }
-        }
+            delegate
+        };
         if !verify_signature(&self.tbs, &self.sig_alg, &self.signature, &responder.public_key) {
             return RevocationStatus::Unknown;
         }

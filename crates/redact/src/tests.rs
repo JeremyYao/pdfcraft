@@ -448,6 +448,46 @@ fn an_image_a_form_drew_through_the_pages_resources_does_not_survive() {
     assert!(!bytes_contain(&bytes, b"REDIMGONECOVERED"), "the image the form drew survived the save");
 }
 
+/// A form without /Resources draws an image both under the mark and outside it, and the page
+/// draws the same image under the mark too. The page then no longer draws the image itself and
+/// drops it from its own dictionary, so the form's copy must keep resources of its own that
+/// still name it: the draw outside the mark stays, with the image's bytes.
+#[test]
+fn an_image_a_resource_less_form_draws_outside_the_mark_survives() {
+    let mut doc = one_page(
+        b"q 50 0 0 50 20 230 cm /Im1 Do Q BT /F1 10 Tf 20 210 Td (PAGESECRET) Tj ET /FmBare Do",
+        "/XObject << /FmBare 7 0 R /Im1 8 0 R >>",
+        vec![
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", b"q 50 0 0 50 120 230 cm /Im1 Do Q q 50 0 0 50 20 20 cm /Im1 Do Q"),
+            stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"IMGKEPTOUTSIDE!!"),
+        ],
+    );
+    mark(&mut doc, 0, &[[0.0, 200.0, 300.0, 300.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.images_removed, r.forms_rewritten), (2, 1), "the page's and the form's draws under the mark go: {r:?}");
+    assert!(!saved_contains(&doc, b"PAGESECRET"), "the page's text under the mark survived the save");
+    assert!(saved_contains(&doc, b"IMGKEPTOUTSIDE!!"), "the image the form still draws outside the mark left the saved file");
+
+    // The page draws the form's copy, which draws /Im1 once (outside the mark) and finds it
+    // through its own /Resources, or through the page's when it has none.
+    let saved = reopen(&doc);
+    let page = pdfcraft_model::pages(&saved).swap_remove(0);
+    let page_res = saved.resolve(page.dict.get(b"Resources").unwrap()).as_dict().cloned().unwrap();
+    let page_xo = saved.resolve(page_res.get(b"XObject").unwrap()).as_dict().cloned().unwrap();
+    let copy = page_xo.iter().find(|(n, _)| n.starts_with(b"PCRedacted")).and_then(|(_, v)| v.as_ref()).expect("the page draws the form's copy");
+    let Object::Stream(copy) = &*saved.get(copy) else { panic!("the form's copy is a stream") };
+    let drawn = String::from_utf8(copy.decoded().unwrap()).unwrap();
+    assert_eq!(drawn.matches("/Im1 Do").count(), 1, "only the draw outside the mark stays: {drawn}");
+    let res = match copy.dict.get(b"Resources") {
+        Some(r) => saved.resolve(r).as_dict().cloned().unwrap(),
+        None => page_res,
+    };
+    let image = res.get(b"XObject").and_then(|x| saved.resolve(x).as_dict().cloned()).and_then(|xo| xo.get(b"Im1").and_then(Object::as_ref));
+    let image = image.map(|r| saved.get(r)).expect("the form's copy can no longer find the image it draws outside the mark");
+    let Object::Stream(image) = &*image else { panic!("/Im1 is a stream") };
+    assert_eq!(image.decoded().unwrap(), b"IMGKEPTOUTSIDE!!", "the image drawn outside the mark is intact");
+}
+
 /// Remove Hidden Information has the same rewrite: an off layer's image named by an inherited
 /// /Resources must leave the saved file too.
 #[test]

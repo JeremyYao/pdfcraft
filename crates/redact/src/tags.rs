@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
+use crate::interp::REPLACEMENT_KEYS;
+
 /// Each MCID's operators (serialized), and whether anything is still drawn inside it.
 fn by_mcid(doc: &Document, resources: &Dict, data: &[u8]) -> HashMap<i64, (Vec<u8>, bool)> {
     let mut out: HashMap<i64, (Vec<u8>, bool)> = HashMap::new();
@@ -97,6 +99,26 @@ fn mcid_of(doc: &Document, o: &Object, page: Option<ObjRef>, target: ObjRef, str
     }
 }
 
+/// A kid of the structure tree waiting to be visited, with what it gets from above.
+struct Pending {
+    kid: Object,
+    /// The page it inherits (the nearest `/Pg` above it).
+    page: Option<ObjRef>,
+    /// The element above it.
+    parent: Option<ObjRef>,
+}
+
+/// A structure element with marked content of the cleaned page or form among its kids.
+struct Hit {
+    element: ObjRef,
+    /// The element as the walk found it.
+    dict: Dict,
+    /// The page its kids inherit (its own `/Pg`, or the nearest above it).
+    page: Option<ObjRef>,
+    /// It owns marked content that changed, so its descriptive text goes.
+    sensitive: bool,
+}
+
 /// Clean the elements owning `changed` marked content on `page`; returns how many changed.
 pub(crate) fn clean(
     doc: &mut Document,
@@ -115,23 +137,22 @@ pub(crate) fn clean(
     else {
         return Ok(0);
     };
-    // Indirect elements with the page they inherit and the element above them.
-    let mut todo: Vec<(Object, Option<ObjRef>, Option<ObjRef>)> = root.get(b"K").map(|k| vec![(k.clone(), None, None)]).unwrap_or_default();
+    let mut todo: Vec<Pending> = root.get(b"K").map(|k| vec![Pending { kid: k.clone(), page: None, parent: None }]).unwrap_or_default();
     let mut seen = HashSet::new();
     // Each element's parent as the walk found it (not `/P`, which a malformed tree may point
     // anywhere): an element is reached once, after its parent, so following this is acyclic.
     let mut parents: HashMap<ObjRef, ObjRef> = HashMap::new();
-    let mut hits: Vec<(ObjRef, Dict, Option<ObjRef>, bool)> = Vec::new();
-    while let Some((k, pg, parent)) = todo.pop() {
-        match k {
-            Object::Array(a) => todo.extend(a.into_iter().map(|x| (x, pg, parent))),
+    let mut hits: Vec<Hit> = Vec::new();
+    while let Some(Pending { kid, page: pg, parent }) = todo.pop() {
+        match kid {
+            Object::Array(a) => todo.extend(a.into_iter().map(|kid| Pending { kid, page: pg, parent })),
             Object::Ref(r) => {
                 if !seen.insert(r) || seen.len() > 2_000_000 {
                     continue;
                 }
                 let object = doc.get(r);
                 if let Object::Array(a) = &*object {
-                    todo.extend(a.iter().cloned().map(|x| (x, pg, parent)));
+                    todo.extend(a.iter().cloned().map(|kid| Pending { kid, page: pg, parent }));
                     continue;
                 }
                 let Some(d) = object.as_dict().cloned() else { continue };
@@ -152,16 +173,16 @@ pub(crate) fn clean(
                 let sensitive = kids.iter().any(|x| mcid_of(doc, x, pg, page, stream).is_some_and(|m| changed.contains(&m)));
                 let remap = stream.is_some() && kids.iter().any(|x| mcid_of(doc, x, pg, page, stream).is_some());
                 if sensitive || remap {
-                    hits.push((r, d.clone(), pg, sensitive));
+                    hits.push(Hit { element: r, dict: d.clone(), page: pg, sensitive });
                 }
-                todo.extend(kids.into_iter().map(|x| (x, pg, Some(r))));
+                todo.extend(kids.into_iter().map(|kid| Pending { kid, page: pg, parent: Some(r) }));
             }
             _ => {}
         }
     }
     let mut n = 0;
-    let owners: Vec<ObjRef> = hits.iter().filter(|h| h.3).map(|h| h.0).collect();
-    for (r, d, pg, sensitive) in hits {
+    let owners: Vec<ObjRef> = hits.iter().filter(|hit| hit.sensitive).map(|hit| hit.element).collect();
+    for Hit { element: r, dict: d, page: pg, sensitive } in hits {
         let kids = d.get(b"K").map(|k| doc.resolve(k));
         let array = kids.as_ref().is_some_and(|k| matches!(&**k, Object::Array(_)));
         let list = match kids.as_deref() {
@@ -194,9 +215,7 @@ pub(crate) fn clean(
         }
         doc.update_dict(r, |e| {
             if sensitive {
-                for key in DESCRIPTIVE_KEYS {
-                    e.remove(key);
-                }
+                strip_descriptive(e);
             }
             if array {
                 e.set(b"K".to_vec(), Object::Array(keep));
@@ -220,12 +239,8 @@ pub(crate) fn clean(
             if steps > 100_000 || !cleaned.insert(p) {
                 break;
             }
-            if doc.get(p).as_dict().is_some_and(|d| DESCRIPTIVE_KEYS.iter().any(|k| d.contains(k))) {
-                doc.update_dict(p, |e| {
-                    for key in DESCRIPTIVE_KEYS {
-                        e.remove(key);
-                    }
-                })?;
+            if doc.get(p).as_dict().is_some_and(has_descriptive) {
+                doc.update_dict(p, strip_descriptive)?;
                 n += 1;
             }
             cur = parents.get(&p).copied();
@@ -234,9 +249,23 @@ pub(crate) fn clean(
     Ok(n)
 }
 
-/// What a structure element says about its content: the replacement text a reader may show in
-/// its place (`REPLACEMENT_KEYS`) and the title that names it. A title names a section rather
-/// than spelling its content, but nothing says it never repeats the removed words, so it goes
-/// too (fail closed).
-const DESCRIPTIVE_KEYS: [&[u8]; 4] =
-    [crate::interp::REPLACEMENT_KEYS[0], crate::interp::REPLACEMENT_KEYS[1], crate::interp::REPLACEMENT_KEYS[2], b"T"];
+/// The keys under which a structure element says something about its content: the replacement
+/// text a reader may show in its place (every one of `REPLACEMENT_KEYS`) and the title that names
+/// it (`/T`). A title names a section rather than spelling its content, but nothing says it never
+/// repeats the removed words, so it goes too (fail closed).
+fn descriptive_keys() -> impl Iterator<Item = &'static [u8]> {
+    REPLACEMENT_KEYS.into_iter().chain(std::iter::once(b"T".as_slice()))
+}
+
+/// Does this structure element describe its content (hold any of the `descriptive_keys`)?
+fn has_descriptive(d: &Dict) -> bool {
+    descriptive_keys().any(|key| d.contains(key))
+}
+
+/// Remove what this structure element says about its content (every one of the
+/// `descriptive_keys`).
+fn strip_descriptive(d: &mut Dict) {
+    for key in descriptive_keys() {
+        d.remove(key);
+    }
+}

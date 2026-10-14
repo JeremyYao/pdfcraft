@@ -1423,10 +1423,16 @@ fn freed_kind(d: &Dict) -> &'static str {
     if d.name(b"FT") == Some(b"Sig") {
         return kind::OTHER;
     }
-    if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") || d.contains(b"Fields") {
+    if is_field_dict(d) || d.contains(b"Fields") {
         return kind::FORM_FILL;
     }
     kind::OTHER
+}
+
+/// Whether `d` has the keys of interactive form data: a field's type, a name with kids (a field
+/// that only groups others), or the default resources (/DR) an interactive form carries.
+fn is_field_dict(d: &Dict) -> bool {
+    d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR")
 }
 
 /// What the signed revision's pages reach, and as what: the pages themselves and everything
@@ -1714,7 +1720,7 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
                     }
                 }
                 // A catalog that did not exist when signed: only the trailer can make it the
-                // document's, and that is compared above; by itself it is a structure change.
+                // document's, and classify_changes compares that; by itself it is a structure change.
                 None => kind::STRUCTURE,
             };
         }
@@ -1744,7 +1750,7 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
     if d.contains(b"Fields") {
         return acroform_kind(doc, old, d, before);
     }
-    if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") {
+    if is_field_dict(d) {
         return kind::FORM_FILL;
     }
     if d.contains(b"Kids") || d.contains(b"Contents") || d.contains(b"MediaBox") {

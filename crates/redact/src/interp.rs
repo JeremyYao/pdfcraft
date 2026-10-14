@@ -71,7 +71,16 @@ pub(crate) struct Output {
     /// Apply mode met vertical-writing text (which it cannot remove) while a redaction region was
     /// in force: the operation must fail closed rather than leave that text under the mark.
     pub vertical: bool,
+    /// Each form this scope rewrote, nested scopes included: (original, rewritten copy, MCIDs
+    /// whose content changed, MCIDs left empty).
     pub tag_changes: Vec<(ObjRef, ObjRef, HashSet<i64>, HashSet<i64>)>,
+}
+
+impl Output {
+    /// The rewritten form copies of [`Self::tag_changes`], in order.
+    pub(crate) fn rewritten_forms(&self) -> impl Iterator<Item = ObjRef> + '_ {
+        self.tag_changes.iter().map(|(_, copy, _, _)| *copy)
+    }
 }
 
 pub(crate) struct Scope<'a> {
@@ -248,11 +257,11 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
 /// replaced by a private copy on its node, so a dictionary object shared with other nodes is
 /// left as it is for them. Fails closed when a page's use of a name cannot be told.
 ///
-/// `copies` are the rewritten form copies. One made for a form without /Resources of its own
-/// was given its caller's dictionary, which names the original form (the one the copy replaces)
-/// and whatever else the caller dropped: those entries go from the copy too, unless the copy's
-/// own content still draws the name.
-pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], copies: &[ObjRef]) -> Result<(), RedactError> {
+/// `rewritten_forms` are the rewritten form copies. One made for a form without /Resources of
+/// its own was given its caller's dictionary, which names the original form (the one the copy
+/// replaces) and whatever else the caller dropped: those entries go from the copy too, unless
+/// the copy's own content still draws the name.
+pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], rewritten_forms: &[ObjRef]) -> Result<(), RedactError> {
     if doomed.is_empty() {
         return Ok(());
     }
@@ -299,7 +308,7 @@ pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], copies: &[Obj
             doc.update_dict(node, |d| d.set(b"Resources".to_vec(), Object::Dict(res)))?;
         }
     }
-    for copy in copies {
+    for copy in rewritten_forms {
         let obj = doc.get(*copy);
         let Object::Stream(s) = &*obj else { continue };
         let Some(res) = s.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()) else { continue };

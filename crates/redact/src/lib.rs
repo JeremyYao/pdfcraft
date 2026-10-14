@@ -418,6 +418,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             return Err(RedactError::VerticalText(pi + 1));
         }
         doomed_xobjects.extend_from_slice(&out.doomed);
+        rewritten_forms.extend(out.rewritten_forms());
         let mut new_list = list.clone();
         let mut changed = false;
         for (i, new) in out.streams.into_iter().enumerate() {
@@ -466,7 +467,6 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
 
         for (old, new, changed, empty) in out.tag_changes {
-            rewritten_forms.push(new);
             report.tags += tags::clean(doc, page.obj, Some((old, new)), &changed, &empty)?;
         }
 

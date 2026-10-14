@@ -2040,16 +2040,16 @@ fn a_signature_field_borrowing_another_fields_byte_range_is_invalid() {
         forged.set(b"Reason".to_vec(), PdfString::text("I also agree to the amended terms"));
         forged.set(b"M".to_vec(), PdfString::text("D:20270101090000Z"));
         let v = doc.add(Object::Dict(forged));
-        let mut w = pdfcraft_cos::Dict::new();
-        w.set(b"Type".to_vec(), Object::name("Annot"));
-        w.set(b"Subtype".to_vec(), Object::name("Widget"));
-        w.set(b"FT".to_vec(), Object::name("Sig"));
-        w.set(b"T".to_vec(), PdfString::text("Amendment approval"));
-        w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(10), Object::Int(100), Object::Int(40)]));
-        w.set(b"F".to_vec(), Object::Int(4));
-        w.set(b"P".to_vec(), Object::Ref(page));
-        w.set(b"V".to_vec(), Object::Ref(v));
-        let w = doc.add(Object::Dict(w));
+        let w = doc.add(Object::Dict(dict_of(vec![
+            ("Type", Object::name("Annot")),
+            ("Subtype", Object::name("Widget")),
+            ("FT", Object::name("Sig")),
+            ("T", PdfString::text("Amendment approval").into()),
+            ("Rect", Object::Array(vec![Object::Int(10), Object::Int(10), Object::Int(100), Object::Int(40)])),
+            ("F", Object::Int(4)),
+            ("P", Object::Ref(page)),
+            ("V", Object::Ref(v)),
+        ])));
         doc.update_dict(page, |p| {
             if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
                 a.push(Object::Ref(w));
@@ -2088,10 +2088,11 @@ fn fixture_with_dangling_xobject() -> Vec<u8> {
 #[test]
 fn defining_an_object_the_signed_page_already_named_is_a_change() {
     assert_refused_at_every_level(&fixture_with_dangling_xobject(), "page content", |doc| {
-        let mut d = pdfcraft_cos::Dict::new();
-        d.set(b"Type".to_vec(), Object::name("XObject"));
-        d.set(b"Subtype".to_vec(), Object::name("Form"));
-        d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+        let d = dict_of(vec![
+            ("Type", Object::name("XObject")),
+            ("Subtype", Object::name("Form")),
+            ("BBox", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)])),
+        ]);
         let s = pdfcraft_cos::Stream::from_raw(d, b"0 0 0 rg 20 60 260 140 re f".to_vec());
         doc.set(pdfcraft_cos::ObjRef { num: 50, generation: 0 }, Object::Stream(s));
     });
@@ -2117,16 +2118,15 @@ fn fixture_with_text_field(lock: &str) -> Vec<u8> {
 /// `register`, to the AcroForm's /Fields.
 fn add_widget(doc: &mut Document, extra: Vec<(&str, Object)>, register: bool) -> pdfcraft_cos::ObjRef {
     let page = pdfcraft_cos::ObjRef { num: 3, generation: 0 };
-    let mut w = pdfcraft_cos::Dict::new();
-    w.set(b"Type".to_vec(), Object::name("Annot"));
-    w.set(b"Subtype".to_vec(), Object::name("Widget"));
-    w.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(235), Object::Int(290), Object::Int(275)]));
-    w.set(b"F".to_vec(), Object::Int(4));
-    w.set(b"P".to_vec(), Object::Ref(page));
-    for (k, v) in extra {
-        w.set(k.as_bytes().to_vec(), v);
-    }
-    let w = doc.add(Object::Dict(w));
+    let mut entries = vec![
+        ("Type", Object::name("Annot")),
+        ("Subtype", Object::name("Widget")),
+        ("Rect", Object::Array(vec![Object::Int(10), Object::Int(235), Object::Int(290), Object::Int(275)])),
+        ("F", Object::Int(4)),
+        ("P", Object::Ref(page)),
+    ];
+    entries.extend(extra);
+    let w = doc.add(Object::Dict(dict_of(entries)));
     doc.update_dict(page, |p| {
         if let Some(Object::Array(a)) = p.get_mut(b"Annots") {
             a.push(Object::Ref(w));
@@ -2142,24 +2142,19 @@ fn add_widget(doc: &mut Document, extra: Vec<(&str, Object)>, register: bool) ->
 /// A form XObject painting a white box with other text: what an appearance put over the page
 /// after signing can show.
 fn covering_appearance(doc: &mut Document) -> Object {
-    let mut d = pdfcraft_cos::Dict::new();
-    d.set(b"Type".to_vec(), Object::name("XObject"));
-    d.set(b"Subtype".to_vec(), Object::name("Form"));
-    d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(280), Object::Int(40)]));
+    let d = dict_of(vec![
+        ("Type", Object::name("XObject")),
+        ("Subtype", Object::name("Form")),
+        ("BBox", Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(280), Object::Int(40)])),
+    ]);
     let s = pdfcraft_cos::Stream::from_raw(d, b"1 1 1 rg 0 0 280 40 re f 0 g 20 10 120 12 re f".to_vec());
     let ap = doc.add(Object::Stream(s));
-    let mut n = pdfcraft_cos::Dict::new();
-    n.set(b"N".to_vec(), Object::Ref(ap));
-    Object::Dict(n)
+    Object::Dict(dict_of(vec![("N", Object::Ref(ap))]))
 }
 
 fn js_action() -> Object {
-    let mut js = pdfcraft_cos::Dict::new();
-    js.set(b"S".to_vec(), Object::name("JavaScript"));
-    js.set(b"JS".to_vec(), PdfString::text("app.alert('added after certification');"));
-    let mut aa = pdfcraft_cos::Dict::new();
-    aa.set(b"Fo".to_vec(), Object::Dict(js));
-    Object::Dict(aa)
+    let js = dict_of(vec![("S", Object::name("JavaScript")), ("JS", PdfString::text("app.alert('added after certification');").into())]);
+    Object::Dict(dict_of(vec![("Fo", Object::Dict(js))]))
 }
 
 /// After certifying, a new field or widget is annotation creation (permitted only where

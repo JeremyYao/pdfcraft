@@ -1932,16 +1932,11 @@ fn details_say_themselves() {
 /// content stream) that draws `text`, then a cross-reference table section whose subsections are
 /// what `xref` returns for the offset of that definition. The section continues the signed chain.
 fn append_content_revision(signed: &[u8], text: &str, xref: impl Fn(usize) -> String) -> Vec<u8> {
-    let at = signed.windows(9).rposition(|w| w == b"startxref").unwrap() + 9;
-    let prev: String = signed[at..].iter().skip_while(|b| b.is_ascii_whitespace()).take_while(|b| b.is_ascii_digit()).map(|b| *b as char).collect();
+    let prev = prev_startxref(signed);
     let mut out = signed.to_vec();
-    let content = format!("BT /F1 14 Tf 20 250 Td ({text}) Tj ET");
     let object = out.len();
-    out.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n{content}\nendstream\nendobj\n", content.len()).as_bytes());
-    let section = out.len();
-    out.extend_from_slice(
-        format!("xref\n{}trailer\n<< /Size 60 /Root 1 0 R /Prev {prev} >>\nstartxref\n{section}\n%%EOF\n", xref(object)).as_bytes(),
-    );
+    out.extend_from_slice(format!("4 0 obj\n{}\nendobj\n", content_body(text)).as_bytes());
+    end_revision(&mut out, &xref(object), &format!("/Root 1 0 R /Prev {prev}"));
     out
 }
 
@@ -2022,8 +2017,7 @@ fn append_objects_revision(signed: &[u8], objects: &[(u32, &str)], trailer: &str
         subsections += &format!("{num} 1\n{}", xref_entry(out.len()));
         out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
     }
-    let section = out.len();
-    out.extend_from_slice(format!("xref\n{subsections}trailer\n<< /Size 60 /Prev {prev} {trailer} >>\nstartxref\n{section}\n%%EOF\n").as_bytes());
+    end_revision(&mut out, &subsections, &format!("/Prev {prev} {trailer}"));
     out
 }
 
@@ -2031,11 +2025,18 @@ fn append_objects_revision(signed: &[u8], objects: &[(u32, &str)], trailer: &str
 fn append_section(signed: &[u8], subsections: &str, trailer: &str) -> Vec<u8> {
     let prev = prev_startxref(signed);
     let mut out = signed.to_vec();
-    let section = out.len();
-    out.extend_from_slice(format!("xref\n{subsections}trailer\n<< /Size 60 /Prev {prev} {trailer} >>\nstartxref\n{section}\n%%EOF\n").as_bytes());
+    end_revision(&mut out, subsections, &format!("/Prev {prev} {trailer}"));
     out
 }
 
+/// Close a revision appended to `out` by hand: a classic cross-reference section of
+/// `subsections`, a trailer of /Size 60 and the given `entries`, then `startxref` and `%%EOF`.
+fn end_revision(out: &mut Vec<u8>, subsections: &str, entries: &str) {
+    let section = out.len();
+    out.extend_from_slice(format!("xref\n{subsections}trailer\n<< /Size 60 {entries} >>\nstartxref\n{section}\n%%EOF\n").as_bytes());
+}
+
+/// The body of a content stream that draws `text` with the fixture's font.
 fn content_body(text: &str) -> String {
     let content = format!("BT /F1 14 Tf 20 250 Td ({text}) Tj ET");
     format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len())

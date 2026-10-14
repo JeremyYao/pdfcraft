@@ -1272,30 +1272,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
     for (_, num) in doc.xref_oddities().iter().filter(|o| !old.xref_oddities().contains(o)) {
         verdict.forbid(shown_when_signed(ObjRef { num: *num, generation: doc.generation(*num) }));
     }
-    // An object body in the bytes after the signed revision that no cross-reference entry
-    // locates. A writer lists every object it appends. A reader that rebuilds its table by
-    // scanning the file (the renderer does, whenever a section of the chain fails it) takes
-    // such a body for the number and draws it, whatever this reader resolves: never a permitted
-    // change, whatever made that reader rebuild.
-    for num in doc.objects_unlisted_from(appended_from) {
-        verdict.forbid(shown_when_signed(ObjRef { num, generation: old.generation(num) }));
-    }
-    // The trailer itself: which catalog the file starts from, how its strings and streams
-    // decode, and the first file identifier. A later revision can point /Root at a catalog of
-    // its own (a new object is judged by what references it, and nothing but the trailer
-    // references a catalog), add or change /Encrypt, or replace /ID. No signature permits it.
-    if doc.root() != old.root() {
-        verdict.forbid(kind::STRUCTURE);
-    }
-    let encrypt = |d: &Document| d.trailer().get(b"Encrypt").map(|e| d.resolve(e)).filter(|e| !matches!(**e, Object::Null));
-    // A revision without /ID is tolerated (writers leave it out, and every save adds one to a
-    // file that had none): only a first identifier replaced by another is a change.
-    let first_id =
-        |d: &Document| d.trailer().get(b"ID").and_then(Object::as_array).and_then(|a| a.first()).and_then(Object::as_string).map(|s| s.bytes.clone());
-    let id_replaced = matches!((first_id(doc), first_id(&old)), (Some(now), Some(then)) if now != then);
-    if encrypt(doc).as_deref() != encrypt(&old).as_deref() || id_replaced {
-        verdict.forbid(kind::OTHER);
-    }
+    unlisted_bodies(doc, &old, appended_from, shown_when_signed, &mut verdict);
+    trailer_changes(doc, &old, &mut verdict);
     for num in doc.object_numbers() {
         if same_place(num) {
             continue;
@@ -1351,26 +1329,74 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
         };
         verdict.record(what, permitted(what, p));
     }
-    // Objects the signed revision had that a later one freed, or no longer locates. The loop
-    // above never visits them (object_numbers leaves out freed numbers) and the objects that
-    // referenced them are unchanged bytes, yet the page draws without its content stream,
-    // font or image, and a form without its field. Each is judged by what it was when signed,
-    // as a rewritten object is.
-    let reach = signed_reach(&old);
+    freed_objects(doc, &old, p, &old_content, &signed_pages, old_info, &mut verdict);
+    verdict.finish()
+}
+
+/// Forbid every object body in the bytes after the signed revision (from `appended_from`) that
+/// no cross-reference entry locates. A writer lists every object it appends. A reader that
+/// rebuilds its table by scanning the file (the renderer does, whenever a section of the chain
+/// fails it) takes such a body for the number and draws it, whatever this reader resolves:
+/// never a permitted change, whatever made that reader rebuild.
+fn unlisted_bodies(doc: &Document, old: &Document, appended_from: usize, shown_when_signed: impl Fn(ObjRef) -> &'static str, verdict: &mut Verdict) {
+    for num in doc.objects_unlisted_from(appended_from) {
+        verdict.forbid(shown_when_signed(ObjRef { num, generation: old.generation(num) }));
+    }
+}
+
+/// Forbid changes to the trailer itself: which catalog the file starts from, how its strings
+/// and streams decode, and the first file identifier. A later revision can point /Root at a
+/// catalog of its own (a new object is judged by what references it, and nothing but the
+/// trailer references a catalog), add or change /Encrypt, or replace /ID. No signature permits
+/// it.
+fn trailer_changes(doc: &Document, old: &Document, verdict: &mut Verdict) {
+    if doc.root() != old.root() {
+        verdict.forbid(kind::STRUCTURE);
+    }
+    let encrypt = |d: &Document| d.trailer().get(b"Encrypt").map(|e| d.resolve(e)).filter(|e| !matches!(**e, Object::Null));
+    // A revision without /ID is tolerated (writers leave it out, and every save adds one to a
+    // file that had none): only a first identifier replaced by another is a change.
+    let first_id =
+        |d: &Document| d.trailer().get(b"ID").and_then(Object::as_array).and_then(|a| a.first()).and_then(Object::as_string).map(|s| s.bytes.clone());
+    let id_replaced = matches!((first_id(doc), first_id(old)), (Some(now), Some(then)) if now != then);
+    if encrypt(doc).as_deref() != encrypt(old).as_deref() || id_replaced {
+        verdict.forbid(kind::OTHER);
+    }
+}
+
+/// Record the objects the signed revision had that a later one freed, or no longer locates.
+/// The changed-objects loop of `classify_changes` never visits them (`object_numbers` leaves
+/// out freed numbers) and the objects that referenced them are unchanged bytes, yet the page
+/// draws without its content stream, font or image, and a form without its field. Each is
+/// judged by what it was when signed, as a rewritten object is: page content when it was a
+/// signed page or one of its content streams (`old_content`, `signed_pages`), metadata when it
+/// was the signed `/Info` (`old_info`), else by what the signed pages reach it as, else by its
+/// own dictionary.
+fn freed_objects(
+    doc: &Document,
+    old: &Document,
+    p: Option<u8>,
+    old_content: &HashSet<ObjRef>,
+    signed_pages: &HashSet<ObjRef>,
+    old_info: Option<ObjRef>,
+    verdict: &mut Verdict,
+) {
+    // What the signed pages reach is only asked for the rare freed object that is neither a
+    // page nor /Info: walked when first needed.
+    let reach = std::cell::OnceCell::new();
     for num in old.object_numbers() {
         if doc.is_edited(num) || !matches!(doc.xref_entry(num), None | Some(pdfcraft_cos::XrefEntry::Free { .. })) {
             continue;
         }
         let r = ObjRef { num, generation: old.generation(num) };
-        let was = old.get(r);
         let what = if old_content.contains(&r) || signed_pages.contains(&r) {
             kind::PAGE_CONTENT
         } else if Some(r) == old_info {
             kind::METADATA
-        } else if let Some(role) = reach.get(&num) {
+        } else if let Some(role) = reach.get_or_init(|| signed_reach(old)).get(&num) {
             role
         } else {
-            match &*was {
+            match &*old.get(r) {
                 Object::Dict(d) => freed_kind(d),
                 Object::Stream(s) => freed_kind(&s.dict),
                 Object::Null => continue,
@@ -1379,7 +1405,6 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
         };
         verdict.record(what, permitted(what, p));
     }
-    verdict.finish()
 }
 
 /// What freeing the signed object `d` amounts to, by what it was: a page-tree node is
@@ -1422,18 +1447,22 @@ fn signed_reach(old: &Document) -> HashMap<u32, &'static str> {
                 roles.insert(r.num, role);
                 visit(old, &old.get(*r), role, depth + 1, roles);
             }
-            Object::Dict(d) => {
-                for (_, v) in d.iter().filter(|(k, _)| !matches!(k.as_slice(), b"Parent" | b"P" | b"Dest" | b"A" | b"AA")) {
-                    visit(old, v, role, depth + 1, roles);
-                }
-            }
-            Object::Stream(s) => visit(old, &Object::Dict(s.dict.clone()), role, depth, roles),
+            Object::Dict(d) => visit_entries(old, d, role, depth, roles),
+            Object::Stream(s) => visit_entries(old, &s.dict, role, depth, roles),
             Object::Array(a) => {
                 for v in a {
                     visit(old, v, role, depth + 1, roles);
                 }
             }
             _ => {}
+        }
+    }
+    /// Visit the entries of the dictionary (or stream dictionary) `d` met at `depth`, except the
+    /// keys that lead back up or away: a page's parent, an annotation's page, destination and
+    /// actions.
+    fn visit_entries(old: &Document, d: &Dict, role: &'static str, depth: usize, roles: &mut HashMap<u32, &'static str>) {
+        for (_, v) in d.iter().filter(|(k, _)| !matches!(k.as_slice(), b"Parent" | b"P" | b"Dest" | b"A" | b"AA")) {
+            visit(old, v, role, depth + 1, roles);
         }
     }
     let mut roles = HashMap::new();

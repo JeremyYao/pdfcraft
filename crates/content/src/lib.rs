@@ -138,10 +138,11 @@ pub fn parse_capped(data: &[u8], max_ops: usize) -> Parsed {
                 operands.push(Object::Null);
             }
             b"BI" => match inline_image(data, lx.pos) {
-                Ok((dict, img, end, terminated)) => {
-                    lx.pos = end;
-                    out.unterminated_inline_image |= !terminated;
-                    out.ops.push(Op { op: b"BI".to_vec(), operands: Vec::new(), inline: Some((dict, img)), span: start.take().unwrap_or(at)..end });
+                Ok(image) => {
+                    lx.pos = image.end;
+                    out.unterminated_inline_image |= !image.terminated;
+                    let span = start.take().unwrap_or(at)..image.end;
+                    out.ops.push(Op { op: b"BI".to_vec(), operands: Vec::new(), inline: Some((image.params, image.data)), span });
                     operands.clear();
                 }
                 Err(end) => {
@@ -166,10 +167,21 @@ pub fn parse_capped(data: &[u8], max_ops: usize) -> Parsed {
     out
 }
 
-/// Read an inline image starting after `BI`: (parameters, data, position after `EI`, whether an
-/// `EI` ended the data). `Err` holds the position after the `EI` (or the end of the stream) of an
-/// image whose parameters can't be read.
-fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize, bool), usize> {
+/// An inline image as [`inline_image`] read it.
+struct InlineImage {
+    /// The entries between `BI` and `ID`.
+    params: Dict,
+    /// The bytes between `ID` and `EI`.
+    data: Vec<u8>,
+    /// The position after `EI`, or the end of the stream when no `EI` ended the data.
+    end: usize,
+    /// Whether an `EI` ended the data.
+    terminated: bool,
+}
+
+/// Read an inline image starting after `BI`. `Err` holds the position after the `EI` (or the end
+/// of the stream) of an image whose parameters can't be read.
+fn inline_image(data: &[u8], pos: usize) -> Result<InlineImage, usize> {
     let mut lx = Lexer::new(data, pos);
     let mut dict = Dict::new();
     loop {
@@ -186,7 +198,7 @@ fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize, bool),
             // A stream that ends inside the parameters is cut short, not unreadable: keep what was
             // read (nothing follows it, so nothing is swallowed).
             if at >= data.len() {
-                return Ok((dict, Vec::new(), data.len(), true));
+                return Ok(InlineImage { params: dict, data: Vec::new(), end: data.len(), terminated: true });
             }
             // Without an `EI` after it, the image runs to the end of the stream.
             return Err(end_of_image(data, at, &dict).map_or(data.len(), |(_, end)| end));
@@ -196,8 +208,8 @@ fn inline_image(data: &[u8], pos: usize) -> Result<(Dict, Vec<u8>, usize, bool),
     // One whitespace byte separates ID from the data.
     let begin = (lx.pos + 1).min(data.len());
     Ok(match end_of_image(data, begin, &dict) {
-        Some((end_data, end)) => (dict, data[begin..end_data].to_vec(), end, true),
-        None => (dict, data[begin..].to_vec(), data.len(), false),
+        Some((end_data, end)) => InlineImage { params: dict, data: data[begin..end_data].to_vec(), end, terminated: true },
+        None => InlineImage { params: dict, data: data[begin..].to_vec(), end: data.len(), terminated: false },
     })
 }
 

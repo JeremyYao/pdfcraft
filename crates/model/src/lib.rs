@@ -148,11 +148,16 @@ mod tests {
 
     /// `pages` and `page` add entries to the page tree node and to the page.
     fn doc_with(rotate: i64, pages: &str, page: &str) -> Document {
-        let objs = [
+        open(&[
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             format!("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] /Rotate {rotate} /Resources << /Font << >> >> {pages} >>"),
             format!("<< /Type /Page /Parent 2 0 R /CropBox [10 20 210 320] {page} >>"),
-        ];
+        ])
+    }
+
+    /// A file holding `objs` as objects 1, 2, … (object 1 is the catalog) with a classic xref
+    /// table, opened.
+    fn open(objs: &[String]) -> Document {
         let mut out = b"%PDF-1.7\n".to_vec();
         let mut offs = Vec::new();
         for (i, o) in objs.iter().enumerate() {
@@ -215,19 +220,7 @@ mod tests {
             format!("<< /Type /Pages /Kids [{refs}] /Count 1 /MediaBox [0 0 200 200] /Resources << /ProcSet [{procset}] >> >>"),
             "<< /Type /Page /Parent 2 0 R >>".to_string(),
         ];
-        let mut out = b"%PDF-1.7\n".to_vec();
-        let mut offs = Vec::new();
-        for (i, o) in objs.iter().enumerate() {
-            offs.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
-        }
-        let x = out.len();
-        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
-        for o in offs {
-            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
-        }
-        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1).as_bytes());
-        let doc = Document::open(Arc::new(out)).unwrap();
+        let doc = open(&objs);
         let start = std::time::Instant::now();
         let got = pages(&doc);
         assert_eq!(got.len(), 1, "the repeated page is one page");

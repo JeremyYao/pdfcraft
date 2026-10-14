@@ -264,49 +264,36 @@ impl<'a> Walker<'a> {
     }
 
     /// Walk the normal appearance a viewer paints for the `k`-th annotation of the page, placed
-    /// by its `/Rect`, `/BBox` and `/Matrix` (ISO 32000-2 §12.5.5): the form's bounding box goes
-    /// through its matrix, and the box that comes out is scaled and moved onto `/Rect`. The
-    /// appearance is painted after all page content and is clipped to its box, so every
-    /// rectangle it paints is cut to `/Rect` and stamped with a position past every page
-    /// operator. Annotations a viewer does not paint (Hidden or NoView flags, popups, or no
-    /// appearance to show) contribute nothing; an appearance that cannot be decoded fails the
-    /// audit like page content does.
+    /// on its `/Rect` by [`placement`]. The appearance is painted after all page content and is
+    /// clipped to its box, so every rectangle it paints is cut to `/Rect` and stamped with a
+    /// position past every page operator. An annotation the audit does not walk ([`is_painted`])
+    /// or with no appearance to show contributes nothing; an appearance that cannot be decoded
+    /// fails the audit like page content does.
     fn walk_annotation(&mut self, annot: &Dict, k: usize) -> Result<(), AuditError> {
-        const HIDDEN: i64 = 2;
-        const NO_VIEW: i64 = 32;
-        let flags = annot.get(b"F").map(|o| self.doc.resolve(o)).and_then(|o| o.as_int()).unwrap_or(0);
-        if flags & (HIDDEN | NO_VIEW) != 0 || annot.name(b"Subtype") == Some(b"Popup") {
+        if !is_painted(self.doc, annot) {
             return Ok(());
         }
-        let Some(r) = numbers::<4>(self.doc, annot.get(b"Rect")) else { return Ok(()) };
-        let rect = [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])];
-        let Some(stream) = self.normal_appearance(annot) else { return Ok(()) };
-        let Object::Stream(stream) = &*stream else { return Ok(()) };
+        let Some(on_page) = rect(self.doc, annot.get(b"Rect")) else { return Ok(()) };
+        let Some(appearance) = self.normal_appearance(annot) else { return Ok(()) };
+        let Object::Stream(stream) = &*appearance else { return Ok(()) };
         let matrix = numbers::<6>(self.doc, stream.dict.get(b"Matrix")).map_or(Matrix::IDENTITY, Matrix);
-        // Algorithm 8.1: `/BBox` through `/Matrix`, then the matrix `a` that maps that box onto
-        // `/Rect`. A box with no extent in a direction is not scaled in it. Without a `/BBox`
-        // the form has no box to map: its content is taken as drawn in page space.
-        let a = match numbers::<4>(self.doc, stream.dict.get(b"BBox")) {
-            Some(bbox) => {
-                let b = matrix.bbox([bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3])]);
-                let scale = |from: f64, to: f64| if from > 0.0 && from.is_finite() { to / from } else { 1.0 };
-                let (sx, sy) = (scale(b[2] - b[0], rect[2] - rect[0]), scale(b[3] - b[1], rect[3] - rect[1]));
-                Matrix([sx, 0.0, 0.0, sy, rect[0] - b[0] * sx, rect[1] - b[1] * sy])
-            }
-            None => Matrix::IDENTITY,
-        };
-        let gs = Gs { ctm: a, ..Gs::default() };
+        let gs = Gs { ctm: placement(matrix, rect(self.doc, stream.dict.get(b"BBox")), on_page), ..Gs::default() };
         let from = self.out.len();
         self.walk_form(stream, &gs, 0, annotation_pos(k))?;
-        // The appearance shows only inside its box, which `a` maps onto `/Rect`. (`from` is
-        // never past the end: the walk only appends.)
+        // The appearance shows only inside its box, which the placement maps onto `/Rect`.
+        self.clip_since(from, on_page);
+        Ok(())
+    }
+
+    /// Cut every rectangle collected since `from` to `clip`, dropping those left with no area.
+    /// (`from` is never past the end, since walks only append; past it, nothing is cut.)
+    fn clip_since(&mut self, from: usize, clip: [f64; 4]) {
         let painted = self.out.split_off(from.min(self.out.len()));
         self.out.extend(painted.into_iter().filter_map(|mut f| {
             let r = f.rect;
-            f.rect = [r[0].max(rect[0]), r[1].max(rect[1]), r[2].min(rect[2]), r[3].min(rect[3])];
+            f.rect = [r[0].max(clip[0]), r[1].max(clip[1]), r[2].min(clip[2]), r[3].min(clip[3])];
             (f.rect[2] > f.rect[0] && f.rect[3] > f.rect[1]).then_some(f)
         }));
-        Ok(())
     }
 
     /// The normal appearance stream a viewer shows for `annot`: `/AP /N`, either a stream or a
@@ -335,6 +322,35 @@ impl<'a> Walker<'a> {
 /// stream has index `usize::MAX`).
 fn annotation_pos(k: usize) -> (usize, usize) {
     (usize::MAX, k)
+}
+
+/// Whether the audit walks `annot`'s appearance as paint over the page: not when a viewer does
+/// not show it (the Hidden or NoView flag, or a popup), and not for a `/Redact` mark, which is
+/// reported as an unapplied mark rather than as a cover.
+fn is_painted(doc: &Document, annot: &Dict) -> bool {
+    const HIDDEN: i64 = 2;
+    const NO_VIEW: i64 = 32;
+    let flags = annot.get(b"F").map(|o| doc.resolve(o)).and_then(|o| o.as_int()).unwrap_or(0);
+    flags & (HIDDEN | NO_VIEW) == 0 && !matches!(annot.name(b"Subtype"), Some(b"Popup" | b"Redact"))
+}
+
+/// The matrix that places an annotation's appearance on the page (ISO 32000-2 §12.5.5,
+/// Algorithm 8.1): the form's `bbox` goes through its `matrix`, and the box that comes out is
+/// scaled and moved onto `rect`. A box with no extent in a direction is not scaled in it.
+/// Without a `bbox` the form has no box to map: its content is taken as drawn in page space.
+fn placement(matrix: Matrix, bbox: Option<[f64; 4]>, rect: [f64; 4]) -> Matrix {
+    let Some(bbox) = bbox else { return Matrix::IDENTITY };
+    let b = matrix.bbox(bbox);
+    let scale = |from: f64, to: f64| if from > 0.0 && from.is_finite() { to / from } else { 1.0 };
+    let (sx, sy) = (scale(b[2] - b[0], rect[2] - rect[0]), scale(b[3] - b[1], rect[3] - rect[1]));
+    Matrix([sx, 0.0, 0.0, sy, rect[0] - b[0] * sx, rect[1] - b[1] * sy])
+}
+
+/// A rectangle array (`/Rect`, `/BBox`) as `[x0, y0, x1, y1]` with `x0 <= x1` and `y0 <= y1`:
+/// four finite numbers, as [`numbers`] reads them, or `None`.
+pub(super) fn rect(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
+    let r = numbers::<4>(doc, o)?;
+    Some([r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])])
 }
 
 /// `N` finite numbers from an array object (`/Rect`, `/BBox`, `/Matrix`), or `None`.
@@ -408,9 +424,7 @@ pub fn filled_rects(doc: &Document, page: &Dict, annots: &[Dict]) -> Result<Vec<
     let mut stack = Vec::new();
     w.walk_ops(&parsed.ops, &mut gs, &mut stack, &resources, 0, None)?;
     for (k, annot) in annots.iter().enumerate() {
-        if annot.name(b"Subtype") != Some(b"Redact") {
-            w.walk_annotation(annot, k)?;
-        }
+        w.walk_annotation(annot, k)?;
     }
     Ok(w.out)
 }

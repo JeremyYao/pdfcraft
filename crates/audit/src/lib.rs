@@ -182,18 +182,5 @@ fn annotations(doc: &Document, page: &Dict) -> Result<Vec<Dict>, AuditError> {
 
 /// Rectangles of the `/Redact` annotations among `annotations` (unrotated user space).
 fn redact_marks(doc: &Document, annotations: &[Dict]) -> Vec<[f64; 4]> {
-    let mut out = Vec::new();
-    for dict in annotations {
-        if dict.name(b"Subtype") != Some(b"Redact") {
-            continue;
-        }
-        let v: Vec<f64> = match dict.get(b"Rect") {
-            None => continue,
-            Some(r) => doc.resolve(r).as_array().map(|arr| arr.iter().filter_map(|o| doc.resolve(o).as_f64()).collect()).unwrap_or_default(),
-        };
-        if v.len() == 4 && v.iter().all(|x| x.is_finite()) {
-            out.push([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]);
-        }
-    }
-    out
+    annotations.iter().filter(|a| a.name(b"Subtype") == Some(b"Redact")).filter_map(|a| cover::rect(doc, a.get(b"Rect"))).collect()
 }

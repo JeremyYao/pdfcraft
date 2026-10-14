@@ -10,7 +10,7 @@ use pdfcraft_content::Matrix;
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
 use crate::interp::{Mode, Scope, process};
-use crate::{RedactError, Report, annots_of, page_streams};
+use crate::{RedactError, Report, annots_of, page_streams, put_annots};
 
 /// The categories of Acrobat's Remove Hidden Information panel that PdfCraft handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -469,13 +469,7 @@ fn remove_form_fields(doc: &mut Document, root: ObjRef) -> Result<Vec<ObjRef>, R
             list.iter().filter(|a| doc.resolve(a).as_dict().and_then(|d| d.name(b"Subtype")) != Some(b"Widget")).cloned().collect();
         on_page.extend(kept.iter().filter_map(Object::as_ref));
         if kept.len() != list.len() {
-            doc.update_dict(p.obj, |d| {
-                if kept.is_empty() {
-                    d.remove(b"Annots");
-                } else {
-                    d.set(b"Annots".to_vec(), Object::Array(kept));
-                }
-            })?;
+            doc.update_dict(p.obj, |d| put_annots(d, kept))?;
         }
     }
     // The widgets taken off the pages are deleted, and so is a field none of whose widgets is on
@@ -560,11 +554,7 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
             kept.push(a);
         }
         doc.update_dict(p.obj, |d| {
-            if kept.is_empty() {
-                d.remove(b"Annots");
-            } else {
-                d.set(b"Annots".to_vec(), Object::Array(kept));
-            }
+            put_annots(d, kept);
             if thumbs {
                 d.remove(b"Thumb");
             }

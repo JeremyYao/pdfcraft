@@ -140,6 +140,15 @@ pub(crate) fn annots_of(doc: &Document, page: &Dict) -> Vec<Object> {
     page.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap_or_default()
 }
 
+/// Make `kept` a page's /Annots, or drop the key when nothing is kept.
+pub(crate) fn put_annots(page: &mut Dict, kept: Vec<Object>) {
+    if kept.is_empty() {
+        page.remove(b"Annots");
+    } else {
+        page.set(b"Annots".to_vec(), Object::Array(kept));
+    }
+}
+
 /// Treat removal as deletion: overwrite each removed annotation, widget or field object with
 /// `null`, which a full save skips, so a referrer other than the page's /Annots and the field
 /// tree (a structure element's OBJR kid, a reply's /IRT) cannot carry its content into the saved
@@ -425,6 +434,103 @@ fn drop_from_calculation_order(doc: &mut Document, gone: &[ObjRef]) -> Result<()
     Ok(())
 }
 
+/// What [`remove_covered_annotations`] took off a page.
+struct Removed {
+    /// The annotations removed and their pop-ups, to be retired.
+    objects: Vec<ObjRef>,
+    /// The fields that own a removed widget (once per widget), to be deleted.
+    fields: Vec<ObjRef>,
+}
+
+/// Take off `page` the applied marks (`marks`), every other annotation whose rectangle overlaps
+/// one of `rects` (a pop-up goes only with its parent), and the pop-ups of all of them. An entry
+/// of /Annots may be a reference or a dictionary written directly in the array; both are
+/// annotations, so entries are judged resolved and removed by position. The removed annotations
+/// other than marks and widgets are counted in `report`.
+fn remove_covered_annotations(
+    doc: &mut Document,
+    page: ObjRef,
+    marks: &[&Mark],
+    rects: &[[f64; 4]],
+    widget_owner: &[(ObjRef, ObjRef)],
+    report: &mut Report,
+) -> Result<Removed, RedactError> {
+    let annots = annots_of(doc, &doc.get(page).as_dict().cloned().unwrap_or_default());
+    let mut removed: Vec<ObjRef> = Vec::new();
+    let mut removed_at: Vec<usize> = Vec::new();
+    let mut fields: Vec<ObjRef> = Vec::new();
+    for (i, a) in annots.iter().enumerate() {
+        let obj = doc.resolve(a);
+        let Some(d) = obj.as_dict() else { continue };
+        let r = a.as_ref();
+        let subtype = d.name(b"Subtype").unwrap_or(b"");
+        if subtype == b"Redact" {
+            if r.is_some_and(|r| marks.iter().any(|m| m.obj == r)) {
+                // Removed like any other annotation, so its pop-up goes with it.
+                removed_at.push(i);
+                removed.extend(r);
+            }
+            continue;
+        }
+        if subtype == b"Popup" {
+            continue;
+        }
+        if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| pdfcraft_content::overlaps(*x, b, 0.0))) {
+            removed_at.push(i);
+            removed.extend(r);
+            if subtype == b"Widget" {
+                if let Some((_, field)) = r.and_then(|r| widget_owner.iter().find(|(w, _)| *w == r)) {
+                    fields.push(*field);
+                }
+            } else {
+                report.annotations += 1;
+            }
+        }
+    }
+    // An entry whose /Parent is a removed annotation (its pop-up) goes with it. A reference is
+    // judged the same wherever it is listed, so an entry not removed by position is not one of
+    // `removed` either.
+    let popup_of_removed =
+        |a: &Object| doc.resolve(a).as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p));
+    let mut objects: Vec<ObjRef> = Vec::new();
+    let mut kept: Vec<Object> = Vec::new();
+    for (i, a) in annots.into_iter().enumerate() {
+        if removed_at.contains(&i) {
+            continue;
+        }
+        if popup_of_removed(&a) {
+            objects.extend(a.as_ref());
+            continue;
+        }
+        kept.push(a);
+    }
+    // The removed annotations and their pop-ups are deleted, not merely unlisted.
+    objects.extend_from_slice(&removed);
+    doc.update_dict(page, |d| put_annots(d, kept))?;
+    Ok(Removed { objects, fields })
+}
+
+/// Delete the form fields in `fields` (those that own a widget under a mark), all their widgets
+/// with them, and count them in `report`. Each goes by its object: deleting by name would take
+/// the first field of that name, which with two same-named fields leaves the marked one, and its
+/// value, in the file. Returns the objects to retire: each deleted field and its widgets.
+fn delete_marked_fields(doc: &mut Document, fields: &[ObjRef], report: &mut Report) -> Result<Vec<ObjRef>, RedactError> {
+    let mut retired = Vec::new();
+    for field in fields {
+        // The field and its widgets, retired once the field is out of the tree.
+        let doomed: Option<Vec<ObjRef>> = pdfcraft_forms::fields(doc)
+            .iter()
+            .find(|f| f.obj == *field)
+            .map(|f| std::iter::once(f.obj).chain(f.widgets.iter().map(|w| w.obj)).collect());
+        if let Some(doomed) = doomed {
+            pdfcraft_forms::delete_field_object(doc, *field)?;
+            report.fields += 1;
+            retired.extend(doomed);
+        }
+    }
+    Ok(retired)
+}
+
 /// Apply every redaction mark (or only those on `pages`, 0-based). Irreversible for the saved
 /// file; callers keep the previous document for undo.
 pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, RedactError> {
@@ -549,86 +655,18 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             report.tags += tags::clean(doc, page.obj, Some((old, new)), &changed, &empty)?;
         }
 
-        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups). An entry
-        // of /Annots may be a reference or a dictionary written directly in the array; both are
-        // annotations, so entries are judged resolved and removed by position.
-        let annots = annots_of(doc, &doc.get(page.obj).as_dict().cloned().unwrap_or_default());
-        let mut removed: Vec<ObjRef> = Vec::new();
-        let mut removed_at: Vec<usize> = Vec::new();
-        for (i, a) in annots.iter().enumerate() {
-            let obj = doc.resolve(a);
-            let Some(d) = obj.as_dict() else { continue };
-            let r = a.as_ref();
-            let subtype = d.name(b"Subtype").unwrap_or(b"");
-            if subtype == b"Redact" {
-                if r.is_some_and(|r| page_marks.iter().any(|m| m.obj == r)) {
-                    // Removed like any other annotation, so its pop-up goes with it.
-                    removed_at.push(i);
-                    removed.extend(r);
-                }
-                continue;
-            }
-            if subtype == b"Popup" {
-                continue;
-            }
-            if rect_of(doc, d.get(b"Rect")).is_some_and(|b| rects.iter().any(|x| pdfcraft_content::overlaps(*x, b, 0.0))) {
-                removed_at.push(i);
-                removed.extend(r);
-                if subtype == b"Widget" {
-                    if let Some((_, field)) = r.and_then(|r| widget_owner.iter().find(|(w, _)| *w == r))
-                        && !doomed_fields.contains(field)
-                    {
-                        doomed_fields.push(*field);
-                    }
-                } else {
-                    report.annotations += 1;
-                }
+        // 2. Annotations: the marks, and whatever lies under them (with their pop-ups).
+        let removed = remove_covered_annotations(doc, page.obj, &page_marks, &rects, &widget_owner, &mut report)?;
+        retired.extend(removed.objects);
+        for field in removed.fields {
+            if !doomed_fields.contains(&field) {
+                doomed_fields.push(field);
             }
         }
-        // The removed annotations and their pop-ups are deleted, not merely unlisted.
-        let popups = annots.iter().filter_map(Object::as_ref).filter(|r| {
-            !removed.contains(r)
-                && doc.get(*r).as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
-        });
-        retired.extend(popups);
-        retired.extend_from_slice(&removed);
-        let kept: Vec<Object> = annots
-            .into_iter()
-            .enumerate()
-            .filter(|(i, a)| {
-                if removed_at.contains(i) {
-                    return false;
-                }
-                // Pop-ups of removed annotations go too.
-                let obj = doc.resolve(a);
-                !obj.as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
-            })
-            .map(|(_, a)| a)
-            .collect();
-        doc.update_dict(page.obj, |d| {
-            if kept.is_empty() {
-                d.remove(b"Annots");
-            } else {
-                d.set(b"Annots".to_vec(), Object::Array(kept));
-            }
-        })?;
     }
 
-    // 3. Form fields with a widget under a mark (all their widgets go). Each is deleted by its
-    // object: deleting by name would take the first field of that name, which with two
-    // same-named fields leaves the marked one, and its value, in the file.
-    for field in &doomed_fields {
-        // The field and its widgets, retired once the field is out of the tree.
-        let doomed: Option<Vec<ObjRef>> = pdfcraft_forms::fields(doc)
-            .iter()
-            .find(|f| f.obj == *field)
-            .map(|f| std::iter::once(f.obj).chain(f.widgets.iter().map(|w| w.obj)).collect());
-        if let Some(doomed) = doomed {
-            pdfcraft_forms::delete_field_object(doc, *field)?;
-            report.fields += 1;
-            retired.extend(doomed);
-        }
-    }
+    // 3. Form fields with a widget under a mark (all their widgets go).
+    retired.extend(delete_marked_fields(doc, &doomed_fields, &mut report)?);
     // The calculation order must not keep a deleted field reachable either.
     drop_from_calculation_order(doc, &retired)?;
 

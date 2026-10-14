@@ -114,7 +114,7 @@ fn added_text_parameters_do_not_keep_redacted_text() {
     apply(&mut doc, None).unwrap();
     assert!(!content(&doc, 0).contains("1234"));
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    assert!(!bytes.windows(4).any(|w| w == b"1234"), "redacted text left in the saved file");
+    assert!(!bytes_contain(&bytes, b"1234"), "redacted text left in the saved file");
 }
 
 #[test]
@@ -340,10 +340,9 @@ fn redacted_images_and_forms_do_not_survive_a_full_rewrite_save() {
 
     // The full rewrite that redaction forces must not carry the removed content forward.
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    assert!(!has(b"REDIMGONECOVERED"), "covered image samples survived the save");
-    assert!(!has(b"REDIMGPARTSECRET"), "partly covered image's secret row survived the save");
-    assert!(!has(b"REDFORMSECRETTEXT"), "the form's redacted text survived the save");
+    assert!(!bytes_contain(&bytes, b"REDIMGONECOVERED"), "covered image samples survived the save");
+    assert!(!bytes_contain(&bytes, b"REDIMGPARTSECRET"), "partly covered image's secret row survived the save");
+    assert!(!bytes_contain(&bytes, b"REDFORMSECRETTEXT"), "the form's redacted text survived the save");
 
     // The unrelated image drawn only on page 2 stays referenced and intact.
     let saved = Document::open(Arc::new(bytes)).unwrap();
@@ -407,9 +406,8 @@ fn redacted_xobjects_do_not_survive_through_inherited_or_shared_resources() {
         assert!(r.images_removed >= 1 && r.forms_rewritten >= 1, "{r:?}");
 
         let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         for secret in [&b"REDIMGONECOVERED"[..], b"REDIMGPARTSECRET", b"REDFORMSECRETTEXT"] {
-            assert!(!has(secret), "{} survived the save (inherited: {inherited})", String::from_utf8_lossy(secret));
+            assert!(!bytes_contain(&bytes, secret), "{} survived the save (inherited: {inherited})", String::from_utf8_lossy(secret));
         }
         // Page 2 still draws its own image through the same dictionary.
         let saved = Document::open(Arc::new(bytes)).unwrap();
@@ -447,7 +445,7 @@ fn an_image_a_form_drew_through_the_pages_resources_does_not_survive() {
     let r = apply(&mut doc, None).unwrap();
     assert_eq!(r.images_removed, 1, "{r:?}");
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    assert!(!bytes.windows(16).any(|w| w == b"REDIMGONECOVERED"), "the image the form drew survived the save");
+    assert!(!bytes_contain(&bytes, b"REDIMGONECOVERED"), "the image the form drew survived the save");
 }
 
 /// Remove Hidden Information has the same rewrite: an off layer's image named by an inherited
@@ -466,7 +464,7 @@ fn a_hidden_layers_image_does_not_survive_through_inherited_resources() {
     let done = remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
     assert!(done.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{done:?}");
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    assert!(!bytes.windows(16).any(|w| w == b"HIDDENLAYERIMAGE"), "the off layer's image survived the save");
+    assert!(!bytes_contain(&bytes, b"HIDDENLAYERIMAGE"), "the off layer's image survived the save");
 }
 
 #[test]
@@ -500,7 +498,7 @@ fn redacting_an_xfa_field_drops_the_xfa_packet_so_its_value_cannot_survive() {
     assert!(r.fields >= 1 && r.xfa_removed, "{r:?}");
 
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    assert!(!bytes.windows(15).any(|w| w == b"SSN-987-65-4321"), "the redacted value survived in the datasets packet");
+    assert!(!bytes_contain(&bytes, b"SSN-987-65-4321"), "the redacted value survived in the datasets packet");
 
     let saved = Document::open(Arc::new(bytes)).unwrap();
     let cat = saved.get(saved.root().unwrap()).as_dict().cloned().unwrap();
@@ -645,7 +643,7 @@ fn hidden_information_is_counted_and_removed() {
     let p = pdfcraft_model::pages(&doc).swap_remove(0);
     assert!(annots_of(&doc, &p.dict).is_empty());
     let shown = doc.object_numbers().into_iter().any(|n| match &*doc.get(ObjRef::new(n, doc.generation(n))) {
-        Object::Stream(s) => s.decoded().is_ok_and(|d| d.windows(5).any(|w| w == b"(Ada)")),
+        Object::Stream(s) => s.decoded().is_ok_and(|d| bytes_contain(&d, b"(Ada)")),
         _ => false,
     });
     assert!(shown, "the field's value stays visible as page content");
@@ -777,17 +775,9 @@ fn tags_lose_what_redaction_removed() {
     assert!(public.get(b"ActualText").is_some(), "untouched content keeps its tags");
 }
 
+/// Fail when `secret` is anywhere in the file a save would write (see [`saved_contains`]).
 fn assert_no_secret(doc: &Document, secret: &[u8]) {
-    let saved = reopen(doc);
-    for (r, object) in saved.scan_objects() {
-        let mut bytes = Vec::new();
-        pdfcraft_cos::serialize(&object, &mut bytes);
-        assert!(!bytes.windows(secret.len()).any(|w| w == secret), "secret remains in object {r:?}");
-        if let Object::Stream(s) = &*object {
-            let data = s.decoded().unwrap();
-            assert!(!data.windows(secret.len()).any(|w| w == secret), "secret remains in stream {r:?}");
-        }
-    }
+    assert!(!saved_contains(doc, secret), "{} remains in the saved file", String::from_utf8_lossy(secret));
 }
 
 #[test]
@@ -965,18 +955,10 @@ fn a_partly_redacted_images_soft_mask_and_stencil_mask_are_cleared_too() {
         mark(&mut doc, 0, &[[0.0, 200.0, 300.0, 260.0]], "");
         let r = apply(&mut doc, None).unwrap();
         assert_eq!((r.images_cleared, r.images_removed), (1, 0), "{mask_key}: {r:?}");
-        let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-        let saved = Document::open(Arc::new(bytes)).unwrap();
-        let mut decoded: Vec<Vec<u8>> = Vec::new();
-        for (_, object) in saved.scan_objects() {
-            if let Object::Stream(s) = &*object {
-                decoded.push(s.decoded().unwrap());
-            }
-        }
-        let has = |needle: &[u8]| decoded.iter().any(|d| d.windows(needle.len()).any(|w| w == needle));
-        assert!(!has(b"COLORSECRETROW00"), "{mask_key}: the covered colour row survived");
-        assert!(!has(secret), "{mask_key}: the covered mask row survived the save");
-        assert!(has(b"colorpublicrow01") && has(public), "{mask_key}: the uncovered rows must stay");
+        assert!(!saved_contains(&doc, b"COLORSECRETROW00"), "{mask_key}: the covered colour row survived");
+        assert!(!saved_contains(&doc, secret), "{mask_key}: the covered mask row survived the save");
+        let streams = saved_streams(&doc);
+        assert!(any_has(&streams, b"colorpublicrow01") && any_has(&streams, public), "{mask_key}: the uncovered rows must stay");
     }
 }
 
@@ -995,33 +977,16 @@ fn redacting_one_of_two_same_named_fields_deletes_that_field_by_object() {
             b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (acct) /V (V034-GONE-DDD) /Rect [50 100 250 120] /P 3 0 R >>".to_vec(),
         ])
     };
-    // Every object of the full-rewrite save, serialized, and every stream decoded (a full save
-    // packs dictionaries into object streams, so the file bytes alone show nothing).
-    let saved = |doc: &Document| -> (Document, Vec<Vec<u8>>) {
-        let saved = Document::open(Arc::new(write_full(doc, &SaveOptions::default()).unwrap())).unwrap();
-        let mut texts = Vec::new();
-        for (_, object) in saved.scan_objects() {
-            let mut bytes = Vec::new();
-            pdfcraft_cos::serialize(&object, &mut bytes);
-            texts.push(bytes);
-            if let Object::Stream(s) = &*object {
-                texts.push(s.decoded().unwrap());
-            }
-        }
-        (saved, texts)
-    };
-    let has = |texts: &[Vec<u8>], needle: &[u8]| texts.iter().any(|t| t.windows(needle.len()).any(|w| w == needle));
-
-    // Only the second field of the name is marked: it goes, the first keeps its value.
+    // Only the second field of the name is marked: it goes, the first keeps its value. Applying
+    // forces a full rewrite, so the saved file is that rewrite.
     let mut doc = make();
     assert_eq!(pdfcraft_forms::fields(&doc).len(), 2, "both same-named fields are listed");
     mark(&mut doc, 0, &[[45.0, 95.0, 255.0, 125.0]], "");
     let r = apply(&mut doc, None).unwrap();
     assert_eq!(r.fields, 1, "{r:?}");
-    let (saved_doc, texts) = saved(&doc);
-    assert!(!has(&texts, b"V034-GONE-DDD"), "the marked field's value survived the save");
-    assert!(has(&texts, b"V034-KEEP-CCC"), "the unmarked field was deleted instead");
-    let left = pdfcraft_forms::fields(&saved_doc);
+    assert!(!saved_contains(&doc, b"V034-GONE-DDD"), "the marked field's value survived the save");
+    assert!(saved_contains(&doc, b"V034-KEEP-CCC"), "the unmarked field was deleted instead");
+    let left = pdfcraft_forms::fields(&reopen(&doc));
     assert_eq!(left.len(), 1, "{left:?}");
     assert_eq!(left[0].value, ["V034-KEEP-CCC"]);
 
@@ -1030,9 +995,8 @@ fn redacting_one_of_two_same_named_fields_deletes_that_field_by_object() {
     mark(&mut doc, 0, &[[45.0, 95.0, 255.0, 125.0], [45.0, 195.0, 255.0, 225.0]], "");
     let r = apply(&mut doc, None).unwrap();
     assert_eq!(r.fields, 2, "{r:?}");
-    let (saved_doc, texts) = saved(&doc);
-    assert!(!has(&texts, b"V034-GONE-DDD") && !has(&texts, b"V034-KEEP-CCC"), "a marked value survived the save");
-    assert!(pdfcraft_forms::fields(&saved_doc).is_empty());
+    assert!(!saved_contains(&doc, b"V034-GONE-DDD") && !saved_contains(&doc, b"V034-KEEP-CCC"), "a marked value survived the save");
+    assert!(pdfcraft_forms::fields(&reopen(&doc)).is_empty());
 }
 
 /// The samples cleared under a mark must be the ones the page shows there. The renderer resolves
@@ -1066,12 +1030,7 @@ fn an_image_whose_sample_layout_is_uncertain_is_removed_whole() {
         // Rows 4 and 5 (y 130–150 of the 80 pt image at y 110).
         mark(&mut doc, 0, &[[60.0, 130.0, 140.0, 150.0]], "");
         let r = apply(&mut doc, None).unwrap();
-        let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
-        let survived = saved.scan_objects().any(|(_, o)| match &*o {
-            Object::Stream(s) => s.decoded().unwrap().windows(16).any(|w| w == b"REDIMGSECRETROW!"),
-            _ => false,
-        });
-        assert!(!survived, "{what}: the marked samples survived the save");
+        assert!(!saved_contains(&doc, b"REDIMGSECRETROW!"), "{what}: the marked samples survived the save");
         assert_eq!((r.images_removed, r.images_cleared), (1, 0), "{what}: {r:?}");
     }
     // The control, a plain DeviceGray image, is cleared in place and keeps its other rows.
@@ -1138,22 +1097,6 @@ fn zlib(data: &[u8]) -> Vec<u8> {
     Stream::flate(Dict::new(), data).raw.to_vec()
 }
 
-/// The decoded streams of a full-rewrite save.
-fn saved_streams(doc: &Document) -> Vec<Vec<u8>> {
-    let saved = Document::open(Arc::new(write_full(doc, &SaveOptions::default()).unwrap())).unwrap();
-    saved
-        .scan_objects()
-        .filter_map(|(_, o)| match &*o {
-            Object::Stream(s) => s.decoded().ok(),
-            _ => None,
-        })
-        .collect()
-}
-
-fn any_has(streams: &[Vec<u8>], needle: &[u8]) -> bool {
-    streams.iter().any(|d| d.windows(needle.len()).any(|w| w == needle))
-}
-
 /// `/Filter` and `/DecodeParms` may be indirect references (ISO 32000-2 §7.3.8.2), and a viewer
 /// resolves them: the content it shows, and the user marks, is the decoded one. Read as an empty
 /// chain, the still-compressed bytes were "redacted" (nothing found), verified clean, and saved;
@@ -1185,9 +1128,9 @@ fn indirect_filter_and_decode_parms_are_resolved_before_redacting() {
     mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0], [0.0, 50.0, 300.0, 60.0]], "");
     let r = apply(&mut doc, None).unwrap();
     assert_eq!((r.glyphs, r.images_cleared, r.images_removed), (4, 1, 0), "{r:?}");
+    assert!(!saved_contains(&doc, b"1234"), "the marked text survived the save");
+    assert!(!saved_contains(&doc, b"COLORSECRETROW19"), "the marked image row survived the save");
     let streams = saved_streams(&doc);
-    assert!(!any_has(&streams, b"1234"), "the marked text survived the save");
-    assert!(!any_has(&streams, b"COLORSECRETROW19"), "the marked image row survived the save");
     assert!(any_has(&streams, b"(KEEP)") && any_has(&streams, b"publicrow18"), "the rest stays");
 }
 
@@ -1229,7 +1172,7 @@ fn streams_cos_cannot_decode_cleanly_fail_closed() {
     doc.update_dict(ObjRef::new(3, 0), |d| d.set(b"Contents".to_vec(), Object::Ref(good))).unwrap();
     mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
     assert_eq!(apply(&mut doc, None).unwrap().glyphs, 4, "control");
-    assert!(!any_has(&saved_streams(&doc), b"1234"));
+    assert!(!saved_contains(&doc, b"1234"));
 
     // An image carrying /DP: the viewer unpredicts it, cos would not. Removed whole.
     let image = stream(
@@ -1239,7 +1182,7 @@ fn streams_cos_cannot_decode_cleanly_fail_closed() {
     let mut doc = one_page(b"q 160 0 0 200 20 50 cm /Im1 Do Q", "/XObject << /Im1 7 0 R >>", vec![image]);
     mark(&mut doc, 0, &[[0.0, 50.0, 300.0, 60.0]], "");
     let r = apply(&mut doc, None).unwrap();
-    assert!(!any_has(&saved_streams(&doc), b"COLORSECRETROW19"), "the marked image row survived the save: {r:?}");
+    assert!(!saved_contains(&doc, b"COLORSECRETROW19"), "the marked image row survived the save: {r:?}");
     assert_eq!((r.images_removed, r.images_cleared), (1, 0), "{r:?}");
 }
 
@@ -1307,7 +1250,7 @@ fn text_set_through_an_extgstate_font_or_inherited_by_a_form_is_redacted() {
     mark(&mut doc, 0, &[[20.0, 95.0, 40.0, 110.0]], "");
     let r = apply(&mut doc, None).unwrap();
     assert_eq!((r.glyphs, r.forms_rewritten), (4, 1), "inherited font: {r:?}");
-    assert!(!any_has(&saved_streams(&doc), b"1234"), "the form's text survived the save");
+    assert!(!saved_contains(&doc, b"1234"), "the form's text survived the save");
 }
 
 /// An annotation held directly in the page's /Annots array (not by reference) is an annotation
@@ -1382,10 +1325,9 @@ fn off_layer_blocks_take_the_images_and_forms_they_draw_with_them() {
         let done = if all { sanitize(&mut doc).unwrap() } else { remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap() };
         assert!(done.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{done:?}");
         let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-        assert!(has(b"PUBLIC"), "the visible text stays (sanitize: {all})");
+        assert!(bytes_contain(&bytes, b"PUBLIC"), "the visible text stays (sanitize: {all})");
         for secret in [&b"LAYERBLOCKTEXT"[..], b"LAYEROCIMAGEBYTE", b"LAYERBLOCKIMAGEB", b"LAYERBLOCKFORMTEXT", b"SECRETLAYERNAME"] {
-            assert!(!has(secret), "{} survived the save (sanitize: {all})", String::from_utf8_lossy(secret));
+            assert!(!bytes_contain(&bytes, secret), "{} survived the save (sanitize: {all})", String::from_utf8_lossy(secret));
         }
         let saved = Document::open(Arc::new(bytes)).unwrap();
         for name in [&b"ImOC"[..], b"ImB", b"FmB"] {
@@ -1413,22 +1355,45 @@ fn off_layer_blocks_inside_a_form_take_their_images_with_them() {
     ]);
     remove_hidden(&mut doc, &[Hidden::HiddenLayers]).unwrap();
     let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
-    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    assert!(has(b"PUBIMGKEEPSURVIV"), "the image drawn outside the block stays");
-    assert!(!has(b"LAYERBLOCKIMAGEB"), "the image the off layer's block drew inside the form survived the save");
-    assert!(!has(b"SECRETLAYERNAME"), "the off layer's name survived the save");
+    assert!(bytes_contain(&bytes, b"PUBIMGKEEPSURVIV"), "the image drawn outside the block stays");
+    assert!(!bytes_contain(&bytes, b"LAYERBLOCKIMAGEB"), "the image the off layer's block drew inside the form survived the save");
+    assert!(!bytes_contain(&bytes, b"SECRETLAYERNAME"), "the off layer's name survived the save");
+}
+
+/// Whether `needle` occurs in `haystack` (the bytes of a saved file, or one decoded stream).
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Whether `needle` is anywhere in the file a save would write: in an object's serialized form
-/// or in a decoded stream (the save is a full rewrite once anything was removed).
+/// or in a decoded stream (the save is a full rewrite once anything was removed). A stream that
+/// does not decode fails the test, so nothing can hide in one.
 fn saved_contains(doc: &Document, needle: &[u8]) -> bool {
     let saved = reopen(doc);
-    saved.scan_objects().any(|(_, object)| {
+    saved.scan_objects().any(|(r, object)| {
         let mut bytes = Vec::new();
         pdfcraft_cos::serialize(&object, &mut bytes);
-        bytes.windows(needle.len()).any(|w| w == needle)
-            || matches!(&*object, Object::Stream(s) if s.decoded().is_ok_and(|d| d.windows(needle.len()).any(|w| w == needle)))
+        bytes_contain(&bytes, needle)
+            || matches!(&*object, Object::Stream(s) if bytes_contain(&s.decoded().unwrap_or_else(|e| panic!("stream {r:?} does not decode: {e}")), needle))
     })
+}
+
+/// The decoded streams of a full-rewrite save, for checks that what stays is still drawn (a
+/// stream that does not decode fails the test).
+fn saved_streams(doc: &Document) -> Vec<Vec<u8>> {
+    let saved = Document::open(Arc::new(write_full(doc, &SaveOptions::default()).unwrap())).unwrap();
+    saved
+        .scan_objects()
+        .filter_map(|(r, o)| match &*o {
+            Object::Stream(s) => Some(s.decoded().unwrap_or_else(|e| panic!("stream {r:?} does not decode: {e}"))),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether any of `texts` holds `needle`.
+fn any_has(texts: &[Vec<u8>], needle: &[u8]) -> bool {
+    texts.iter().any(|t| bytes_contain(t, needle))
 }
 
 /// Whether the saved file holds a dictionary `pred` accepts (stream dictionaries included).

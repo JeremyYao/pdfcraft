@@ -592,7 +592,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         doomed_xobjects.extend_from_slice(&out.doomed);
         let mut new_list = list.clone();
         let mut changed = false;
-        for (i, new) in out.streams.into_iter().enumerate() {
+        for (i, new) in out.streams.iter().enumerate() {
             let Some(bytes) = new else { continue };
             let mut dict = match &*doc.resolve(&list[i]) {
                 Object::Stream(s) => s.dict.clone(),
@@ -604,42 +604,17 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             // as plain drawn content but is no longer editable.
             dict.remove(b"PCAdded");
             // A new object: the original may be shared with other pages.
-            new_list[i] = Object::Ref(doc.add(Object::Stream(Stream::flate(dict, &bytes))));
+            new_list[i] = Object::Ref(doc.add(Object::Stream(Stream::flate(dict, bytes))));
             changed = true;
         }
         if changed || !out.xobjects.is_empty() || !out.replaced.is_empty() {
+            let rewrite = out.rewrite();
+            // A full save keeps whatever is still referenced: the originals this page no longer
+            // draws or names leave its resources, so their bytes cannot survive in the saved file.
+            // The page stores its resources whole, changed or not.
             let mut res = resources.clone();
-            let page_content: Vec<Vec<u8>> = new_list
-                .iter()
-                .map(|o| match &*doc.resolve(o) {
-                    Object::Stream(s) => s.decoded().unwrap_or_default(),
-                    _ => Vec::new(),
-                })
-                .collect();
-            if !out.xobjects.is_empty() || !out.replaced.is_empty() {
-                let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
-                // A full save keeps whatever is still referenced: unlink the originals this page no
-                // longer draws so the removed image or form bytes cannot survive in the saved file.
-                interp::prune(&mut xo, &out.replaced, &page_content);
-                for (n, r) in &out.xobjects {
-                    xo.set(n.clone(), Object::Ref(*r));
-                }
-                res.set(b"XObject".to_vec(), Object::Dict(xo));
-            }
-            // For the tag pass: the original property-list names (in the content before) and the
-            // added ones (in the content after) both resolve.
-            let mut tags_res = resources.clone();
-            if !out.properties.is_empty() || !out.replaced_properties.is_empty() {
-                // The lists whose replacement text went with the glyphs they wrapped: the cleaned
-                // copies are added, the shared originals dropped once nothing names them.
-                let mut pr = res.get(b"Properties").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
-                for (n, d) in &out.properties {
-                    pr.set(n.clone(), Object::Dict(d.clone()));
-                }
-                tags_res.set(b"Properties".to_vec(), Object::Dict(pr.clone()));
-                interp::prune_names(&mut pr, &out.replaced_properties, &page_content, "BDC", 1);
-                res.set(b"Properties".to_vec(), Object::Dict(pr));
-            }
+            interp::rebuild_resources(doc, &mut res, &rewrite, Some(&interp::decoded_contents(doc, &new_list)), &[]);
+            let tags_res = interp::tag_resources(doc, &resources, &rewrite);
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));
                 d.set(b"Resources".to_vec(), Object::Dict(res));

@@ -253,17 +253,116 @@ fn fresh_name(scope: &mut Scope<'_>, taken: &Dict, prefix: &str) -> Vec<u8> {
     }
 }
 
+/// The parts of a scope's [`Output`] that its resource dictionary has to follow once the content
+/// is rewritten.
+pub(crate) struct Rewrite<'a> {
+    /// New XObjects the rewritten content draws: (resource name, object).
+    pub xobjects: &'a [(Vec<u8>, ObjRef)],
+    /// XObject names whose `Do` was dropped or pointed at a cleaned copy.
+    pub replaced: &'a [Vec<u8>],
+    /// Cleaned property lists added under fresh names.
+    pub properties: &'a [(Vec<u8>, Dict)],
+    /// Property-list names whose `BDC` was rewritten.
+    pub replaced_properties: &'a [Vec<u8>],
+}
+
+impl Rewrite<'_> {
+    /// Did the rewrite drop, replace or add any resource name?
+    fn names_resources(&self) -> bool {
+        !self.xobjects.is_empty() || !self.replaced.is_empty() || !self.properties.is_empty() || !self.replaced_properties.is_empty()
+    }
+}
+
+impl Output {
+    /// What the scope's resources have to follow (see [`rebuild_resources`]).
+    pub(crate) fn rewrite(&self) -> Rewrite<'_> {
+        Rewrite { xobjects: &self.xobjects, replaced: &self.replaced, properties: &self.properties, replaced_properties: &self.replaced_properties }
+    }
+}
+
+/// Bring a rewritten scope's resource dictionary `res` in line with its new `content` (`None`
+/// when the content itself did not change: then nothing is pruned, only added), so a full-rewrite
+/// save keeps only what the scope still uses:
+/// - `/XObject`: an original whose `Do` was dropped or replaced goes once no surviving `Do` draws
+///   it; the cleaned copies come in;
+/// - `/Properties`: the lists of `hidden_layers` and the originals of the cleaned lists go once
+///   no surviving `BDC` names them; the cleaned copies with references come in.
+///
+/// Each dictionary is written back into `res` (inline) only when an entry went or came. Returns
+/// whether `res` changed.
+pub(crate) fn rebuild_resources(
+    doc: &Document,
+    res: &mut Dict,
+    rewrite: &Rewrite<'_>,
+    content: Option<&[Vec<u8>]>,
+    hidden_layers: &[ObjRef],
+) -> bool {
+    let mut xo = res_dict(doc, res, b"XObject");
+    let before = xo.len();
+    if let Some(content) = content {
+        prune(&mut xo, rewrite.replaced, content);
+    }
+    for (n, r) in rewrite.xobjects {
+        xo.set(n.clone(), Object::Ref(*r));
+    }
+    let xobjects_changed = xo.len() != before || !rewrite.xobjects.is_empty();
+    if xobjects_changed {
+        res.set(b"XObject".to_vec(), Object::Dict(xo));
+    }
+    let mut pr = res_dict(doc, res, b"Properties");
+    let before = pr.len();
+    if let Some(content) = content {
+        prune_properties(doc, hidden_layers, &mut pr, content);
+        prune_names(&mut pr, rewrite.replaced_properties, content, "BDC", 1);
+    }
+    for (n, d) in rewrite.properties {
+        pr.set(n.clone(), Object::Dict(d.clone()));
+    }
+    let properties_changed = pr.len() != before || !rewrite.properties.is_empty();
+    if properties_changed {
+        res.set(b"Properties".to_vec(), Object::Dict(pr));
+    }
+    xobjects_changed || properties_changed
+}
+
+/// The resources the tag pass reads for a rewritten scope: `res` as it was before
+/// [`rebuild_resources`], plus the property lists the rewrite added, so the names in the content
+/// before (the originals) and after (the fresh ones) both resolve.
+pub(crate) fn tag_resources(doc: &Document, res: &Dict, rewrite: &Rewrite<'_>) -> Dict {
+    let mut tags_res = res.clone();
+    if !rewrite.properties.is_empty() {
+        let mut pr = res_dict(doc, res, b"Properties");
+        for (n, d) in rewrite.properties {
+            pr.set(n.clone(), Object::Dict(d.clone()));
+        }
+        tags_res.set(b"Properties".to_vec(), Object::Dict(pr));
+    }
+    tags_res
+}
+
+/// The data of a page's content streams as listed in `/Contents`, decoded leniently (an entry
+/// that is not a stream, or does not decode, counts as empty): what a rewritten page's resources
+/// are pruned against.
+pub(crate) fn decoded_contents(doc: &Document, list: &[Object]) -> Vec<Vec<u8>> {
+    list.iter()
+        .map(|o| match &*doc.resolve(o) {
+            Object::Stream(s) => s.decoded().unwrap_or_default(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
 /// Drop every `replaced` resource name whose `Do` no longer appears in the rewritten `content`,
 /// so a full-rewrite save stops reaching the original image or form it named. A name that some
 /// surviving `Do` still draws (the same image shown again outside a mark) is kept.
-pub(crate) fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
+fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
     prune_names(xo, replaced, content, "Do", 0);
 }
 
 /// Drop every `replaced` name of a resource dictionary that no surviving `operator` in `content`
 /// names as its operand `operand` (`Do` and an XObject, `BDC` and a property list), so a
 /// full-rewrite save stops reaching what it named.
-pub(crate) fn prune_names(dict: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>], operator: &str, operand: usize) {
+fn prune_names(dict: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>], operator: &str, operand: usize) {
     if replaced.is_empty() {
         return;
     }
@@ -1016,74 +1115,33 @@ fn xobject(
             scope.depth += 1;
             // The form inherits the caller's graphics state (its font and size included) under
             // its own matrix.
-            let inner = process_with(doc, scope, std::slice::from_ref(&data), &res, Gs { ctm: fctm, ..gs.clone() });
+            let mut inner = process_with(doc, scope, std::slice::from_ref(&data), &res, Gs { ctm: fctm, ..gs.clone() });
             scope.depth -= 1;
             scope.fonts = saved_fonts;
             out.residue += inner.residue;
             out.vertical |= inner.vertical;
             out.unreadable |= inner.unreadable;
             out.doomed.extend_from_slice(&inner.doomed);
-            out.tag_changes.extend(inner.tag_changes);
+            out.tag_changes.append(&mut inner.tag_changes);
             if scope.mode == Mode::Verify {
                 return None;
             }
-            let new_data = inner.streams.into_iter().next().flatten();
-            if new_data.is_none() && inner.xobjects.is_empty() && inner.replaced.is_empty() {
+            let new_data = inner.streams.drain(..).next().flatten();
+            let rewrite = inner.rewrite();
+            if new_data.is_none() && rewrite.xobjects.is_empty() && rewrite.replaced.is_empty() {
                 return None;
             }
             let mut dict = s.dict.clone();
             dict.remove(b"Length");
-            // Rebuild the copy's /Resources whenever inner content gained or lost an XObject, so a
-            // `Do` the copy no longer makes stops keeping the original image or form reachable.
+            let tags_res = tag_resources(doc, &res, &rewrite);
+            // The copy gets /Resources of its own whenever they changed, so a `Do` or `BDC` the copy
+            // no longer makes stops keeping the original reachable, and whenever the rewrite named
+            // a resource at all, even if they came out the same: a form without /Resources of its
+            // own would otherwise draw through its caller's, which the caller prunes for its own
+            // content only.
             let mut res = res;
-            let mut rebuilt = false;
-            // For the tag pass: the original names (in the content before) and the added ones (in
-            // the content after) both resolve.
-            let mut tags_res = res.clone();
-            if !inner.properties.is_empty() {
-                let mut pr = res_dict(doc, &tags_res, b"Properties");
-                for (n, d) in &inner.properties {
-                    pr.set(n.clone(), Object::Dict(d.clone()));
-                }
-                tags_res.set(b"Properties".to_vec(), Object::Dict(pr));
-            }
-            if !inner.xobjects.is_empty() || !inner.replaced.is_empty() {
-                let mut xo = res_dict(doc, &res, b"XObject");
-                if let Some(d) = &new_data {
-                    prune(&mut xo, &inner.replaced, std::slice::from_ref(d));
-                }
-                for (n, r) in &inner.xobjects {
-                    xo.set(n.clone(), Object::Ref(*r));
-                }
-                res.set(b"XObject".to_vec(), Object::Dict(xo));
-                rebuilt = true;
-            }
-            // Likewise the property lists of the hidden layers whose blocks went.
-            if let Some(d) = &new_data
-                && !scope.hidden_layers.is_empty()
-            {
-                let mut pr = res_dict(doc, &res, b"Properties");
-                let before = pr.len();
-                prune_properties(doc, &scope.hidden_layers, &mut pr, std::slice::from_ref(d));
-                if pr.len() != before {
-                    res.set(b"Properties".to_vec(), Object::Dict(pr));
-                    rebuilt = true;
-                }
-            }
-            // And the property lists whose replacement text went with the glyphs they wrapped:
-            // the cleaned copies are added, the shared originals dropped once nothing names them.
-            if !inner.properties.is_empty() || !inner.replaced_properties.is_empty() {
-                let mut pr = res_dict(doc, &res, b"Properties");
-                if let Some(d) = &new_data {
-                    prune_names(&mut pr, &inner.replaced_properties, std::slice::from_ref(d), "BDC", 1);
-                }
-                for (n, d) in &inner.properties {
-                    pr.set(n.clone(), Object::Dict(d.clone()));
-                }
-                res.set(b"Properties".to_vec(), Object::Dict(pr));
-                rebuilt = true;
-            }
-            if rebuilt {
+            let resources_changed = rebuild_resources(doc, &mut res, &rewrite, new_data.as_ref().map(std::slice::from_ref), &scope.hidden_layers);
+            if resources_changed || rewrite.names_resources() {
                 dict.set(b"Resources".to_vec(), Object::Dict(res));
             }
             let (changed, empty) = tags::touched(doc, &tags_res, &data, new_data.as_deref().unwrap_or(&data));
@@ -1184,7 +1242,7 @@ fn strip_hidden_layers(doc: &Document, scope: &mut Scope<'_>, ops: Vec<Op>, prop
 /// groups are off) once no surviving `BDC` in `content` names them, so the group dictionary and
 /// its name leave the file with the content it hid. Entries a surviving `BDC` still names are
 /// kept (a block that was not hidden can name the same property list).
-pub(crate) fn prune_properties(doc: &Document, hidden_layers: &[ObjRef], props: &mut Dict, content: &[Vec<u8>]) {
+fn prune_properties(doc: &Document, hidden_layers: &[ObjRef], props: &mut Dict, content: &[Vec<u8>]) {
     if hidden_layers.is_empty() {
         return;
     }

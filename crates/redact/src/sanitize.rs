@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use pdfcraft_content::Matrix;
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
-use crate::interp::{Mode, Scope, process};
+use crate::interp::{Mode, Scope, decoded_contents, process, rebuild_resources};
 use crate::{RedactError, Report, annots_of, page_streams, put_annots};
 
 /// The categories of Acrobat's Remove Hidden Information panel that PdfCraft handles.
@@ -328,50 +328,23 @@ fn content_pass(doc: &mut Document, text: bool, layers: bool, write: bool) -> Re
         doomed.extend_from_slice(&out.doomed);
         let mut new_list = list.clone();
         let mut changed = false;
-        for (i, new) in out.streams.into_iter().enumerate() {
+        for (i, new) in out.streams.iter().enumerate() {
             let Some(bytes) = new else { continue };
             let mut dict = match &*doc.resolve(&list[i]) {
                 Object::Stream(s) => s.dict.clone(),
                 _ => Dict::new(),
             };
             dict.remove(b"Length");
-            new_list[i] = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(dict, &bytes))));
+            new_list[i] = Object::Ref(doc.add(Object::Stream(pdfcraft_cos::Stream::flate(dict, bytes))));
             changed = true;
         }
         if changed || !out.xobjects.is_empty() || !out.replaced.is_empty() {
+            // A full save keeps whatever is still referenced: the originals this page no longer
+            // draws leave its resources, and so do the off layers' property lists with their blocks
+            // (so the group dictionaries and their names stop being reachable through the page).
+            // The page stores its resources whole, changed or not.
             let mut res = resources;
-            let page_content: Vec<Vec<u8>> = new_list
-                .iter()
-                .map(|o| match &*doc.resolve(o) {
-                    Object::Stream(s) => s.decoded().unwrap_or_default(),
-                    _ => Vec::new(),
-                })
-                .collect();
-            if !out.xobjects.is_empty() || !out.replaced.is_empty() {
-                let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
-                // A full save keeps whatever is still referenced: unlink the originals this page no
-                // longer draws so the removed form or image bytes cannot survive in the saved file.
-                crate::interp::prune(&mut xo, &out.replaced, &page_content);
-                for (n, r) in &out.xobjects {
-                    xo.set(n.clone(), Object::Ref(*r));
-                }
-                res.set(b"XObject".to_vec(), Object::Dict(xo));
-            }
-            if layers || !out.properties.is_empty() || !out.replaced_properties.is_empty() {
-                // The off layers' property lists go with their blocks, so the group dictionaries
-                // (and their names) stop being reachable through the page; the lists whose
-                // replacement text went with hidden glyphs are replaced by cleaned copies.
-                let mut pr = res.get(b"Properties").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
-                let before = pr.len();
-                crate::interp::prune_properties(doc, &off, &mut pr, &page_content);
-                crate::interp::prune_names(&mut pr, &out.replaced_properties, &page_content, "BDC", 1);
-                for (n, d) in &out.properties {
-                    pr.set(n.clone(), Object::Dict(d.clone()));
-                }
-                if pr.len() != before || !out.properties.is_empty() {
-                    res.set(b"Properties".to_vec(), Object::Dict(pr));
-                }
-            }
+            rebuild_resources(doc, &mut res, &out.rewrite(), Some(&decoded_contents(doc, &new_list)), &off);
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));
                 d.set(b"Resources".to_vec(), Object::Dict(res));

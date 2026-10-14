@@ -207,23 +207,18 @@ fn is_vertical(doc: &Document, font: &Dict) -> bool {
     }
 }
 
-fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
-    let mut i = scope.used_names.len() + 1;
-    loop {
-        let n = format!("PCRedacted{i}").into_bytes();
-        if !xobjects.contains(&n) && !scope.used_names.contains(&n) {
-            scope.used_names.push(n.clone());
-            return n;
-        }
-        i += 1;
-    }
-}
+/// The prefix of the `/XObject` names given to the cleaned copies of images and forms.
+const XOBJECT_PREFIX: &str = "PCRedacted";
+/// The prefix of the `/Properties` names given to the cleaned copies of property lists.
+const PROPERTY_PREFIX: &str = "PCRedactedP";
 
-fn fresh_property_name(scope: &mut Scope<'_>, props: &Dict) -> Vec<u8> {
+/// A resource name, `prefix` and a number, that is neither in `taken` (the resource dictionary it
+/// is for) nor handed out before; it is recorded in the scope so it is not handed out again.
+fn fresh_name(scope: &mut Scope<'_>, taken: &Dict, prefix: &str) -> Vec<u8> {
     let mut i = scope.used_names.len() + 1;
     loop {
-        let n = format!("PCRedactedP{i}").into_bytes();
-        if !props.contains(&n) && !scope.used_names.contains(&n) {
+        let n = format!("{prefix}{i}").into_bytes();
+        if !taken.contains(&n) && !scope.used_names.contains(&n) {
             scope.used_names.push(n.clone());
             return n;
         }
@@ -293,7 +288,7 @@ fn clean_property_list(doc: &Document, scope: &mut Scope<'_>, op: &mut Op, props
             out.replaced_properties.push(n.clone());
             let d = cleaned(d);
             if d.iter().any(|(_, v)| has_ref(v, 0)) {
-                let fresh = fresh_property_name(scope, props);
+                let fresh = fresh_name(scope, props, PROPERTY_PREFIX);
                 out.properties.push((fresh.clone(), d));
                 Object::Name(fresh)
             } else {
@@ -936,7 +931,7 @@ fn xobject(
                 Ok(None) => None,
                 Ok(Some(new)) => {
                     let nr = doc.add(Object::Stream(new));
-                    let n = fresh_name(scope, xobjects);
+                    let n = fresh_name(scope, xobjects, XOBJECT_PREFIX);
                     xobjects.set(n.clone(), Object::Ref(nr));
                     out.xobjects.push((n.clone(), nr));
                     out.replaced.push(name);
@@ -1069,7 +1064,7 @@ fn xobject(
             };
             let nr = doc.add(Object::Stream(stream));
             out.tag_changes.push((r, nr, changed, empty));
-            let n = fresh_name(scope, xobjects);
+            let n = fresh_name(scope, xobjects, XOBJECT_PREFIX);
             xobjects.set(n.clone(), Object::Ref(nr));
             out.xobjects.push((n.clone(), nr));
             out.replaced.push(name);
@@ -1150,15 +1145,5 @@ pub(crate) fn prune_properties(doc: &Document, hidden_layers: &[ObjRef], props: 
         return;
     }
     let hidden: Vec<Vec<u8>> = props.iter().filter(|(_, v)| layer_hidden(doc, hidden_layers, v)).map(|(n, _)| n.to_vec()).collect();
-    if hidden.is_empty() {
-        return;
-    }
-    let joined = Pieces::join(content);
-    let ops = joined.parse().ops;
-    let still_named = |n: &[u8]| ops.iter().any(|op| op.is("BDC") && op.operands.get(1).and_then(Object::as_name) == Some(n));
-    for n in hidden {
-        if !still_named(&n) {
-            props.remove(&n);
-        }
-    }
+    prune_names(props, &hidden, content, "BDC", 1);
 }

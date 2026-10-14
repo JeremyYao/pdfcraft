@@ -319,26 +319,23 @@ struct Built {
 
 /// Something inside the open marked-content sequences was removed or cut: the text that stood
 /// for it goes from every enclosing `BDC`'s property list, whether that `BDC` is in the piece
-/// being built (`ops`) or an earlier one (whose piece is then flagged as changed). Returns
-/// whether `ops` changed. A sequence cleaned once is forgotten (`None`).
-fn cut_sequences(doc: &Document, scope: &mut Scope<'_>, built: &mut Built, ops: &mut [Op], props: &Dict, out: &mut Output) -> bool {
+/// being built (`ops`) or an earlier one. An earlier piece whose `BDC` changed is flagged as
+/// changed here; the piece being built is not, since the caller, which has just removed or cut
+/// something in it, flags it itself. A sequence cleaned once is forgotten (`None`).
+fn clean_enclosing_sequences(doc: &Document, scope: &mut Scope<'_>, built: &mut Built, ops: &mut [Op], props: &Dict, out: &mut Output) {
     let current = built.done.len();
-    let mut changed = false;
     for slot in built.open.iter_mut() {
         let Some((piece, index)) = *slot else { continue };
         *slot = None;
         let op = if piece == current { ops.get_mut(index) } else { built.done.get_mut(piece).and_then(|(v, _)| v.get_mut(index)) };
         let Some(op) = op else { continue };
-        if !clean_property_list(doc, scope, op, props, out) {
-            continue;
-        }
-        if piece == current {
-            changed = true;
-        } else if let Some((_, c)) = built.done.get_mut(piece) {
-            *c = true;
+        if clean_property_list(doc, scope, op, props, out)
+            && piece != current
+            && let Some((_, changed)) = built.done.get_mut(piece)
+        {
+            *changed = true;
         }
     }
-    changed
 }
 
 /// Whether `content` draws the XObject `name` of the resource dictionary `xo`: directly, or
@@ -569,7 +566,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
     }
 
     // When something inside an open marked-content sequence is removed or cut, the enclosing
-    // property lists lose the text that stood for it (`cut_sequences`).
+    // property lists lose the text that stood for it (`clean_enclosing_sequences`).
     let mut built = Built { done: Vec::with_capacity(streams.len()), open: Vec::new() };
     for (piece, mut changed) in pieces.into_iter().zip(rewrite) {
         let mut ops: Vec<Op> = Vec::with_capacity(piece.len());
@@ -605,7 +602,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 }
                 let b = bbox.unwrap_or_default();
                 changed = true;
-                cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
+                clean_enclosing_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                 if scope.covered(b) {
                     scope.report.paths_removed += 1;
                     if clips {
@@ -750,7 +747,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     }
                     changed = true;
                     scope.report.glyphs += removed;
-                    cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
+                    clean_enclosing_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                     match o {
                         b"\"" => {
                             ops.push(Op::new("Tw", vec![num(gs.word_spacing)]));
@@ -771,7 +768,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                         } else {
                             scope.report.images_removed += 1;
                             changed = true;
-                            cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
+                            clean_enclosing_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                             continue;
                         }
                     }
@@ -780,7 +777,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     // A shading fills the current clip: clip the regions out.
                     if let Some(c) = clip_out(scope.rects, &gs.ctm, [-1e6, -1e6, 1e6, 1e6]) {
                         changed = true;
-                        cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
+                        clean_enclosing_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                         ops.push(Op::new("q", vec![]));
                         ops.extend(c);
                         ops.push(op);
@@ -791,7 +788,7 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 b"Do" => {
                     if let Some(new) = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out) {
                         changed = true;
-                        cut_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
+                        clean_enclosing_sequences(doc, scope, &mut built, &mut ops, &props, &mut out);
                         if let Some(n) = new {
                             ops.push(n);
                         }

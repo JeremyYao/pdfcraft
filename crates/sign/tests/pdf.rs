@@ -2087,24 +2087,14 @@ fn fixture_with_dangling_xobject() -> Vec<u8> {
 /// at any level.
 #[test]
 fn defining_an_object_the_signed_page_already_named_is_a_change() {
-    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
-    let trust = TrustStore { certs: vec![id.certificate.clone()] };
-    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
-    for certify in LEVELS {
-        let signed = pdfcraft_sign::sign(&open(&fixture_with_dangling_xobject()), &id, &SignOptions { certify, ..opts() }).unwrap();
-        assert_eq!(check(&signed).status, Status::Valid, "{certify:?}: untouched");
-        let edited = edit_after(&signed, |doc| {
-            let mut d = pdfcraft_cos::Dict::new();
-            d.set(b"Type".to_vec(), Object::name("XObject"));
-            d.set(b"Subtype".to_vec(), Object::name("Form"));
-            d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
-            let s = pdfcraft_cos::Stream::from_raw(d, b"0 0 0 rg 20 60 260 140 re f".to_vec());
-            doc.set(pdfcraft_cos::ObjRef { num: 50, generation: 0 }, Object::Stream(s));
-        });
-        let s = check(&edited);
-        assert_eq!(s.status, Status::Invalid, "{certify:?}: {:?} {:?}", s.modification, s.details);
-        assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&"page content")), "{certify:?}: {:?}", s.modification);
-    }
+    assert_refused_at_every_level(&fixture_with_dangling_xobject(), "page content", |doc| {
+        let mut d = pdfcraft_cos::Dict::new();
+        d.set(b"Type".to_vec(), Object::name("XObject"));
+        d.set(b"Subtype".to_vec(), Object::name("Form"));
+        d.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+        let s = pdfcraft_cos::Stream::from_raw(d, b"0 0 0 rg 20 60 260 140 re f".to_vec());
+        doc.set(pdfcraft_cos::ObjRef { num: 50, generation: 0 }, Object::Stream(s));
+    });
 }
 
 /// A form with an unsigned signature field (object 6, with `lock` in its dictionary) and a text

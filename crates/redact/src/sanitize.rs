@@ -4,6 +4,8 @@
 //! categories; [`sanitize`] removes all of them. Every removal makes the next save a full
 //! rewrite, so the earlier revision (which still holds the data) leaves the file.
 
+use std::collections::HashSet;
+
 use pdfcraft_content::Matrix;
 use pdfcraft_cos::{Dict, Document, ObjRef, Object};
 
@@ -123,7 +125,7 @@ fn outline_len(doc: &Document, first: Option<&Object>, depth: usize) -> usize {
 /// parser.
 fn reachable(doc: &Document) -> Vec<ObjRef> {
     let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen: HashSet<u32> = HashSet::new();
     let mut stack: Vec<ObjRef> = doc.root().into_iter().collect();
     while let Some(r) = stack.pop() {
         if !seen.insert(r.num) {
@@ -435,6 +437,56 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
         .collect()
 }
 
+/// Remove the interactive form: every field is flattened into its page, one without an
+/// appearance drawn first so its value stays visible; `/AcroForm` leaves the catalog (`root`);
+/// and every widget still on a page goes, undrawn. Returns the objects to retire:
+/// the widgets no longer on a page, and each field none of whose widgets is (its /V would
+/// otherwise stay reachable).
+fn remove_form_fields(doc: &mut Document, root: ObjRef) -> Result<Vec<ObjRef>, RedactError> {
+    let fields = pdfcraft_forms::fields(doc);
+    // Fields without appearances get one first, so their values stay visible.
+    for f in &fields {
+        if f.widgets.iter().any(|w| !doc.get(w.obj).as_dict().is_some_and(|d| d.contains(b"AP"))) {
+            pdfcraft_forms::redraw_field(doc, &f.name)?;
+        }
+    }
+    let n = pdfcraft_model::pages(doc).len();
+    pdfcraft_edit::flatten(doc, &(0..n).collect::<Vec<_>>(), false, true)?;
+    doc.update_dict(root, |d| {
+        d.remove(b"AcroForm");
+    })?;
+    // Flattening leaves Hidden and NoView annotations alone (neither drawn nor removed), which
+    // is right for Flatten but not here: a widget the user cannot see still holds its field's
+    // name and value. Every widget still on a page goes, undrawn; what stays is `on_page`.
+    let mut on_page: HashSet<ObjRef> = HashSet::new();
+    for p in pdfcraft_model::pages(doc) {
+        let list = annots_of(doc, &p.dict);
+        let kept: Vec<Object> =
+            list.iter().filter(|a| doc.resolve(a).as_dict().and_then(|d| d.name(b"Subtype")) != Some(b"Widget")).cloned().collect();
+        on_page.extend(kept.iter().filter_map(Object::as_ref));
+        if kept.len() != list.len() {
+            doc.update_dict(p.obj, |d| {
+                if kept.is_empty() {
+                    d.remove(b"Annots");
+                } else {
+                    d.set(b"Annots".to_vec(), Object::Array(kept));
+                }
+            })?;
+        }
+    }
+    // The widgets taken off the pages are deleted, and so is a field none of whose widgets is on
+    // a page any more.
+    let mut retired = Vec::new();
+    for f in &fields {
+        let gone: Vec<ObjRef> = f.widgets.iter().map(|w| w.obj).filter(|w| !on_page.contains(w)).collect();
+        if gone.len() == f.widgets.len() {
+            retired.push(f.obj);
+        }
+        retired.extend(gone);
+    }
+    Ok(retired)
+}
+
 /// Remove the chosen categories. Returns what was removed per category.
 pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden, usize)>, RedactError> {
     let counts = scan(doc);
@@ -449,49 +501,8 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
     // The annotation, widget and field objects removed: nulled at the end (`retire`), so a
     // structure element, a reply or anything else that still refers to one cannot carry it into
     // the saved file.
-    let mut retired: Vec<ObjRef> = Vec::new();
-    if which.contains(&Hidden::FormFields) && count(Hidden::FormFields) > 0 {
-        let fields = pdfcraft_forms::fields(doc);
-        // Fields without appearances get one first, so their values stay visible.
-        for f in &fields {
-            if f.widgets.iter().any(|w| !doc.get(w.obj).as_dict().is_some_and(|d| d.contains(b"AP"))) {
-                pdfcraft_forms::redraw_field(doc, &f.name)?;
-            }
-        }
-        let n = pdfcraft_model::pages(doc).len();
-        pdfcraft_edit::flatten(doc, &(0..n).collect::<Vec<_>>(), false, true)?;
-        doc.update_dict(root, |d| {
-            d.remove(b"AcroForm");
-        })?;
-        // Flattening leaves Hidden and NoView annotations alone (neither drawn nor removed),
-        // which is right for Flatten but not here: a widget the user cannot see still holds its
-        // field's name and value. Every widget still on a page goes, undrawn.
-        for p in pdfcraft_model::pages(doc) {
-            let list = annots_of(doc, &p.dict);
-            let kept: Vec<Object> =
-                list.iter().filter(|a| doc.resolve(a).as_dict().and_then(|d| d.name(b"Subtype")) != Some(b"Widget")).cloned().collect();
-            if kept.len() != list.len() {
-                doc.update_dict(p.obj, |d| {
-                    if kept.is_empty() {
-                        d.remove(b"Annots");
-                    } else {
-                        d.set(b"Annots".to_vec(), Object::Array(kept));
-                    }
-                })?;
-            }
-        }
-        // The widgets taken off the pages are deleted, and so is a field none of whose widgets
-        // is on a page any more (its /V would otherwise stay reachable).
-        let on_page: std::collections::HashSet<ObjRef> =
-            pdfcraft_model::pages(doc).iter().flat_map(|p| annots_of(doc, &p.dict)).filter_map(|a| a.as_ref()).collect();
-        for f in &fields {
-            let gone: Vec<ObjRef> = f.widgets.iter().map(|w| w.obj).filter(|w| !on_page.contains(w)).collect();
-            if gone.len() == f.widgets.len() {
-                retired.push(f.obj);
-            }
-            retired.extend(gone);
-        }
-    }
+    let mut retired: Vec<ObjRef> =
+        if which.contains(&Hidden::FormFields) && count(Hidden::FormFields) > 0 { remove_form_fields(doc, root)? } else { Vec::new() };
     // Annotations: comments, attachments (multimedia included), links, actions.
     let drop_annot = |a: &Dict| -> bool {
         let s = a.name(b"Subtype").unwrap_or(b"");

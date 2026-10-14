@@ -3,6 +3,8 @@
 //! Dictionaries keep their key order so rewritten objects stay recognisable in diffs and
 //! byte-stable when re-serialized. Streams keep their *encoded* bytes; decoding is on demand.
 
+use std::borrow::Borrow;
+
 use pdfcraft_filters::{Filter, Params};
 
 use crate::{Bytes, CosError, Document};
@@ -186,24 +188,7 @@ impl Stream {
             Some(Object::Array(a)) => a.iter().map(Object::as_dict).collect(),
             _ => Vec::new(),
         };
-        names
-            .into_iter()
-            .enumerate()
-            // `/Crypt` is applied by the security handler when the object is loaded (§7.4.10).
-            .filter(|(_, n)| *n != b"Crypt")
-            .map(|(i, n)| {
-                let p = parms.get(i).copied().flatten();
-                let get = |k: &[u8], d: i64| p.and_then(|p| p.int(k)).unwrap_or(d);
-                let params = Params {
-                    predictor: get(b"Predictor", 1),
-                    colors: get(b"Colors", 1),
-                    bits_per_component: get(b"BitsPerComponent", 8),
-                    columns: get(b"Columns", 1),
-                    early_change: get(b"EarlyChange", 1),
-                };
-                (Filter::from_name(n), params)
-            })
-            .collect()
+        filter_chain(names.into_iter(), &parms, Dict::int)
     }
 
     /// The filter chain resolved through `doc`: `/Filter` and `/DecodeParms` may be indirect
@@ -240,24 +225,7 @@ impl Stream {
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err(unresolved("/DecodeParms")),
         };
-        Ok(names
-            .into_iter()
-            .enumerate()
-            // `/Crypt` is applied by the security handler when the object is loaded (§7.4.10).
-            .filter(|(_, n)| n != b"Crypt")
-            .map(|(i, n)| {
-                let p = parms.get(i).and_then(Option::as_ref);
-                let get = |k: &[u8], d: i64| p.and_then(|p| p.get(k)).and_then(|v| doc.resolve(v).as_int()).unwrap_or(d);
-                let params = Params {
-                    predictor: get(b"Predictor", 1),
-                    colors: get(b"Colors", 1),
-                    bits_per_component: get(b"BitsPerComponent", 8),
-                    columns: get(b"Columns", 1),
-                    early_change: get(b"EarlyChange", 1),
-                };
-                (Filter::from_name(&n), params)
-            })
-            .collect())
+        Ok(filter_chain(names.iter().map(Vec::as_slice), &parms, |p, k| p.get(k).and_then(|v| doc.resolve(v).as_int())))
     }
 
     /// Decoded data with the chain resolved through `doc` ([`Stream::filters_in`]) and any
@@ -265,11 +233,7 @@ impl Stream {
     /// or nothing. For consumers that must not act on bytes a viewer would read differently
     /// (redaction, sanitising).
     pub fn decoded_strict_in(&self, doc: &Document) -> Result<Vec<u8>, CosError> {
-        let chain = self.filters_in(doc)?;
-        if chain.is_empty() {
-            return self.raw_within(MAX_DECODED);
-        }
-        pdfcraft_filters::decode(&chain, &self.raw, MAX_DECODED).map_err(|e| CosError::Filter(e.to_string()))
+        self.decode_strict(&self.filters_in(doc)?, MAX_DECODED)
     }
 
     /// Decoded data, tolerating truncated or corrupt encodings the way viewers do (the data
@@ -291,11 +255,7 @@ impl Stream {
 
     /// Decoded data, bounded by [`MAX_DECODED`]; any corruption is an error.
     pub fn decoded_strict(&self) -> Result<Vec<u8>, CosError> {
-        let chain = self.filters();
-        if chain.is_empty() {
-            return self.raw_within(MAX_DECODED);
-        }
-        pdfcraft_filters::decode(&chain, &self.raw, MAX_DECODED).map_err(|e| CosError::Filter(e.to_string()))
+        self.decode_strict(&self.filters(), MAX_DECODED)
     }
 
     /// Data after the first filter alone, bounded by `max`: the rest of the chain stays encoded.
@@ -303,10 +263,16 @@ impl Stream {
     pub fn decoded_first_filter_strict(&self, max: usize) -> Result<Vec<u8>, CosError> {
         let mut chain = self.filters();
         chain.truncate(1);
+        self.decode_strict(&chain, max)
+    }
+
+    /// The stored bytes run through `chain`, any corruption an error. The output is bounded by
+    /// `max` and by [`MAX_DECODED`]; an empty chain yields the stored bytes under the same bound.
+    fn decode_strict(&self, chain: &[(Filter, Params)], max: usize) -> Result<Vec<u8>, CosError> {
         if chain.is_empty() {
             return self.raw_within(max);
         }
-        pdfcraft_filters::decode(&chain, &self.raw, max.min(MAX_DECODED)).map_err(|e| CosError::Filter(e.to_string()))
+        pdfcraft_filters::decode(chain, &self.raw, max.min(MAX_DECODED)).map_err(|e| CosError::Filter(e.to_string()))
     }
 
     fn raw_within(&self, max: usize) -> Result<Vec<u8>, CosError> {
@@ -318,6 +284,34 @@ impl Stream {
         }
         Ok(self.raw.to_vec())
     }
+}
+
+/// The decoder chain for the filter `names`, in order, each with the parameter dictionary at its
+/// position in `parms` (none when the list is shorter or holds no dictionary there). `/Crypt` is
+/// left out, and a parameter that `int` does not find takes its default. `int` reads one integer
+/// entry of a parameter dictionary: whether it follows references is the caller's choice.
+fn filter_chain<'a, D: Borrow<Dict>>(
+    names: impl Iterator<Item = &'a [u8]>,
+    parms: &[Option<D>],
+    int: impl Fn(&Dict, &[u8]) -> Option<i64>,
+) -> Vec<(Filter, Params)> {
+    names
+        .enumerate()
+        // `/Crypt` is applied by the security handler when the object is loaded (§7.4.10).
+        .filter(|(_, n)| *n != b"Crypt")
+        .map(|(i, n)| {
+            let p = parms.get(i).and_then(Option::as_ref).map(D::borrow);
+            let get = |k: &[u8], d: i64| p.and_then(|p| int(p, k)).unwrap_or(d);
+            let params = Params {
+                predictor: get(b"Predictor", 1),
+                colors: get(b"Colors", 1),
+                bits_per_component: get(b"BitsPerComponent", 8),
+                columns: get(b"Columns", 1),
+                early_change: get(b"EarlyChange", 1),
+            };
+            (Filter::from_name(n), params)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq)]

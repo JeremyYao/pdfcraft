@@ -1175,6 +1175,46 @@ fn validate_x509_rsa_sha1(
     finish_validation(doc, bytes, trust, info, cache, covered, cert, &certs, None, None);
 }
 
+/// The kinds of change found so far, each listed once in the order found, split by whether the
+/// signature permits them.
+#[derive(Default)]
+struct Verdict {
+    allowed: Vec<&'static str>,
+    disallowed: Vec<&'static str>,
+}
+
+impl Verdict {
+    /// A change no signature permits.
+    fn forbid(&mut self, what: &'static str) {
+        self.record(what, false);
+    }
+
+    fn record(&mut self, what: &'static str, permitted: bool) {
+        let list = if permitted { &mut self.allowed } else { &mut self.disallowed };
+        if !list.contains(&what) {
+            list.push(what);
+        }
+    }
+
+    fn finish(self) -> Modification {
+        if self.disallowed.is_empty() { Modification::Allowed(self.allowed) } else { Modification::Disallowed(self.disallowed) }
+    }
+}
+
+/// Whether a signature under DocMDP level `p` (none: an approval signature) permits a change of
+/// kind `what`, going by the kind alone.
+fn permitted(what: &'static str, p: Option<u8>) -> bool {
+    match (what, p) {
+        // Signing again, and adding validation data (ISO 32000-2 12.8.2.2.2).
+        (kind::SIGNATURE | kind::SECURITY_STORE, _) => true,
+        (kind::FORM_FILL, Some(2 | 3) | None) => true,
+        (kind::COMMENTS, Some(3) | None) => true,
+        // Every save updates /Info (ModDate), signing included.
+        (kind::METADATA, _) => true,
+        _ => false,
+    }
+}
+
 /// What later revisions changed, classified as Acrobat reports it, under DocMDP `p` (or none:
 /// an approval signature permits form fill, comments and further signatures). `appended_from`
 /// is where the bytes after the signed revision start.
@@ -1205,7 +1245,7 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
     // /Type and adding /ModDate, must not reclassify it away from page content).
     let signed_pages: HashSet<ObjRef> = pdfcraft_annot::page_refs(&old).unwrap_or_default().into_iter().collect();
     let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
-    let (mut allowed, mut disallowed): (Vec<&'static str>, Vec<&'static str>) = (Vec::new(), Vec::new());
+    let mut verdict = Verdict::default();
     let dss = dss_parts(doc, &old);
     // Stored at the same place in both (and not edited since): the same bytes, unchanged.
     let same_place = |num: u32| -> bool {
@@ -1221,17 +1261,16 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
             _ => false,
         }
     };
+    // What reading the file differently amounts to for object `r`: page content when `r` was a
+    // signed page or one of its content streams, else "other".
+    let shown_when_signed = |r: ObjRef| if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
     // A later cross-reference section may carry an entry this reader sets aside (an in-use entry
     // at offset 0, a second entry for one object, a reserved entry type). The renderer may follow
     // it and draw another object than the one compared below, so the page could show new content
     // while every comparison here finds the signed object untouched. No writer has a reason to
     // add such an entry after signing: it is never a permitted change.
     for (_, num) in doc.xref_oddities().iter().filter(|o| !old.xref_oddities().contains(o)) {
-        let r = ObjRef { num: *num, generation: doc.generation(*num) };
-        let what = if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
-        if !disallowed.contains(&what) {
-            disallowed.push(what);
-        }
+        verdict.forbid(shown_when_signed(ObjRef { num: *num, generation: doc.generation(*num) }));
     }
     // An object body in the bytes after the signed revision that no cross-reference entry
     // locates. A writer lists every object it appends. A reader that rebuilds its table by
@@ -1239,18 +1278,14 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
     // such a body for the number and draws it, whatever this reader resolves: never a permitted
     // change, whatever made that reader rebuild.
     for num in doc.objects_unlisted_from(appended_from) {
-        let r = ObjRef { num, generation: old.generation(num) };
-        let what = if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
-        if !disallowed.contains(&what) {
-            disallowed.push(what);
-        }
+        verdict.forbid(shown_when_signed(ObjRef { num, generation: old.generation(num) }));
     }
     // The trailer itself: which catalog the file starts from, how its strings and streams
     // decode, and the first file identifier. A later revision can point /Root at a catalog of
     // its own (a new object is judged by what references it, and nothing but the trailer
     // references a catalog), add or change /Encrypt, or replace /ID. No signature permits it.
-    if doc.root() != old.root() && !disallowed.contains(&kind::STRUCTURE) {
-        disallowed.push(kind::STRUCTURE);
+    if doc.root() != old.root() {
+        verdict.forbid(kind::STRUCTURE);
     }
     let encrypt = |d: &Document| d.trailer().get(b"Encrypt").map(|e| d.resolve(e)).filter(|e| !matches!(**e, Object::Null));
     // A revision without /ID is tolerated (writers leave it out, and every save adds one to a
@@ -1258,8 +1293,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
     let first_id =
         |d: &Document| d.trailer().get(b"ID").and_then(Object::as_array).and_then(|a| a.first()).and_then(Object::as_string).map(|s| s.bytes.clone());
     let id_replaced = matches!((first_id(doc), first_id(&old)), (Some(now), Some(then)) if now != then);
-    if (encrypt(doc).as_deref() != encrypt(&old).as_deref() || id_replaced) && !disallowed.contains(&kind::OTHER) {
-        disallowed.push(kind::OTHER);
+    if encrypt(doc).as_deref() != encrypt(&old).as_deref() || id_replaced {
+        verdict.forbid(kind::OTHER);
     }
     for num in doc.object_numbers() {
         if same_place(num) {
@@ -1272,8 +1307,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
             // The same content at a new place. That is true for the renderer as well only when
             // the entry locates the object itself: where this reader had to search for the
             // object, another reader may arrive at a different one.
-            if !doc.is_edited(num) && !doc.xref_entry_is_exact(num) && !disallowed.contains(&kind::OTHER) {
-                disallowed.push(kind::OTHER);
+            if !doc.is_edited(num) && !doc.xref_entry_is_exact(num) {
+                verdict.forbid(kind::OTHER);
             }
             continue;
         }
@@ -1314,18 +1349,7 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
             _ if before.is_none() => continue,
             _ => kind::OTHER,
         };
-        let ok = match (what, p) {
-            (kind::SIGNATURE | kind::SECURITY_STORE, _) => true,
-            (kind::FORM_FILL, Some(2 | 3) | None) => true,
-            (kind::COMMENTS, Some(3) | None) => true,
-            // Every save updates /Info (ModDate), signing included.
-            (kind::METADATA, _) => true,
-            _ => false,
-        };
-        let list = if ok { &mut allowed } else { &mut disallowed };
-        if !list.contains(&what) {
-            list.push(what);
-        }
+        verdict.record(what, permitted(what, p));
     }
     // Objects the signed revision had that a later one freed, or no longer locates. The loop
     // above never visits them (object_numbers leaves out freed numbers) and the objects that
@@ -1353,13 +1377,9 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, append
                 _ => kind::OTHER,
             }
         };
-        let ok = matches!((what, p), (kind::FORM_FILL, Some(2 | 3) | None) | (kind::COMMENTS, Some(3) | None) | (kind::METADATA, _));
-        let list = if ok { &mut allowed } else { &mut disallowed };
-        if !list.contains(&what) {
-            list.push(what);
-        }
+        verdict.record(what, permitted(what, p));
     }
-    if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
+    verdict.finish()
 }
 
 /// What freeing the signed object `d` amounts to, by what it was: a page-tree node is

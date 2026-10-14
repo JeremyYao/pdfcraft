@@ -142,9 +142,14 @@ pub(crate) fn annots_of(doc: &Document, page: &Dict) -> Vec<Object> {
 
 /// Treat removal as deletion: overwrite each removed annotation, widget or field object with
 /// `null`, which a full save skips, so a referrer other than the page's /Annots and the field
-/// tree (a structure element's OBJR kid, a reply's /IRT, the form's /CO) cannot carry its content
-/// into the saved file. A surviving annotation that replied to a removed one loses its /IRT
-/// (and /RT) rather than point at nothing.
+/// tree (a structure element's OBJR kid, a reply's /IRT) cannot carry its content into the saved
+/// file. A surviving annotation that replied to a removed one loses its /IRT (and /RT) rather
+/// than point at nothing.
+///
+/// That is the only referrer edited here: any other is left as it is, pointing at `null`. In
+/// particular the form's calculation order (/AcroForm /CO) still lists a retired field;
+/// [`apply`] takes the deleted fields out of it in a separate step
+/// (`drop_from_calculation_order`).
 pub(crate) fn retire(doc: &mut Document, objects: &[ObjRef]) -> Result<(), pdfcraft_cos::CosError> {
     if objects.is_empty() {
         return Ok(());

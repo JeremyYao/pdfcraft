@@ -1349,11 +1349,13 @@ fn off_layer_block_fixture() -> Document {
             "",
             b"BT /F1 12 Tf 20 20 Td (PUBLIC) Tj ET q 50 0 0 50 20 100 cm /ImOC Do Q /OC /L1 BDC BT /F1 12 Tf 20 60 Td (LAYERBLOCKTEXT) Tj ET q 50 0 0 50 100 100 cm /ImB Do Q /FmB Do EMC",
         ),
-        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        // The font has widths of its own (10), so nothing but the layer's own use reaches the OCG.
+        FONT.replace("95 0 R", "10 0 R").into_bytes(),
         b"<< /Type /OCG /Name (SECRETLAYERNAME) >>".to_vec(),
         stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /OC 6 0 R", b"LAYEROCIMAGEBYTE"),
         stream("/Type /XObject /Subtype /Image /Width 16 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"LAYERBLOCKIMAGEB"),
         stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 5 0 R >> >>", b"BT /F1 10 Tf 20 230 Td (LAYERBLOCKFORMTEXT) Tj ET"),
+        widths(),
     ])
 }
 
@@ -1366,9 +1368,12 @@ fn off_layer_blocks_take_the_images_and_forms_they_draw_with_them() {
         assert!(done.iter().any(|(h, n)| *h == Hidden::HiddenLayers && *n > 0), "{done:?}");
         let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
         assert!(bytes_contain(&bytes, b"PUBLIC"), "the visible text stays (sanitize: {all})");
-        for secret in [&b"LAYERBLOCKTEXT"[..], b"LAYEROCIMAGEBYTE", b"LAYERBLOCKIMAGEB", b"LAYERBLOCKFORMTEXT", b"SECRETLAYERNAME"] {
+        for secret in [&b"LAYERBLOCKTEXT"[..], b"LAYEROCIMAGEBYTE", b"LAYERBLOCKIMAGEB", b"LAYERBLOCKFORMTEXT"] {
             assert!(!bytes_contain(&bytes, secret), "{} survived the save (sanitize: {all})", String::from_utf8_lossy(secret));
         }
+        // A full save packs the layer's dictionary into a compressed object stream, where the
+        // file bytes do not show it: search the objects themselves.
+        assert!(!saved_contains(&doc, b"SECRETLAYERNAME"), "the off layer's name survived the save (sanitize: {all})");
         let saved = Document::open(Arc::new(bytes)).unwrap();
         for name in [&b"ImOC"[..], b"ImB", b"FmB"] {
             assert_eq!(named_image(&saved, 0, name), None, "/{} is still named by the page (sanitize: {all})", String::from_utf8_lossy(name));

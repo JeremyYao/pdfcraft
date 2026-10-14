@@ -1612,7 +1612,7 @@ impl FieldLock {
     }
 
     /// Both locks together: a field either one locks.
-    fn and(self, other: FieldLock) -> FieldLock {
+    fn union(self, other: FieldLock) -> FieldLock {
         match (self, other) {
             (FieldLock::All, _) | (_, FieldLock::All) => FieldLock::All,
             (FieldLock::Only(mut a), FieldLock::Only(b)) => {
@@ -1640,7 +1640,7 @@ fn field_lock(old: &Document, v: &Dict, field: Option<ObjRef>) -> Option<FieldLo
         .filter_map(|r| old.resolve(&r).as_dict().cloned())
         .filter(|r| r.name(b"TransformMethod") == Some(b"FieldMDP"))
         .filter_map(|r| r.get(b"TransformParams").map(|p| old.resolve(p)).and_then(|p| p.as_dict().and_then(|p| FieldLock::from_dict(old, p))))
-        .reduce(FieldLock::and);
+        .reduce(FieldLock::union);
     references.or_else(|| {
         let f = old.get(field?);
         let lock = f.as_dict()?.get(b"Lock").map(|l| old.resolve(l))?;

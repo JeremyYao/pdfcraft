@@ -1307,32 +1307,7 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
     let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
     let mut verdict = Verdict::default();
     let dss = dss_parts(doc, &old);
-    // Object numbers the signed revision referenced but did not define (a page's /Resources
-    // naming an XObject, a font or a pattern that does not exist yet). The signed objects that
-    // name them are unchanged bytes, yet defining one later changes what they show: never
-    // "just a new object", at any level.
-    let old_dangling: HashSet<u32> = {
-        fn walk(o: &Object, out: &mut Vec<u32>, depth: u8) {
-            if depth > 64 {
-                return;
-            }
-            match o {
-                Object::Ref(r) => out.push(r.num),
-                Object::Array(a) => a.iter().for_each(|x| walk(x, out, depth + 1)),
-                Object::Dict(d) => d.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
-                Object::Stream(s) => s.dict.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
-                _ => {}
-            }
-        }
-        let mut named = Vec::new();
-        walk(&Object::Dict(old.trailer().clone()), &mut named, 0);
-        for (_, o) in old.scan_objects() {
-            walk(&o, &mut named, 0);
-        }
-        named.sort_unstable();
-        named.dedup();
-        named.into_iter().filter(|n| old.try_get(*n).is_ok_and(|o| matches!(*o, Object::Null))).collect()
-    };
+    let old_dangling = dangling_refs(&old);
     // Stored at the same place in both (and not edited since): the same bytes, unchanged.
     let same_place = |num: u32| -> bool {
         use pdfcraft_cos::XrefEntry;
@@ -1365,6 +1340,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
         let r = ObjRef { num, generation: doc.generation(num) };
         let new = doc.get(r);
         let before = old.try_get(num).ok().filter(|o| !matches!(**o, Object::Null));
+        // The signed version as a dictionary, when it was one.
+        let was = before.as_deref().and_then(Object::as_dict);
         if before.as_deref() == Some(&*new) {
             // The same content at a new place. That is true for the renderer as well only when
             // the entry locates the object itself: where this reader had to search for the
@@ -1380,7 +1357,6 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
             // The Document Security Store's own arrays and dictionaries, when they only grew.
             _ if dss.contains(&num) => kind::SECURITY_STORE,
             Object::Dict(d) => {
-                let was = before.as_deref().and_then(Object::as_dict);
                 if signed_pages.contains(&r) {
                     // A signed page is always judged by what the page shows, whatever it is now
                     // relabelled: a rewritten /Contents or /Resources is a page content change.
@@ -1415,17 +1391,11 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
         };
         // A field the signer locked (a FieldMDP reference, or the field's own /Lock) may not
         // be filled in either: that fill is a change no permission covers.
-        let what = if what == kind::FORM_FILL
-            && lock
-                .is_some_and(|l| before.as_deref().and_then(Object::as_dict).is_some_and(|was| field_name(&old, r, was).is_some_and(|n| l.locks(&n))))
-        {
-            kind::OTHER
-        } else {
-            what
-        };
+        let locked = what == kind::FORM_FILL && lock.zip(was).is_some_and(|(lock, was)| lock.locks_field(&old, r, was));
+        let what = if locked { kind::OTHER } else { what };
         // "No changes" permits one signature change: a document timestamp.
         let ok = if (what, p) == (kind::SIGNATURE, Some(1)) {
-            new.as_dict().is_some_and(|d| is_doc_timestamp_change(doc, &old, d, before.as_deref().and_then(Object::as_dict)))
+            new.as_dict().is_some_and(|d| is_doc_timestamp_change(doc, &old, d, was))
         } else {
             permitted(what, p)
         };
@@ -1555,6 +1525,33 @@ fn dss_parts(doc: &Document, old: &Document) -> HashSet<u32> {
     parts
 }
 
+/// Object numbers the signed revision referenced but did not define (a page's /Resources
+/// naming an XObject, a font or a pattern that does not exist yet). The signed objects that
+/// name them are unchanged bytes, yet defining one later changes what they show: never
+/// "just a new object", at any level.
+fn dangling_refs(old: &Document) -> HashSet<u32> {
+    fn walk(o: &Object, out: &mut HashSet<u32>, depth: u8) {
+        if depth > 64 {
+            return;
+        }
+        match o {
+            Object::Ref(r) => {
+                out.insert(r.num);
+            }
+            Object::Array(a) => a.iter().for_each(|x| walk(x, out, depth + 1)),
+            Object::Dict(d) => d.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
+            Object::Stream(s) => s.dict.iter().for_each(|(_, x)| walk(x, out, depth + 1)),
+            _ => {}
+        }
+    }
+    let mut named = HashSet::new();
+    walk(&Object::Dict(old.trailer().clone()), &mut named, 0);
+    for (_, o) in old.scan_objects() {
+        walk(&o, &mut named, 0);
+    }
+    named.into_iter().filter(|n| old.try_get(*n).is_ok_and(|o| matches!(*o, Object::Null))).collect()
+}
+
 /// What adding `added` annotations or fields amounts to: signing, when every one is a signature
 /// field that is signed; otherwise new annotations. No permission covers creating a field, and
 /// an unsigned signature field is an appearance over the page like any other annotation.
@@ -1589,6 +1586,12 @@ impl FieldLock {
             FieldLock::Only(names) => names.iter().any(|n| n == name),
             FieldLock::AllBut(names) => !names.iter().any(|n| n == name),
         }
+    }
+
+    /// Whether `was`, the signed version of object `r` in the signed revision `old`, is a
+    /// field or widget this lock covers, going by its fully qualified name there.
+    fn locks_field(&self, old: &Document, r: ObjRef, was: &Dict) -> bool {
+        field_name(old, r, was).is_some_and(|name| self.locks(&name))
     }
 
     /// A lock from a FieldMDP transform parameters or a /Lock dictionary: /Action (All,

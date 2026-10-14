@@ -1659,16 +1659,19 @@ fn field_name(old: &Document, r: ObjRef, was: &Dict) -> Option<String> {
     }
     let mut parts: Vec<String> = Vec::new();
     let mut seen = HashSet::from([r]);
-    let mut node = was.clone();
+    // The ancestor `node` is read from, held while `node` borrows its dictionary.
+    let mut ancestor: Arc<Object>;
+    let mut node = was;
     for _ in 0..32 {
-        if let Some(t) = text(old, &node, b"T") {
+        if let Some(t) = text(old, node, b"T") {
             parts.push(t);
         }
         let Some(parent) = node.get(b"Parent").and_then(Object::as_ref) else { break };
         if !seen.insert(parent) {
             break;
         }
-        node = old.get(parent).as_dict().cloned()?;
+        ancestor = old.get(parent);
+        node = ancestor.as_dict()?;
     }
     if parts.is_empty() {
         return None;

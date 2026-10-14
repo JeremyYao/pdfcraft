@@ -25,9 +25,9 @@ mod regions;
 use regions::{group_blocks, rewrite_styled_block};
 
 /// Per-page aggregate decoded-content budget: a crafted `/Contents` array of several streams,
-/// each within the per-stream decompression cap, must not sum to far more than this. Matches the
-/// group-selection path in `objects.rs`.
-const MAX_CONTENT_BYTES: usize = 128 * 1024 * 1024;
+/// each within the per-stream decompression cap, must not sum to far more than this. The
+/// group-selection path in `objects.rs` uses the same budget.
+pub(crate) const MAX_CONTENT_BYTES: usize = 128 * 1024 * 1024;
 /// Most `/Contents` array elements one page may list.
 const MAX_CONTENT_STREAMS: usize = 10_000;
 /// Most operators the text interpreters materialise from one page's content. Past this the page

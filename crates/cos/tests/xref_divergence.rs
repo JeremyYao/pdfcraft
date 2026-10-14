@@ -7,6 +7,7 @@ use std::sync::Arc;
 use pdfcraft_cos::{Document, XrefEntry};
 
 /// A classic-xref file from object bodies (object i+1 = bodies[i]).
+/// Mirrors `document::tests::build`, which an integration test cannot reach.
 fn build(bodies: &[&str], trailer: &str) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();

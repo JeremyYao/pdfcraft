@@ -1236,6 +1236,46 @@ fn validate_x509_rsa_sha1(
     finish_validation(doc, bytes, trust, info, cache, covered, cert, &certs, None, None, None);
 }
 
+/// The kinds of change found so far, each listed once in the order found, split by whether the
+/// signature permits them.
+#[derive(Default)]
+struct Verdict {
+    allowed: Vec<&'static str>,
+    disallowed: Vec<&'static str>,
+}
+
+impl Verdict {
+    /// A change no signature permits.
+    fn forbid(&mut self, what: &'static str) {
+        self.record(what, false);
+    }
+
+    fn record(&mut self, what: &'static str, permitted: bool) {
+        let list = if permitted { &mut self.allowed } else { &mut self.disallowed };
+        if !list.contains(&what) {
+            list.push(what);
+        }
+    }
+
+    fn finish(self) -> Modification {
+        if self.disallowed.is_empty() { Modification::Allowed(self.allowed) } else { Modification::Disallowed(self.disallowed) }
+    }
+}
+
+/// Whether a signature under DocMDP level `p` (none: an approval signature) permits a change of
+/// kind `what`, going by the kind alone.
+fn permitted(what: &'static str, p: Option<u8>) -> bool {
+    match (what, p) {
+        // Signing again, and adding validation data (ISO 32000-2 12.8.2.2.2).
+        (kind::SIGNATURE | kind::SECURITY_STORE, _) => true,
+        (kind::FORM_FILL, Some(2 | 3) | None) => true,
+        (kind::COMMENTS, Some(3) | None) => true,
+        // Every save updates /Info (ModDate), signing included.
+        (kind::METADATA, _) => true,
+        _ => false,
+    }
+}
+
 /// What later revisions changed, classified as Acrobat reports it, under DocMDP `p` (or none:
 /// an approval signature permits form fill, comments and further signatures).
 fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: Option<&FieldLock>) -> Modification {
@@ -1265,7 +1305,7 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
     // /Type and adding /ModDate, must not reclassify it away from page content).
     let signed_pages: HashSet<ObjRef> = pdfcraft_annot::page_refs(&old).unwrap_or_default().into_iter().collect();
     let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
-    let (mut allowed, mut disallowed): (Vec<&'static str>, Vec<&'static str>) = (Vec::new(), Vec::new());
+    let mut verdict = Verdict::default();
     let dss = dss_parts(doc, &old);
     // Object numbers the signed revision referenced but did not define (a page's /Resources
     // naming an XObject, a font or a pattern that does not exist yet). The signed objects that
@@ -1307,17 +1347,16 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
             _ => false,
         }
     };
+    // What reading the file differently amounts to for object `r`: page content when `r` was a
+    // signed page or one of its content streams, else "other".
+    let shown_when_signed = |r: ObjRef| if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
     // A later cross-reference section may carry an entry this reader sets aside (an in-use entry
     // at offset 0, a second entry for one object, a reserved entry type). The renderer may follow
     // it and draw another object than the one compared below, so the page could show new content
     // while every comparison here finds the signed object untouched. No writer has a reason to
     // add such an entry after signing: it is never a permitted change.
     for (_, num) in doc.xref_oddities().iter().filter(|o| !old.xref_oddities().contains(o)) {
-        let r = ObjRef { num: *num, generation: doc.generation(*num) };
-        let what = if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
-        if !disallowed.contains(&what) {
-            disallowed.push(what);
-        }
+        verdict.forbid(shown_when_signed(ObjRef { num: *num, generation: doc.generation(*num) }));
     }
     for num in doc.object_numbers() {
         if same_place(num) {
@@ -1330,8 +1369,8 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
             // The same content at a new place. That is true for the renderer as well only when
             // the entry locates the object itself: where this reader had to search for the
             // object, another reader may arrive at a different one.
-            if !doc.is_edited(num) && !doc.xref_entry_is_exact(num) && !disallowed.contains(&kind::OTHER) {
-                disallowed.push(kind::OTHER);
+            if !doc.is_edited(num) && !doc.xref_entry_is_exact(num) {
+                verdict.forbid(kind::OTHER);
             }
             continue;
         }
@@ -1384,26 +1423,15 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>, lock: 
         } else {
             what
         };
-        let ok = match (what, p) {
-            // Validation data may always be added (ISO 32000-2 12.8.2.2.2).
-            (kind::SECURITY_STORE, _) => true,
-            // "No changes" permits one signature change: a document timestamp.
-            (kind::SIGNATURE, Some(1)) => {
-                new.as_dict().is_some_and(|d| is_doc_timestamp_change(doc, &old, d, before.as_deref().and_then(Object::as_dict)))
-            }
-            (kind::SIGNATURE, _) => true,
-            (kind::FORM_FILL, Some(2 | 3) | None) => true,
-            (kind::COMMENTS, Some(3) | None) => true,
-            // Every save updates /Info (ModDate), signing included.
-            (kind::METADATA, _) => true,
-            _ => false,
+        // "No changes" permits one signature change: a document timestamp.
+        let ok = if (what, p) == (kind::SIGNATURE, Some(1)) {
+            new.as_dict().is_some_and(|d| is_doc_timestamp_change(doc, &old, d, before.as_deref().and_then(Object::as_dict)))
+        } else {
+            permitted(what, p)
         };
-        let list = if ok { &mut allowed } else { &mut disallowed };
-        if !list.contains(&what) {
-            list.push(what);
-        }
+        verdict.record(what, ok);
     }
-    if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
+    verdict.finish()
 }
 
 /// Where an object sits in the Document Security Store (ISO 32000-2 §12.8.4.3).

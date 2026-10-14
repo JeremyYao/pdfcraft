@@ -264,10 +264,14 @@ fn three_d_stream(doc: &Document, annot: &Dict) -> Option<ObjRef> {
     }
 }
 
-/// Does this 3D annotation's stream run a script when it is instantiated (`/OnInstantiate`)?
-fn has_3d_script(doc: &Document, annot: &Dict) -> bool {
-    annot.name(b"Subtype") == Some(b"3D")
-        && three_d_stream(doc, annot).is_some_and(|s| doc.get(s).as_dict().is_some_and(|d| d.contains(b"OnInstantiate")))
+/// The 3D stream of a 3D annotation when it runs a script as it is instantiated
+/// (`/OnInstantiate`); `None` for a 3D annotation whose stream has no script, and for any other
+/// annotation.
+fn scripted_3d_stream(doc: &Document, annot: &Dict) -> Option<ObjRef> {
+    if annot.name(b"Subtype") != Some(b"3D") {
+        return None;
+    }
+    three_d_stream(doc, annot).filter(|s| doc.get(*s).as_dict().is_some_and(|d| d.contains(b"OnInstantiate")))
 }
 
 /// The layers that are off in the default configuration.
@@ -424,7 +428,7 @@ pub fn scan(doc: &Document) -> Vec<(Hidden, usize)> {
                         + usize::from(cat.contains(b"AA"))
                         + pages.iter().filter(|p| p.dict.contains(b"AA")).count()
                         + annots.iter().filter(|a| a.contains(b"AA") || (a.name(b"Subtype") != Some(b"Link") && a.contains(b"A"))).count()
-                        + annots.iter().filter(|a| has_3d_script(doc, a)).count()
+                        + annots.iter().filter(|a| scripted_3d_stream(doc, a).is_some()).count()
                         + sub(doc, &names, b"JavaScript").map_or(0, |t| name_tree_len(doc, &t, 0))
                         + sub(doc, &names, b"AlternatePresentations").map_or(0, |t| name_tree_len(doc, &t, 0))
                 }
@@ -548,10 +552,7 @@ pub fn remove_hidden(doc: &mut Document, which: &[Hidden]) -> Result<Vec<(Hidden
                     d.remove(b"A");
                 })?;
             }
-            if actions
-                && has_3d_script(doc, &d)
-                && let Some(s) = three_d_stream(doc, &d)
-            {
+            if actions && let Some(s) = scripted_3d_stream(doc, &d) {
                 doc.update_dict(s, |d| {
                     d.remove(b"OnInstantiate");
                 })?;

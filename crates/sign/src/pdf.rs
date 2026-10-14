@@ -2023,18 +2023,14 @@ fn sign_inner(
         tp.set(b"Type".to_vec(), Object::name("TransformParams"));
         tp.set(b"P".to_vec(), Object::Int(p.clamp(1, 3) as i64));
         tp.set(b"V".to_vec(), Object::name("1.2"));
-        let mut sr = Dict::new();
-        sr.set(b"Type".to_vec(), Object::name("SigRef"));
-        sr.set(b"TransformMethod".to_vec(), Object::name("DocMDP"));
-        sr.set(b"TransformParams".to_vec(), Object::Dict(tp));
-        v.set(b"Reference".to_vec(), Object::Array(vec![Object::Dict(sr)]));
+        v.set(b"Reference".to_vec(), Object::Array(vec![sig_ref("DocMDP", tp)]));
     }
     // A field whose /Lock names what it locks after signing gets a FieldMDP reference saying
     // so (ISO 32000-2 §12.8.2.4), for readers that only read references.
     if let Some(name) = &opts.field
         && let Some(lock) = sig_fields(&doc).into_iter().find(|f| &f.name == name).and_then(|f| f.dict.get(b"Lock").map(|l| doc.resolve(l)))
         && let Some(lock) = lock.as_dict()
-        && matches!(lock.name(b"Action"), Some(b"All" | b"Include" | b"Exclude"))
+        && FieldLock::from_dict(&doc, lock).is_some()
     {
         let mut tp = Dict::new();
         tp.set(b"Type".to_vec(), Object::name("TransformParams"));
@@ -2044,12 +2040,8 @@ fn sign_inner(
                 tp.set(key.to_vec(), (*doc.resolve(x)).clone());
             }
         }
-        let mut sr = Dict::new();
-        sr.set(b"Type".to_vec(), Object::name("SigRef"));
-        sr.set(b"TransformMethod".to_vec(), Object::name("FieldMDP"));
-        sr.set(b"TransformParams".to_vec(), Object::Dict(tp));
         let mut references = v.get(b"Reference").and_then(Object::as_array).cloned().unwrap_or_default();
-        references.push(Object::Dict(sr));
+        references.push(sig_ref("FieldMDP", tp));
         v.set(b"Reference".to_vec(), Object::Array(references));
     }
     let sig = doc.add(Object::Dict(v.clone()));
@@ -2185,6 +2177,16 @@ fn sign_inner(
     let hex: Vec<u8> = cms.iter().flat_map(|b| format!("{b:02X}").into_bytes()).collect();
     out[start + 1..start + 1 + hex.len()].copy_from_slice(&hex);
     Ok(out)
+}
+
+/// A signature reference dictionary (ISO 32000-2 §12.8.1): the transform `method` the signature
+/// was made under, and that transform's `params`.
+fn sig_ref(method: &str, params: Dict) -> Object {
+    let mut sr = Dict::new();
+    sr.set(b"Type".to_vec(), Object::name("SigRef"));
+    sr.set(b"TransformMethod".to_vec(), Object::name(method));
+    sr.set(b"TransformParams".to_vec(), Object::Dict(params));
+    Object::Dict(sr)
 }
 
 /// Append a document timestamp (ISO 32000-2 §12.8.2.2): a standalone signature dictionary

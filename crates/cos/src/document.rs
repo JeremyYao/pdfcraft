@@ -379,7 +379,7 @@ impl Document {
         // signing and redaction work on the decrypted ones. Refuse rather than read a security
         // dictionary two ways.
         let lenient = match enc {
-            Object::Ref(r) => self.read_leniently(r.num),
+            Object::Ref(r) => self.needs_lenient_read(r.num),
             _ => self.trailer_lenient,
         };
         if lenient {
@@ -647,9 +647,8 @@ impl Document {
         match self.entries.get(&num) {
             None | Some(XrefEntry::Free { .. }) => true,
             Some(XrefEntry::InFile { offset, .. }) => {
-                let at = |off: usize| matches!(parse_indirect_shared(&self.data, off, &|_| None), Ok((id, _)) if id.num == num);
-                // Offsets may count from a header that does not start the file.
-                usize::try_from(*offset).is_ok_and(|off| at(off) || (self.header_offset != 0 && at(off.saturating_add(self.header_offset))))
+                let at = |pos: usize| matches!(parse_indirect_shared(&self.data, pos, &|_| None), Ok((id, _)) if id.num == num);
+                self.entry_positions(*offset).any(at)
             }
             Some(XrefEntry::InStream { stream, index }) => {
                 self.objstm(*stream).is_ok_and(|stm| usize::try_from(*index).ok().and_then(|i| stm.index.get(i)).is_some_and(|(n, _)| *n == num))
@@ -657,17 +656,25 @@ impl Document {
         }
     }
 
+    /// Where in the file an in-file entry's `offset` may point, in the order to try them: the
+    /// offset as written, then, when the `%PDF-` header does not start the file, the offset
+    /// counted from that header. A position that does not fit the address space is left out.
+    fn entry_positions(&self, offset: u64) -> impl Iterator<Item = usize> + '_ {
+        let written = usize::try_from(offset).ok();
+        let from_header = written.filter(|_| self.header_offset != 0).and_then(|pos| pos.checked_add(self.header_offset));
+        written.into_iter().chain(from_header)
+    }
+
     /// Whether object `num` can only be read leniently from the file: its entry misses it (so
     /// the reader searches), it sits in an object stream, or a dictionary in it was parsed with
     /// tokens skipped. Another reader may then read something else, or nothing, for the number.
-    fn read_leniently(&self, num: u32) -> bool {
+    fn needs_lenient_read(&self, num: u32) -> bool {
         let Some(XrefEntry::InFile { offset, .. }) = self.entries.get(&num) else { return true };
-        let at = |off: usize| match parse_indirect_checked(&self.data, off, &|_| None) {
+        let at = |pos: usize| match parse_indirect_checked(&self.data, pos, &|_| None) {
             Ok((id, _, lenient)) if id.num == num => Some(lenient),
             _ => None,
         };
-        let Ok(off) = usize::try_from(*offset) else { return true };
-        at(off).or_else(|| (self.header_offset != 0).then(|| at(off.saturating_add(self.header_offset))).flatten()).unwrap_or(true)
+        self.entry_positions(*offset).find_map(at).unwrap_or(true)
     }
 
     /// Object numbers whose `N G obj` header is in the bytes from `from` on, at a line start
@@ -680,20 +687,22 @@ impl Document {
     pub fn objects_unlisted_from(&self, from: usize) -> Vec<u32> {
         let mut out = BTreeSet::new();
         scan_headers(&self.data, from, |at, num, _| {
-            let here = |off: u64| {
-                usize::try_from(off).is_ok_and(|off| off == at || (self.header_offset != 0 && off.saturating_add(self.header_offset) == at))
-            };
-            let current = matches!(self.entries.get(&num), Some(XrefEntry::InFile { offset, .. }) if here(*offset));
-            let older = || {
-                let at = at as u64;
-                self.superseded.contains(&(num, at))
-                    || (self.header_offset != 0 && at.checked_sub(self.header_offset as u64).is_some_and(|off| self.superseded.contains(&(num, off))))
-            };
-            if !current && !older() {
+            let current =
+                matches!(self.entries.get(&num), Some(XrefEntry::InFile { offset, .. }) if self.entry_positions(*offset).any(|pos| pos == at));
+            if !current && !self.superseded_at(num, at) {
                 out.insert(num);
             }
         });
         out.into_iter().collect()
+    }
+
+    /// Whether an older cross-reference section places `num` at the file position `at`: an entry
+    /// a newer section overrode gives that offset as written, or counted from a `%PDF-` header
+    /// that does not start the file (the reverse of [`Self::entry_positions`]).
+    fn superseded_at(&self, num: u32, at: usize) -> bool {
+        let at = at as u64;
+        self.superseded.contains(&(num, at))
+            || (self.header_offset != 0 && at.checked_sub(self.header_offset as u64).is_some_and(|offset| self.superseded.contains(&(num, offset))))
     }
 
     /// Object `num` has an unsaved edit.

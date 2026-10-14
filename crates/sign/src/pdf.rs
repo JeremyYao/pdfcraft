@@ -486,6 +486,17 @@ struct Field {
 }
 
 impl Field {
+    /// The signature dictionary's own object: the reference in /V, when /V is one.
+    fn value_ref(&self) -> Option<ObjRef> {
+        self.dict.get(b"V").and_then(Object::as_ref)
+    }
+
+    /// The object whose own /Contents the byte range must exclude: /V when indirect, else the
+    /// field that holds the dictionary.
+    fn holder(&self) -> Option<ObjRef> {
+        self.value_ref().or(self.r)
+    }
+
     /// The signature dictionary in /V. A field without one is unsigned, whether /V is missing,
     /// null or not a dictionary.
     fn signature(&self, doc: &Document) -> Option<Dict> {
@@ -570,9 +581,7 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
     let mut out = Vec::new();
     let mut field_values: HashSet<ObjRef> = HashSet::new();
     for f in sig_fields(doc) {
-        if let Some(v_ref) = f.dict.get(b"V").and_then(Object::as_ref) {
-            field_values.insert(v_ref);
-        }
+        field_values.extend(f.value_ref());
         let widget = f.widgets.first();
         let page = widget.and_then(|(r, w)| r.and_then(|r| pages.get(&r).copied()).or_else(|| w.reference(b"P").and_then(|p| page_index(doc, p))));
         let rect = widget
@@ -609,10 +618,7 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
             details: Vec::new(),
         };
         if let Some(v) = v {
-            // The object whose own /Contents the byte range must exclude: /V when indirect,
-            // else the field that holds the dictionary.
-            let holder = f.dict.get(b"V").and_then(Object::as_ref).or(f.r);
-            validate_into(doc, bytes, trust, &v, &mut info, cache, holder, f.r);
+            validate_into(doc, bytes, trust, &v, &mut info, cache, &f);
         }
         out.push(info);
     }
@@ -712,17 +718,8 @@ fn is_doc_timestamp(d: &Dict) -> bool {
     d.name(b"SubFilter") == Some(b"ETSI.RFC3161") && matches!(d.name(b"Type"), Some(b"DocTimeStamp" | b"Sig"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn validate_into(
-    doc: &Document,
-    bytes: &[u8],
-    trust: &TrustStore,
-    v: &Dict,
-    info: &mut SignatureInfo,
-    cache: &DigestCache,
-    holder: Option<ObjRef>,
-    field: Option<ObjRef>,
-) {
+/// Validate `v`, the signature dictionary that `field` holds, into `info`.
+fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, info: &mut SignatureInfo, cache: &DigestCache, field: &Field) {
     // A document timestamp can also be the value of a signature field (Documenso writes
     // `Timestamp_1` that way). Its `/Contents` is a bare RFC 3161 token, not a signature over the
     // document, so it must not be read as one.
@@ -730,7 +727,7 @@ fn validate_into(
         info.sub_filter = Some("ETSI.RFC3161".to_string());
         info.doc_timestamp = true;
         info.timestamp = true;
-        validate_doc_timestamp(doc, bytes, v, info, cache, trust, holder);
+        validate_doc_timestamp(doc, bytes, v, info, cache, trust, field.holder());
         return;
     }
     info.date = text(doc, v, b"M");
@@ -763,7 +760,7 @@ fn validate_into(
         return invalid(info, Detail::plain("The signature's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
-    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, holder, l0, o1) {
+    if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') || !gap_is_own_contents(doc, bytes, field.holder(), l0, o1) {
         return invalid(info, Detail::plain("The signature's byte range does not exclude exactly its contents."));
     }
     let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, Detail::plain("The signature contents are not hexadecimal.")) };
@@ -772,7 +769,7 @@ fn validate_into(
     // The signed revision's number: its cross-reference sections (1 for a reconstructed file).
     info.revision = cache.revision(bytes, covered).map_or(1, |d| d.revisions().len().max(1));
     // The fields this signature locks, read from the signed revision.
-    let lock = cache.revision(bytes, covered).and_then(|old| field_lock(&old, v, field));
+    let lock = cache.revision(bytes, covered).and_then(|old| field_lock(&old, v, field.r));
     // What can't be checked is unknown, not invalid: only data that is wrong or fails its check
     // is "invalid".
     let unsupported = |info: &mut SignatureInfo, why: &str| {
@@ -1041,7 +1038,6 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
 
 /// Validate a standalone document timestamp dictionary (`/ETSI.RFC3161`): the token must be
 /// cryptographically valid and its message imprint must cover the file's signed bytes.
-#[allow(clippy::too_many_arguments)]
 fn validate_doc_timestamp(
     doc: &Document,
     bytes: &[u8],

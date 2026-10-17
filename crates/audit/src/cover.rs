@@ -204,10 +204,13 @@ impl<'a> Walker<'a> {
                 b"h" => {
                     path = match path {
                         Path::Lines(pts, _) => Path::Lines(pts, true),
+                        // `re` already closed its subpath, so a further `h` changes nothing.
+                        Path::Rect(r) => Path::Rect(r),
                         _ => Path::Other,
                     };
                 }
-                b"f" | b"F" | b"f*" | b"B" | b"B*" => {
+                // `b`/`b*` close the path before filling it, which the fill does anyway.
+                b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" => {
                     // Only an opaque, normally blended fill hides what is under it.
                     if let Some(r) = std::mem::replace(&mut path, Path::Empty).rect()
                         && gs.alpha >= 1.0

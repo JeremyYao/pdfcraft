@@ -15,3 +15,8 @@ panics. An inline image whose data no `EI` ends runs to the end of the stream an
 draws can fail closed; data that ends in its filter's marker (`>`, `~>`) may run straight into
 `EI`. `redact` and (later) `edit` build their interpreters on it; the graphics-state tracker
 and the `Patch` API of architecture §6 grow here.
+
+Unfiltered inline images with built-in or Indexed colour spaces, and image masks, use their
+sample layout (including per-row byte padding) to locate `EI`. This preserves pixel bytes
+that look like the terminator. Filtered images and resource-defined colour spaces retain
+the tolerant delimiter heuristic; damaged or truncated layouts fall back to it too.

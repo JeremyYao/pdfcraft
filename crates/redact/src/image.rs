@@ -1,15 +1,13 @@
 //! Clearing the pixels of an image under redaction regions. The image is decoded, every pixel
 //! whose centre maps into a region is set to zero (no ink for image masks), and the result is
 //! written as a new Flate image; the original object is untouched (other pages may use it).
-//! The image's soft mask or stencil mask (`/SMask`, a `/Mask` stream) carries samples of the same
-//! pixels, so it is cleared over the same regions into a copy of its own.
-//! Images whose codec PdfCraft can't decode (DCT, JPX, JBIG2, CCITT), or whose sample layout is
-//! not certain to be the one the page is drawn with (see [`components`] and [`SHORT_KEYS`]),
-//! return `None`, and the caller removes the whole image instead; that is fail-closed. So does a
-//! mask that can't be cleared.
+//! Images whose codec PdfCraft can't decode (DCT, JPX, JBIG2, CCITT), whose separate mask
+//! (`/SMask`, `/Mask`) could keep the original pixels, or whose sample layout is not certain to be
+//! the one the page is drawn with (see [`components`] and [`SHORT_KEYS`]) return `None`, and the
+//! caller removes the whole image instead; that is fail-closed.
 
 use pdfcraft_content::{Matrix, overlaps};
-use pdfcraft_cos::{Dict, Document, Filter, Object, Stream};
+use pdfcraft_cos::{Document, Filter, Object, Stream};
 
 /// Most pixels an image may have to be cleared in place (larger ones are removed).
 const MAX_PIXELS: u64 = 64 << 20;
@@ -74,63 +72,18 @@ fn components(doc: &Document, s: &Stream) -> Option<usize> {
     }
 }
 
-/// `Ok(Some(copy))` with the covered pixels cleared (its masks cleared into new objects),
-/// `Ok(None)` when no pixel centre is covered, `Err(())` when the image can't be cleared (the
-/// caller removes it).
+/// `Ok(Some(copy))` with the covered pixels cleared, `Ok(None)` when no pixel centre is covered,
+/// `Err(())` when the image can't be cleared (the caller removes it).
 #[allow(clippy::result_unit_err)]
-pub(crate) fn clear(doc: &mut Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Result<Option<Stream>, ()> {
-    let Some(cleared) = decode_and_clear(doc, s, ctm, rects) else { return Err(()) };
-    let Some(Cleared { mut dict, data, masks }) = cleared else { return Ok(None) };
-    for (key, mask) in masks {
-        let r = doc.add(Object::Stream(mask));
-        dict.set(key, Object::Ref(r));
+pub(crate) fn clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Result<Option<Stream>, ()> {
+    decode_and_clear(doc, s, ctm, rects).ok_or(())
+}
+
+fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<Stream>> {
+    // Separate masks can retain the original image data.
+    if s.dict.contains(b"SMask") || s.dict.contains(b"Mask") {
+        return None;
     }
-    Ok(Some(Stream::flate(dict, &data)))
-}
-
-/// A cleared image: its dictionary (without the entries the new data makes stale), its samples,
-/// and the cleared copies of its masks to store under the given keys.
-struct Cleared {
-    dict: Dict,
-    data: Vec<u8>,
-    masks: Vec<(Vec<u8>, Stream)>,
-}
-
-fn decode_and_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<Cleared>> {
-    let Some((mut dict, data)) = clear_samples(doc, s, ctm, rects)? else { return Some(None) };
-    // Alternate images hold the same pixels again; the copy does without them.
-    dict.remove(b"Alternates");
-    dict.remove(b"OPI");
-    // The masks are drawn through the same unit square, so the same regions cover them, whatever
-    // their resolution. A mask that can't be cleared fails the whole image (removed by the caller).
-    let mut masks = Vec::new();
-    for key in [&b"SMask"[..], b"Mask"] {
-        let Some(m) = s.dict.get(key) else { continue };
-        match &*doc.resolve(m) {
-            // `None` from the mask: no mask pixel centre under the regions (a coarser mask), so
-            // it is kept as it is.
-            Object::Stream(mask) => {
-                if let Some((mut md, data)) = clear_samples(doc, mask, ctm, rects)? {
-                    // A mask has no masks of its own.
-                    md.remove(b"SMask");
-                    md.remove(b"Mask");
-                    masks.push((key.to_vec(), Stream::flate(md, &data)));
-                }
-            }
-            // A colour-key mask (an array) holds no samples; anything else is not a mask.
-            Object::Array(_) => {}
-            _ => {
-                dict.remove(key);
-            }
-        }
-    }
-    Some(Some(Cleared { dict, data, masks }))
-}
-
-/// Decode one image's samples and clear the pixels under the regions: `Some(Some((dict, data)))`
-/// with the copy's dictionary (`/Length` and the decode parameters removed) and the new samples,
-/// `Some(None)` when no pixel centre is covered, `None` when the image can't be cleared.
-fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -> Option<Option<(Dict, Vec<u8>)>> {
     // The chain as the document declares it (indirect entries resolved); only codecs that can be
     // decoded and re-encoded here.
     let chain = s.filters_in(doc).ok()?;
@@ -148,15 +101,20 @@ fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return None;
     }
+    // Every size comes from the file: multiply checked, so an overflowing product refuses the image
+    // instead of sizing the writes below.
+    let bits_per_pixel = ncomp.checked_mul(bpc)?;
+    let row = w.checked_mul(bits_per_pixel)?.div_ceil(8);
+    let bytes = row.checked_mul(h)?;
+    let row_bits = row.checked_mul(8)?;
+    bytes.checked_mul(8)?;
     // Strict: samples a viewer would decode differently (a corrupt or partial stream) are not
     // cleared in place at offsets of their own.
     let mut data = s.decoded_strict_in(doc).ok()?;
-    let row = w.checked_mul(ncomp)?.checked_mul(bpc)?.div_ceil(8);
-    let need = row.checked_mul(h)?;
-    if data.len() < need {
+    if data.len() < bytes {
         return None;
     }
-    data.truncate(need);
+    data.truncate(bytes);
     // Image masks: a sample of 0 paints unless /Decode is [1 0]; cleared samples must not paint.
     let clear_bit = if mask {
         let inverted = s.dict.get(b"Decode").and_then(Object::as_array).and_then(|d| d.first()).and_then(Object::as_f64) == Some(1.0);
@@ -164,7 +122,6 @@ fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -
     } else {
         false
     };
-    let bits_per_pixel = ncomp * bpc;
     let mut cleared = 0usize;
     for j in 0..h {
         // Image space: (0,0) is the bottom-left of the unit square; row 0 is the top.
@@ -182,13 +139,15 @@ fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -
                 continue;
             }
             cleared += 1;
-            let start = j * row * 8 + i * bits_per_pixel;
+            // `bytes * 8` fits, and every bit index is below it, so this arithmetic can't overflow.
+            let start = j * row_bits + i * bits_per_pixel;
             for bit in start..start + bits_per_pixel {
                 let (byte, shift) = (bit / 8, 7 - bit % 8);
+                let b = data.get_mut(byte)?;
                 if clear_bit {
-                    data[byte] |= 1 << shift;
+                    *b |= 1 << shift;
                 } else {
-                    data[byte] &= !(1 << shift);
+                    *b &= !(1 << shift);
                 }
             }
         }
@@ -199,5 +158,8 @@ fn clear_samples(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]]) -
     let mut dict = s.dict.clone();
     dict.remove(b"Length");
     dict.remove(b"DecodeParms");
-    Some(Some((dict, data)))
+    // Alternate images and an OPI original hold the same pixels again; the copy does without them.
+    dict.remove(b"Alternates");
+    dict.remove(b"OPI");
+    Some(Some(Stream::flate(dict, &data)))
 }

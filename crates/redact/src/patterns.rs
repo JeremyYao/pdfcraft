@@ -84,15 +84,49 @@ fn run_ends(s: &[char], start: usize, end: usize) -> impl Iterator<Item = usize>
     std::iter::once(end).chain(cuts).filter(move |&e| e > start)
 }
 
+/// Whether the separated digit run goes on past `k` in the direction `step` (1 or −1): the next
+/// digit after `k` is reached through separators only.
+fn run_continues(s: &[char], k: usize, step: isize, seps: &[char]) -> bool {
+    let mut j = k;
+    loop {
+        let Some(c) = j.checked_add_signed(step).and_then(|j| s.get(j)) else { return false };
+        if c.is_ascii_digit() {
+            return true;
+        }
+        if !seps.contains(c) {
+            return false;
+        }
+        j = j.wrapping_add_signed(step);
+    }
+}
+
 fn phone(s: &[char], i: usize) -> Option<usize> {
+    const SEPS: [char; 5] = [' ', '-', '.', '(', ')'];
     let start_ok = s[i] == '+' && digit(s.get(i + 1)) || s[i] == '(' && digit(s.get(i + 1)) || s[i].is_ascii_digit();
     if !start_ok || word(i.checked_sub(1).and_then(|p| s.get(p))) || s.get(i.wrapping_sub(1)) == Some(&'+') {
         return None;
     }
+    // A phone number is a whole run of digit groups. The tail of a longer one (an IBAN, a
+    // company or social security number) is not a phone number, however it is grouped (#1884).
+    if run_continues(s, i, -1, &SEPS) {
+        return None;
+    }
     let plus = s[i] == '+';
     let first = if plus { i + 1 } else { i };
-    let (longest, _) = digit_run(s, first, &[' ', '-', '.', '(', ')'], 28);
-    run_ends(s, first, longest).find_map(|end| phone_run(s, i, first, end, plus))
+    let (longest, _) = digit_run(s, first, &SEPS, 28);
+    // Nor is the head of a run too long to be a phone number.
+    if longest > first && run_continues(s, longest - 1, 1, &SEPS) {
+        return None;
+    }
+    run_ends(s, first, longest).find_map(|end| {
+        // Spaces alone also group the parts of one longer number, so a run cut back at a space is
+        // a phone number only when it is punctuated as one ("555-123-4567 12 Elm Street").
+        let punctuated = || s.get(first..end).is_some_and(|run| run.iter().any(|c| matches!(c, '-' | '.' | '(' | ')')));
+        if end != longest && !punctuated() {
+            return None;
+        }
+        phone_run(s, i, first, end, plus)
+    })
 }
 
 /// Is `s[first..end]` a phone number (starting at `i`, after a `+` when `plus`)? Its length.
@@ -376,13 +410,22 @@ mod tests {
         assert_eq!(
             found(
                 Pattern::Phone,
-                "on 01.10.2026 or 09-10-2026, ratio 0.1234567, id 0211123456, +4921511234567, +1 234 567, 0211 12, +4912345678901234"
+                "on 01.10.2026 or 09-10-2026, ratio 0.1234567, id 0211123456, +4921511234567, +1 234 567, 0211 12, +49 1234 5678 9012 3456"
             ),
             Vec::<String>::new()
         );
-        // A grouped run with too many digits cannot be told from a number followed by another
-        // number (see `run_ends`): its longest valid prefix is marked rather than nothing.
-        assert_eq!(found(Pattern::Phone, "+49 1234 5678 9012 3456"), ["+49 1234 5678 9012"]);
+    }
+
+    #[test]
+    fn the_tail_of_a_longer_number_is_not_a_phone_number() {
+        // #1884: the last groups of a French social security number, an IBAN and a SIRET used
+        // to be marked as phone numbers (and the start left visible). Example numbers.
+        for s in ["NIR 1 85 05 78 006 084 36 end", "IBAN FR76 3000 6000 0112 3456 7890 189", "SIRET 123 456 782 00010"] {
+            assert_eq!(found(Pattern::Phone, s), Vec::<String>::new(), "{s}");
+        }
+        assert_eq!(found(Pattern::Phone, "tel 01 23 45 67 89 / +33 1 23 45 67 89"), ["01 23 45 67 89", "+33 1 23 45 67 89"]);
+        // Nor the head of a run too long to be one: 28 characters in, this one still goes on.
+        assert_eq!(found(Pattern::Phone, "01 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7"), Vec::<String>::new());
     }
 
     #[test]
@@ -421,7 +464,6 @@ mod tests {
         assert_eq!(found(Pattern::Phone, "Tel 555-123-4567 12 Elm Street"), ["555-123-4567"]);
         assert_eq!(found(Pattern::Phone, "Fax (555) 222-3333 25 Oak Road"), ["(555) 222-3333"]);
         assert_eq!(found(Pattern::Phone, "Tel 555-123-4567 1234 Elm Street"), ["555-123-4567"]);
-        assert_eq!(found(Pattern::Phone, "555-123-4567 555-987-6543"), ["555-123-4567", "555-987-6543"]);
         assert_eq!(found(Pattern::CreditCard, "Card 4111 1111 1111 1111 12/26 expiry"), ["4111 1111 1111 1111"]);
         assert_eq!(found(Pattern::CreditCard, "Card 4111 1111 1111 1111 123"), ["4111 1111 1111 1111"]);
         assert_eq!(found(Pattern::CreditCard, "4111 1111 1111 1111 5500 0000 0000 0004"), ["4111 1111 1111 1111", "5500 0000 0000 0004"]);

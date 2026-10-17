@@ -18,13 +18,13 @@ clear_marks(&mut doc, None)?;                        // remove marks without app
   more than a fifth of its size (or a point) both ways; zero-size text goes when its origin is
   inside;
 - **images**: fully covered → removed; partly covered → a copy with the covered pixels cleared
-  (8/16-bit and 1/2/4-bit images, image masks; Flate/LZW/RL/A85/AHx), its `/SMask` and stencil
-  `/Mask` cleared over the same areas into copies of their own. Removed whole (fail-closed):
-  codecs PdfCraft can't re-encode (DCT, JPX, JBIG2, CCITT), a mask that can't be cleared, and
-  images whose sample layout the renderer might read differently (inline-image abbreviations
-  such as `/CS` or `/W` on an XObject, a bare non-Device colour-space name, an ICC profile whose
-  `/N` and `/Alternate` disagree or that doesn't decode); inline images under an area are
-  removed;
+  (8/16-bit and 1/2/4-bit images, image masks; Flate/LZW/RL/A85/AHx); cleared copies drop
+  `/Alternates` and `/OPI` so alternate pixels cannot survive. Removed whole (fail-closed):
+  codecs PdfCraft can't re-encode (DCT, JPX, JBIG2, CCITT), images with separate `/SMask` or
+  `/Mask` data, and images whose sample layout the renderer might read differently
+  (inline-image abbreviations such as `/CS` or `/W` on an XObject, a bare non-Device
+  colour-space name, an ICC profile whose `/N` and `/Alternate` disagree or that doesn't
+  decode); inline images under an area are removed;
 - **vectors**: covered paths are removed; partly covered paths and shadings are clipped so
   nothing paints inside the areas;
 - **form XObjects**: rewritten recursively into new objects (pages sharing the original keep it);
@@ -36,6 +36,13 @@ clear_marks(&mut doc, None)?;                        // remove marks without app
 A verification pass re-reads each redacted page and fails the operation if any glyph or inline
 image is still under an area. Content that can't be decoded makes the operation fail rather than
 leave it unredacted.
+
+Before changing any page, `apply` prepares the redaction appearances with a shared 8 MiB
+budget for their uncompressed PDF content across the selected pages. It bounds repeated-text
+counts and working line buffers before allocating them, and measures and encodes each repeated
+line once. Invalid or excessive appearances return `RedactError::OverlayLimit` without changing
+the document. Reduce the marked area, disable repeated text, or apply fewer pages at a time.
+This limits appearance generation; it is not a limit on the input PDF or the whole process's memory.
 
 Text that stands for removed glyphs goes with them: the property list of every marked-content
 sequence (`BDC`) around a removed or cut item loses its `/ActualText`, `/Alt` and `/E` (an inline

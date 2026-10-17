@@ -9,7 +9,10 @@ fn page(parts: &[&str]) -> PageText {
     }
 }
 
-// The original straightforward search is an independent oracle for valid page metadata.
+// The original straightforward search is an independent oracle for valid page metadata and for
+// text that search normalisation leaves alone: the alphabet below must avoid ligatures, soft
+// hyphens, zero-width characters, dash variants and precomposed letters, whose normalisation is
+// tested in text.rs.
 fn reference(page: &PageText, query: &str, sensitive: bool, whole: bool, limit: usize) -> Vec<Range<usize>> {
     let fold = |s: &str| if sensitive { s.to_owned() } else { fold_case(s) };
     let needle: Vec<char> = fold(query).split_whitespace().collect::<Vec<_>>().join(" ").chars().collect();

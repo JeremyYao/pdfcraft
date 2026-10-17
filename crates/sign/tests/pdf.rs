@@ -2168,10 +2168,7 @@ fn fixture_with_dangling_appearance() -> Vec<u8> {
         b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R 7 0 R] >>",
-        b"<< /Length 44 >>
-stream
-BT /F1 14 Tf 20 250 Td (Contract text) Tj ET
-endstream",
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
         b"<< /Type /Annot /Subtype /Square /Rect [10 235 290 275] /P 3 0 R /F 4 /AP << /N 50 0 R >> >>",

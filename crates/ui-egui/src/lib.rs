@@ -1520,8 +1520,7 @@ impl PdfCraftApp {
         match (data, open) {
             (Err(e), _) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &att.name), ("e", &e.to_string())]),
             (Ok(bytes), true) => {
-                // The tab is named after the attachment, but as a plain file name: the outer
-                // document's author wrote `/UF`, and Save As and the file sinks start from it.
+                // The tab name later names files written from the tab (Split, Extract pages).
                 if let Err(e) = self.open_bytes(&crate::files::attachment_file_name(&att.name), None, bytes) {
                     self.notify_fmt("Couldn't open {name}: {e}", &[("name", &att.name), ("e", &e.to_string())]);
                 }

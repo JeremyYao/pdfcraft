@@ -198,9 +198,9 @@ pub(crate) fn file_stem_from_user(name: &str) -> String {
 /// `name` as exactly one safe file name to write into a chosen folder: its stem cleaned by
 /// [`file_stem_from_user`] (separators, `..`, drive prefixes and reserved names can't survive
 /// it), its extension (a short alphanumeric suffix, when it has one) kept, and "document" when
-/// nothing usable is left. Names that reach the file sinks come from the document (an embedded
-/// file's `/UF`, a signer certificate's CN) as much as from the user, so every one goes through
-/// this before it is joined onto the folder.
+/// nothing usable is left. Export names its files after the document, so each name goes through
+/// this before it is joined onto the folder, rather than being refused as
+/// [`PdfCraftApp::write_files`] refuses a name that is not plain.
 pub(crate) fn safe_file_name(name: &str) -> String {
     let split = name.rfind('.').filter(|&i| i > 0).and_then(|i| {
         let (stem, ext) = (name.get(..i)?, name.get(i + 1..)?);
@@ -212,30 +212,21 @@ pub(crate) fn safe_file_name(name: &str) -> String {
     if ext.is_empty() { stem.to_string() } else { format!("{stem}.{ext}") }
 }
 
-/// `dir/name` when `name` is one normal path component (see [`safe_file_name`]), so the file
-/// lands directly inside `dir`; `None` for anything else. [`write_inside`] refuses such a name
-/// rather than write beside or outside the chosen folder.
-#[cfg(not(target_arch = "wasm32"))]
-fn inside(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let mut components = std::path::Path::new(name).components();
-    let one = matches!((components.next(), components.next()), (Some(std::path::Component::Normal(_)), None));
-    let path = dir.join(name);
-    (one && path.parent() == Some(dir)).then_some(path)
-}
-
 /// Write `bytes` atomically as the file `name` directly inside the chosen folder `dir`. `name` is
 /// one the caller already made safe with [`safe_file_name`] (and shows in its own messages); a
-/// name that is still not one plain component is refused ([`inside`]), never written beside or
-/// outside `dir`. The error is the reason, for the caller to report next to the name.
+/// name that is still not a plain file name ([`is_plain_file_name`]) is refused, never written
+/// beside or outside `dir`. The error is the reason, for the caller to report next to the name.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn write_inside(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = inside(dir, name).ok_or_else(|| "the name is not a plain file name".to_string())?;
-    crate::editing::write_atomically(&path.to_string_lossy(), bytes).map_err(|e| e.to_string())
+    if !is_plain_file_name(name) {
+        return Err("the name is not a plain file name".to_string());
+    }
+    crate::editing::write_atomically(&dir.join(name).to_string_lossy(), bytes).map_err(|e| e.to_string())
 }
 
-/// A safe native Save suggestion for a PDF-supplied attachment name, and the name an attachment
-/// opened in its own tab gets. This changes only those names, never the stored name or the
-/// selected destination.
+/// A plain file name for a PDF-supplied attachment name: the Save suggestion, and the tab name
+/// (which later names files written from that tab). It never changes the stored name or a
+/// destination the user selected.
 pub(crate) fn attachment_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -253,6 +244,14 @@ pub(crate) fn attachment_file_name(name: &str) -> String {
             .or_else(|| device.strip_prefix("LPT"))
             .is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
     if reserved { format!("_{name}") } else { name.to_string() }
+}
+
+/// Whether `name` names a file directly inside a folder: not empty, `.` or `..`, with no `/` or
+/// `\\`, and no drive (`C:`). On Windows any `:` is refused, which also rules out alternate data
+/// streams.
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
+    let drive = matches!(name.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic());
+    !(name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) || drive || (cfg!(windows) && name.contains(':')))
 }
 
 /// Pages ▸ Rotate Pages.
@@ -705,16 +704,18 @@ impl PdfCraftApp {
 
     /// [`Self::write_files`], then `after` once every file is written: now, or on a later frame
     /// when the user chooses the folder. `after` never runs when writing fails or is cancelled.
-    /// Every name is made one safe file name first ([`safe_file_name`]): the files land directly
-    /// inside the chosen folder whatever the document called them.
+    /// Every name must be a plain file name ([`is_plain_file_name`]); otherwise nothing is written.
     pub(crate) fn write_files_then(&mut self, named: Vec<(String, Arc<Vec<u8>>)>, title: &str, after: impl FnOnce(&mut Self) + Send + 'static) {
-        let named: Vec<(String, Arc<Vec<u8>>)> = named.into_iter().map(|(name, bytes)| (safe_file_name(&name), bytes)).collect();
+        if let Some((name, _)) = named.iter().find(|(name, _)| !is_plain_file_name(name)) {
+            self.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", tl!("the name is not a plain file name"))]);
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let write = move |app: &mut Self, dir: std::path::PathBuf| {
                 for (name, bytes) in &named {
-                    if let Err(e) = write_inside(&dir, name, bytes) {
-                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e)]);
+                    if let Err(e) = crate::editing::write_atomically(&dir.join(name).to_string_lossy(), bytes) {
+                        app.notify_fmt("Couldn't write {name}: {e}", &[("name", name), ("e", &e.to_string())]);
                         return;
                     }
                 }
@@ -1035,14 +1036,13 @@ impl PdfCraftApp {
     }
 }
 
-/// The multi-file sinks (Split, Extract, Export, the accessibility report, Export certificate)
-/// take names from the document (an embedded file's `/UF`, a signer's CN) and join them onto
-/// the folder the user chose. Every file must land directly inside that folder.
+/// Export names its files after the document and writes them into the folder the user chose:
+/// every file must land directly inside that folder, whatever the document is called. (Writing
+/// through [`PdfCraftApp::write_files`] refuses a name that is not plain; see `stem_tests`.)
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod sink_tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
 
     use crate::PdfCraftApp;
 
@@ -1069,25 +1069,6 @@ trailer << /Root 1 0 R >>
     }
 
     #[test]
-    fn written_files_never_leave_the_chosen_folder() {
-        let (root, chosen) = folders("files");
-        std::fs::write(root.join("escaped.txt"), "USER DATA").unwrap();
-        let mut app = PdfCraftApp::new();
-        app.export_dir_override = Some(chosen.to_string_lossy().into_owned());
-        let absolute = root.join("elsewhere").join("owned.txt").to_string_lossy().into_owned();
-        let b = |s: &str| Arc::new(s.as_bytes().to_vec());
-        app.write_files(&[("../escaped.txt".into(), b("1")), (absolute, b("2")), ("..".into(), b("3")), ("plain.txt".into(), b("4"))], "t");
-        assert_eq!(std::fs::read_to_string(root.join("escaped.txt")).unwrap(), "USER DATA", "a file beside the folder is not replaced");
-        assert_eq!(names(&root), ["chosen", "escaped.txt"], "nothing lands beside the chosen folder");
-        let written = names(&chosen);
-        assert_eq!(written.len(), 4, "{written:?}");
-        for expected in [".._escaped.txt", "document", "plain.txt"] {
-            assert!(written.iter().any(|n| n == expected), "{expected} in {written:?}");
-        }
-        assert_eq!(std::fs::read_to_string(chosen.join(".._escaped.txt")).unwrap(), "1");
-    }
-
-    #[test]
     fn exported_text_never_leaves_the_chosen_folder() {
         let (root, chosen) = folders("export");
         let mut app = PdfCraftApp::new();
@@ -1100,7 +1081,7 @@ trailer << /Root 1 0 R >>
 
     #[test]
     fn safe_file_names_are_one_component_with_the_extension_kept() {
-        use super::{inside, safe_file_name};
+        use super::{is_plain_file_name, safe_file_name};
         assert_eq!(safe_file_name("report (page 1).pdf"), "report (page 1).pdf");
         assert_eq!(safe_file_name("../escaped (page 1).pdf"), ".._escaped (page 1).pdf");
         assert_eq!(safe_file_name("../evilcert.cer"), ".._evilcert.cer");
@@ -1120,25 +1101,14 @@ trailer << /Root 1 0 R >>
             let once = safe_file_name(name);
             assert_eq!(Path::new(&once).components().count(), 1, "{once:?}");
             assert_eq!(safe_file_name(&once), once, "stable");
-            assert!(inside(Path::new("chosen"), &once).is_some(), "{once:?}");
-        }
-        // The sink's own check, should a name ever reach it uncleaned.
-        let dir = Path::new("chosen");
-        assert_eq!(inside(dir, "plain.txt"), Some(dir.join("plain.txt")));
-        for name in ["../escaped.txt", "sub/x.txt", "..", ".", "", "/abs.txt"] {
-            assert_eq!(inside(dir, name), None, "{name:?}");
-        }
-        // Drive-letter forms are paths on Windows only (elsewhere a colon or backslash is an
-        // ordinary character of a name).
-        for name in ["C:\\abs.txt", "C:rel.txt", "sub\\x.txt"] {
-            assert_eq!(inside(dir, name).is_none(), cfg!(windows), "{name:?}");
+            assert!(is_plain_file_name(&once), "{once:?}");
         }
     }
 }
 
 #[cfg(test)]
 mod stem_tests {
-    use super::{attachment_file_name, file_stem_from_user};
+    use super::{attachment_file_name, file_stem_from_user, is_plain_file_name};
 
     #[test]
     fn user_file_names_stay_inside_the_folder_and_writable_everywhere() {
@@ -1190,5 +1160,37 @@ mod stem_tests {
             let once = attachment_file_name(name);
             assert_eq!(attachment_file_name(&once), once);
         }
+    }
+
+    #[test]
+    fn write_files_refuses_names_that_leave_the_folder() {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-write-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("a").join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let absolute = dir.join("abs.pdf").to_string_lossy().into_owned();
+        let mut app = crate::PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.export_dir_override = Some(out.to_string_lossy().into_owned());
+        for bad in ["../x.pdf", "..", ".", "", "sub/x.pdf", "sub\\x.pdf", "C:x.pdf", absolute.as_str()] {
+            assert!(!is_plain_file_name(bad), "{bad}");
+            // A plain name first: nothing is written when any name in the batch is refused.
+            app.write_files(&[("ok.pdf".into(), std::sync::Arc::new(b"%PDF".to_vec())), (bad.into(), std::sync::Arc::new(b"%PDF".to_vec()))], "t");
+            assert!(app.toast.as_ref().is_some_and(|t| t.0.contains("not a plain file name")), "{bad}");
+        }
+        let names: Vec<_> = walk(&dir);
+        assert!(names.is_empty(), "{names:?}");
+        app.write_files(&[("x.pdf".into(), std::sync::Arc::new(b"%PDF".to_vec()))], "t");
+        assert_eq!(walk(&dir), vec![out.join("x.pdf")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { out.extend(walk(&path)) } else { out.push(path) }
+        }
+        out
     }
 }

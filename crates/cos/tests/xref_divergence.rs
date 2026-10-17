@@ -144,3 +144,31 @@ fn object_bodies_no_entry_locates_are_listed() {
     assert!(doc.objects_unlisted_from(body).is_empty(), "{:?}", doc.objects_unlisted_from(body));
     assert_eq!(doc.xref_entry(3), Some(XrefEntry::InFile { offset: body2 as u64, generation: 0 }));
 }
+
+/// A hybrid file's cross-reference stream that is unreadable partway keeps what it recorded
+/// before the error: here a row /Index declares that the data does not hold, then a pair with a
+/// negative count. The stream itself is not used, but the record stays.
+#[test]
+fn a_hybrid_stream_unreadable_partway_keeps_what_it_recorded() {
+    let (base, prev, _, _) = base();
+    let doc = Document::open(Arc::new(base.clone())).unwrap();
+    let at = |num| match doc.xref_entry(num) {
+        Some(XrefEntry::InFile { offset, .. }) => offset,
+        other => panic!("object {num} is in the file, not {other:?}"),
+    };
+    let row = |offset: u64| [1, (offset >> 8) as u8, offset as u8, 0];
+    let mut data = vec![0, 0, 0, 255];
+    data.extend(row(at(1)));
+    data.extend(row(at(2)));
+    let mut bytes = base;
+    let stream = bytes.len();
+    bytes.extend_from_slice(format!("8 0 obj\n<< /Type /XRef /Size 9 /W [1 2 1] /Index [0 10 5 -1] /Length {} >>\nstream\n", data.len()).as_bytes());
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let table = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n0 0\ntrailer\n<< /Size 9 /Root 1 0 R /XRefStm {stream} /Prev {prev} >>\nstartxref\n{table}\n%%EOF\n").as_bytes(),
+    );
+    let doc = Document::open(Arc::new(bytes)).unwrap();
+    assert_eq!(doc.xref_oddities(), [(table as u64, 3)]);
+}

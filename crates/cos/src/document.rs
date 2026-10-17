@@ -250,17 +250,28 @@ impl XrefIndex {
         }
     }
 
-    /// Whether some cross-reference section places object `num` in the file at `offset`. A
-    /// compact index keeps every revision's sections, so an older revision's entry for an object a
-    /// later revision wrote again counts; a materialized index holds only the entry in force (its
-    /// reader keeps the older ones apart, as `Document::superseded`).
-    fn places(&self, num: u32, offset: u64, file: &[u8]) -> bool {
-        let here = |entry: Option<XrefEntry>| matches!(entry, Some(XrefEntry::InFile { offset: at, .. }) if at == offset);
-        match self {
-            Self::Compact { revisions, .. } => revisions.iter().any(|revision| {
-                here(revision.primary.lookup(num, file)) || revision.hybrid.as_ref().is_some_and(|hybrid| here(hybrid.lookup(num, file)))
-            }),
-            Self::Materialized(entries) => here(entries.get(&num).copied()),
+    /// A test of whether some cross-reference section places object `num` in the file at
+    /// `offset`, for asking about many bodies at once. A compact index keeps every revision's
+    /// sections, so an older revision's entry for an object a later revision wrote again counts:
+    /// their in-file entries are read once, into a set (at most `MAX_COMPACT_XREF_ROWS`), so a
+    /// question costs the same however many revisions the file has. A materialized index holds
+    /// only the entry in force (its reader keeps the older ones apart, as `Document::superseded`).
+    fn placements<'a>(&'a self, file: &[u8]) -> impl Fn(u32, u64) -> bool + 'a {
+        let mut placed = HashSet::new();
+        if let Self::Compact { revisions, .. } = self {
+            for section in revisions.iter().flat_map(|revision| std::iter::once(&revision.primary).chain(&revision.hybrid)) {
+                let mut numbers = Vec::new();
+                section.extend_numbers(&mut numbers);
+                for num in numbers {
+                    if let Some(XrefEntry::InFile { offset, .. }) = section.lookup(num, file) {
+                        placed.insert((num, offset));
+                    }
+                }
+            }
+        }
+        move |num, offset| match self {
+            Self::Compact { .. } => placed.contains(&(num, offset)),
+            Self::Materialized(entries) => matches!(entries.get(&num), Some(XrefEntry::InFile { offset: at, .. }) if *at == offset),
         }
     }
 
@@ -362,6 +373,8 @@ pub struct Document {
     xref_oddities: Arc<Vec<(u64, u32)>>,
     /// In-file entries an older cross-reference section gives that a newer one overrides, as
     /// (object number, offset): bodies the file still lists, though not as the current object.
+    /// Only the materialized reader fills it: a compact index keeps every revision's entries
+    /// itself, so ask [`Self::lists_body`], not this set.
     superseded: Arc<BTreeSet<(u32, u64)>>,
     /// The trailer dictionary was read leniently (tokens skipped as garbage): another reader
     /// may read what it names, an /Encrypt dictionary above all, differently.
@@ -974,9 +987,10 @@ impl Document {
     /// every object it appends, so after a signed revision such a header is never part of a
     /// permitted change. Headers inside stream data count too: a scanning reader takes them.
     pub fn objects_unlisted_from(&self, from: usize) -> Vec<u32> {
+        let placed = self.entries.placements(&self.data);
         let mut out = BTreeSet::new();
         scan_headers(&self.data, from, |at, num, _| {
-            if !self.lists_body(num, at) {
+            if !self.lists_body(&placed, num, at) {
                 out.insert(num);
             }
         });
@@ -985,15 +999,13 @@ impl Document {
 
     /// Whether some cross-reference section places object `num` at the file position `at`: the
     /// entry in force, or one an older section gave before a newer revision wrote the object
-    /// again. An entry gives that position as written, or counted from a `%PDF-` header that does
-    /// not start the file (the reverse of [`Self::entry_positions`]).
-    fn lists_body(&self, num: u32, at: usize) -> bool {
+    /// again (`placed` is [`XrefIndex::placements`] of this document's index). An entry gives that
+    /// position as written, or counted from a `%PDF-` header that does not start the file (the
+    /// reverse of [`Self::entry_positions`]).
+    fn lists_body(&self, placed: &impl Fn(u32, u64) -> bool, num: u32, at: usize) -> bool {
         let at = at as u64;
         let from_header = at.checked_sub(self.header_offset as u64).filter(|_| self.header_offset != 0);
-        [Some(at), from_header]
-            .into_iter()
-            .flatten()
-            .any(|offset| self.entries.places(num, offset, &self.data) || self.superseded.contains(&(num, offset)))
+        [Some(at), from_header].into_iter().flatten().any(|offset| placed(num, offset) || self.superseded.contains(&(num, offset)))
     }
 
     /// Object `num` has an unsaved edit.
@@ -1491,11 +1503,9 @@ impl Document {
                         retained_bytes = bytes;
                         Some(section)
                     }
-                    Ok(None) => return Ok(None),
-                    Err(e) => {
-                        log.push(format!("hybrid /XRefStm at {x} unreadable: {e}"));
-                        None
-                    }
+                    // An unreadable stream is left to the materialized reader too: it skips the
+                    // stream as this reader would, and keeps what it noted before the error.
+                    Ok(None) | Err(_) => return Ok(None),
                 }
             } else {
                 None
@@ -2259,7 +2269,9 @@ mod tests {
 
     fn assert_compact_matches_materialized(doc: &Document) {
         assert!(matches!(doc.entries.as_ref(), XrefIndex::Compact { .. }), "valid xrefs should not retain a per-entry map");
-        let XrefChain { entries, revisions, .. } = doc.read_xref_chain_materialized(&mut Vec::new()).unwrap();
+        let XrefChain { entries, revisions, oddities, trailer_lenient, .. } = doc.read_xref_chain_materialized(&mut Vec::new()).unwrap();
+        // What the compact reader returns has nothing to note: the materialized reader agrees.
+        assert!(oddities.is_empty() && !trailer_lenient, "{oddities:?}, lenient trailer: {trailer_lenient}");
         let XrefIndex::Materialized(entries) = entries else { panic!("the materialized reader returns a materialized index") };
         assert_eq!(revisions.as_slice(), doc.revisions());
         let max = entries.keys().next_back().copied().unwrap_or(0);
@@ -2351,6 +2363,58 @@ mod tests {
         assert!(matches!(doc.entries.as_ref(), XrefIndex::Materialized(_)));
         assert_eq!(doc.next_num, 4);
         assert_eq!(doc.object_numbers(), vec![1, 2, 3]);
+    }
+
+    /// Listing the object bodies no entry locates asks about every `N G obj` header after a
+    /// point. A compact index keeps every revision's sections, and searching all of them per
+    /// header cost seconds per megabyte of headers in a file with thousands of revisions.
+    #[test]
+    fn listing_unlisted_bodies_costs_the_same_however_many_revisions() {
+        const REVISIONS: usize = 9_000;
+        const HEADERS: usize = 200_000;
+        let mut bytes = build(&["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", "<< /Value 9 >>"], "/Root 1 0 R");
+        let mut prev = String::from_utf8_lossy(&bytes)
+            .rfind(
+                "xref
+0 4",
+            )
+            .unwrap();
+        let bodies = bytes.len();
+        for _ in 0..HEADERS {
+            bytes.extend_from_slice(
+                b"3 0 obj
+9
+endobj
+",
+            );
+        }
+        for _ in 0..REVISIONS {
+            let section = bytes.len();
+            bytes.extend_from_slice(
+                format!(
+                    "xref
+trailer
+<< /Size 4 /Root 1 0 R /Prev {prev} >>
+"
+                )
+                .as_bytes(),
+            );
+            prev = section;
+        }
+        bytes.extend_from_slice(
+            format!(
+                "startxref
+{prev}
+%%EOF
+"
+            )
+            .as_bytes(),
+        );
+        let doc = Document::open(Arc::new(bytes)).unwrap();
+        assert!(matches!(doc.entries.as_ref(), XrefIndex::Compact { .. }), "the compact reader reads this file");
+        let started = std::time::Instant::now();
+        assert_eq!(doc.objects_unlisted_from(bodies), [3]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "listing took {:?}", started.elapsed());
     }
 
     /// Entries the reader sets aside are remembered, so a caller comparing revisions can tell

@@ -75,6 +75,18 @@ fn one_page(content: &[u8], page_extra: &str) -> Vec<u8> {
     b.build()
 }
 
+/// One page with two content streams (`/Contents [4 0 R 5 0 R]`).
+fn two_streams(s1: &[u8], s2: &[u8]) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.add("<< /Type /Catalog /Pages 2 0 R >>");
+    b.add("<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << /Font << /F1 6 0 R >> >> >>");
+    b.add_stream(s1);
+    b.add_stream(s2);
+    b.add(FONT);
+    b.build()
+}
+
 /// One page whose content stream claims `/FlateDecode` but holds garbage: decoding must fail.
 fn bad_filter_page() -> Vec<u8> {
     let mut b = Builder::new();
@@ -651,4 +663,33 @@ fn forms_nested_past_depth_limit_fail_closed() {
     // page clean with a possible cover left unseen.
     let result = audit_redactions(&open(nested_forms(33)));
     assert!(matches!(result, Err(crate::AuditError::TooDeep)), "{result:?}");
+}
+
+#[test]
+fn comment_across_streams_neither_invents_text_nor_a_cover() {
+    let doc = open(two_streams(b"BT /F1 24 Tf 72 700 Td (Visible text) Tj ET % note", b"0 g 70 690 200 40 re f"));
+    assert!(audit_redactions(&doc).unwrap().is_empty(), "commented cover must not be reported");
+    let doc = open(two_streams(b"BT /F1 24 Tf 72 700 Td (Before comment) Tj ET % note", b"BT /F1 24 Tf 72 650 Td (After comment) Tj ET"));
+    let text: String = pdfcraft_edit::text_lines(&doc, 0).unwrap().into_iter().map(|line| line.text).collect();
+    assert!(!text.contains("After comment"), "editor exposed phantom text: {text}");
+}
+
+#[test]
+fn reading_blocks_respect_stream_comments_and_split_operands() {
+    let doc = open(two_streams(b"BT /F1 24 Tf 72 700 Td (Before comment) Tj ET % note", b"BT /F1 24 Tf 72 650 Td (After comment) Tj ET"));
+    let text: String = pdfcraft_edit::reading_blocks(&doc, 0).unwrap().into_iter().map(|block| block.editor_text).collect();
+    assert_eq!(text, "Before comment");
+    let doc = open(two_streams(b"BT /F1 24 Tf 72 700 Td (Split operand)", b"Tj ET"));
+    let text: String = pdfcraft_edit::reading_blocks(&doc, 0).unwrap().into_iter().map(|block| block.editor_text).collect();
+    assert_eq!(text, "Split operand");
+    // Marked content opened in one stream applies to text in the next: its /ActualText replaces
+    // the glyphs, as when the streams are read joined.
+    for (s1, s2) in [
+        (b"BT /F1 24 Tf 72 700 Td /Span <</ActualText (Replacement text)".as_slice(), b">> BDC (Glyphs) Tj EMC ET".as_slice()),
+        (b"BT /F1 24 Tf 72 700 Td /Span <</ActualText (Replacement text)>> BDC", b"(Glyphs) Tj EMC ET"),
+    ] {
+        let doc = open(two_streams(s1, s2));
+        let text: String = pdfcraft_edit::reading_blocks(&doc, 0).unwrap().into_iter().map(|block| block.editor_text).collect();
+        assert_eq!(text, "Replacement text", "{}", String::from_utf8_lossy(s1));
+    }
 }

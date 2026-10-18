@@ -666,6 +666,9 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
     let joined = Pieces::join(streams);
     let mut parsed = joined.parse();
     out.unreadable |= parsed.unterminated_inline_image;
+    // A rewritten piece loses its comments, so keep where they began and ended: a comment that
+    // ran on into the next piece still hides that piece's first line.
+    let comment_edges = joined.comment_edges(&parsed);
     let props = res_dict(doc, resources, b"Properties");
     if !scope.hidden_layers.is_empty() {
         let stripped = strip_hidden_layers(doc, scope, parsed.ops, &props, &mut out);
@@ -940,8 +943,17 @@ fn process_with(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
         }
         built.done.push((ops, changed));
     }
-    for (ops, changed) in built.done {
-        out.streams.push(changed.then(|| serialize_ops(&ops)));
+    for ((ops, changed), (comment_in, comment_out)) in built.done.into_iter().zip(comment_edges) {
+        out.streams.push(changed.then(|| {
+            // The piece before still ends inside a comment: end it before the first operator.
+            let mut bytes = if comment_in { b"\n".to_vec() } else { Vec::new() };
+            bytes.extend(serialize_ops(&ops));
+            // The piece ended inside a comment that hid the start of the next one: keep it open.
+            if comment_out {
+                bytes.push(b'%');
+            }
+            bytes
+        }));
     }
     out
 }
